@@ -1,0 +1,13 @@
+# Ignore packaging artifacts and backups
+argon_context.zip
+argon_package.zip
+*.zip
+.argon_backup/
+argon_response.txt
+apply_changes.ps1
+
+# System & IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

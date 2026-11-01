@@ -1,0 +1,16 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "argon-coding-bridge",
+  "version": "1.0.0",
+  "description": "Bridge local coding agents (MiniMax Code, Antigravity, Cursor) with Gemini 4 Argon in Gemini Web (Task mode) or Google AI Studio. Packages codebase context respecting .gitignore, crafts surgical prompts preventing UI distortion, and provides one-click PowerShell patch execution.",
+  "author": "Antigravity & MiniMax Community",
+  "license": "MIT",
+  "keywords": [
+    "gemini-4-argon",
+    "minimax",
+    "code-refactoring",
+    "task-mode",
+    "patch-applicator",
+    "agent-plugin"
+  ]
+}
