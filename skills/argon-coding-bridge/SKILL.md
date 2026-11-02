@@ -292,6 +292,42 @@ A downloaded file is also checked for **completeness** before it is accepted: it
 unterminated. A file that fails those checks is reported as truncated and is **not** written, so a
 partial patch can never be applied by mistake.
 
+### The project is verified LOCALLY - no extra Gemini round
+
+After the patch is applied, the bridge runs the project's own build/lint command
+**on this machine** (`cargo check`, `npm run lint`, `ruff`, `go build`, `dotnet
+build`, `make`, ... - detected from the project root, or given with
+`--verify-cmd`).
+
+That check costs **no quota at all** - it never talks to Gemini. When it passes,
+the run reports `Project verification: <cmd> -> clean`. When it fails, the errors
+are printed and recorded in the task state and in the notes file, and the run ends
+with exit code `8`.
+
+**The agent that drove the bridge fixes those errors itself.** Lint problems,
+a lost brace, a wrong import - they are small and local, and fixing them costs
+nothing. The bridge deliberately does NOT send a follow-up to Argon for them,
+because every extra Gemini round burns the owner's hourly, weekly and monthly
+quota.
+
+**Ask Argon again only for a genuinely major or difficult task** - a redesign, a
+migration, something that needs real reasoning. That decision belongs to the
+agent, not to this script.
+
+### Three checks that stop a broken patch before it reaches the project
+
+| check | what it catches |
+|---|---|
+| `validate_patch_payloads()` | a raw control character, a line starting with `@'`, a `$` inside a double-quoted here-string, a typographic quote - the payload is refused BEFORE any file is written |
+| `verify_written_files_bytes()` | a raw control byte that appeared in a written file although it was not there before |
+| `verify_written_files_structure()` | a file that was balanced before the patch and is unbalanced after it - a brace, parenthesis or bracket was lost |
+
+### Argon gets the real API, so it never has to guess
+
+The packager writes **`API_INDEX.md`** into the archive: every public declaration
+of every source file, with its file and line, complete and not truncated. The
+task brief points Argon at it and says: use that, never invent a signature, and
+name the missing symbol instead of guessing.
 ### The carry-over rule: a run without a delivery starts a NEW session
 
 A run can end without a delivery: Gemini stops working, the chat dies mid-task, or

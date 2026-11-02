@@ -85,6 +85,23 @@ function Get-LongPath([string]$Path) {
     }
 }
 
+function Get-SourceBalance([string]$Text) {
+    <#
+        Brace / paren / bracket balance of a source file.
+        Strings and comments are stripped first, so only real code counts.
+    #>
+    $out = $Text
+    $out = [regex]::Replace($out, '/\*.*?\*/', '', [System.Text.RegularExpressions.RegexOptions]::Singleline)
+    $out = [regex]::Replace($out, '//[^\n]*', '')
+    $out = [regex]::Replace($out, '"(?:\\.|[^"\\\n])*"', '""')
+    $out = [regex]::Replace($out, "'(?:\\.|[^'\\\n])*'", "''")
+    $out = [regex]::Replace($out, '`(?:\\.|[^`\\])*`', '``')
+    $ob = ([regex]::Matches($out, '\{')).Count - ([regex]::Matches($out, '\}')).Count
+    $op = ([regex]::Matches($out, '\(')).Count - ([regex]::Matches($out, '\)')).Count
+    $ok = ([regex]::Matches($out, '\[')).Count - ([regex]::Matches($out, '\]')).Count
+    return [pscustomobject]@{ braces = $ob; parens = $op; brackets = $ok }
+}
+
 try {
     $scriptRoot = $PSScriptRoot
     if (-not $scriptRoot) { $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path }
@@ -583,6 +600,24 @@ try {
                     if ($seenCtrlCounts[$nb] -gt $prevCnt) {
                         $writtenCtrlErrors.Add(("file={0} offset={1} byte=0x{2:X2} (raw control character not present in old file)" -f ($relPf -replace '\\', '/'), $bi, $nb))
                     }
+                }
+            }
+
+            # Structure guard: a file that was balanced before the patch and is
+            # unbalanced after it lost a brace - the most common way a delivered
+            # patch breaks the build. Reported here so it can be fixed locally;
+            # it costs no quota.
+            if ($oldBytes.Length -gt 0) {
+                $oldBal = Get-SourceBalance ([System.Text.Encoding]::UTF8.GetString($oldBytes))
+                $newBal = Get-SourceBalance ([System.Text.Encoding]::UTF8.GetString($newBytes))
+                $oldOk = ($oldBal.braces -eq 0 -and $oldBal.parens -eq 0 -and $oldBal.brackets -eq 0)
+                $newOk = ($newBal.braces -eq 0 -and $newBal.parens -eq 0 -and $newBal.brackets -eq 0)
+                if ($oldOk -and -not $newOk) {
+                    $broken = @()
+                    if ($newBal.braces -ne 0) { $broken += "braces=$($newBal.braces)" }
+                    if ($newBal.parens -ne 0) { $broken += "parens=$($newBal.parens)" }
+                    if ($newBal.brackets -ne 0) { $broken += "brackets=$($newBal.brackets)" }
+                    $writtenCtrlErrors.Add(("file={0} (the file was balanced before the patch and is unbalanced after it: {1}) - a brace/paren/bracket was lost" -f ($relPf -replace '\\', '/'), ($broken -join ', ')))
                 }
             }
         }

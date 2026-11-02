@@ -151,6 +151,32 @@ delivery chip and a floating quick-action bar. To keep it as calm as a fresh cha
 | the delivery chip | only the chip of the **new assistant turn** is opened |
 | the prompt | pasted through the clipboard, the send is verified |
 | the model | the double check runs again right before the send |
+### The project is verified LOCALLY - no extra Gemini round
+
+After the patch is applied the bridge runs the project's own build/lint command
+**on this machine** - detected from the project root (`Cargo.toml`,
+`package.json`, `pyproject.toml`, `go.mod`, `pom.xml`, `build.gradle`,
+`*.sln`, `Makefile`, `mix.exs`, `Gemfile`) or given with `--verify-cmd`.
+
+That check never talks to Gemini, so it costs **no quota**. When it fails, the
+errors are printed and recorded (task state + notes file) and the run exits with
+code `8`. **The agent that drove the bridge fixes those errors itself** - lint
+problems and a lost brace are small and local. The bridge never sends a
+follow-up to Argon for them, because every extra Gemini round burns the owner's
+hourly / weekly / monthly quota. Ask Argon again only for a genuinely major or
+difficult task.
+
+Three checks stop a broken patch before it reaches the project:
+
+| check | what it catches |
+|---|---|
+| `validate_patch_payloads()` | a raw control character, a line starting with `@'`, a `$` inside a double-quoted here-string, a typographic quote - refused BEFORE any file is written |
+| `verify_written_files_bytes()` | a raw control byte that appeared in a written file |
+| `verify_written_files_structure()` | a file that was balanced before the patch and is unbalanced after it - a lost brace |
+
+`API_INDEX.md` is written into the archive by the packager: every public
+declaration of every source file with its file and line, complete and not
+truncated. The brief tells Argon to use it and never to invent a signature.
 ### The carry-over rule - a run without a delivery starts a NEW session
 
 When a run ends **without a delivery** (Gemini stopped working, the chat died, or
