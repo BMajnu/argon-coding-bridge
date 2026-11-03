@@ -17,6 +17,47 @@ Bridge **any local AI coding agent** with **Gemini 4 Argon** running in Gemini W
 
 ---
 
+## Working rules
+
+These rules are how the agent that drives this bridge works. They are not
+suggestions.
+
+### 1. Dispatch preparation is quick, and the archive is complete
+
+The agent focuses on the USER'S PROMPT and the intent behind it.
+
+- It works out which codebase can be related to the user's problem and puts
+  **the whole of it** into the zip. The file set is never smaller than that.
+  A few extra files are fine - a narrow archive is not.
+- The analysis that settles the subject finishes in **seconds to a few
+  minutes**. It never turns into a long analysis phase, and the agent does not
+  keep analysing after the subject is clear.
+- This does NOT mean "no analysis at all". It means the analysis is short,
+  it is aimed at the user's prompt, and it stops.
+
+### 2. Compare fast, apply the merged good parts
+
+When both patch files have arrived, the agent compares them quickly and works
+out which one is better and which good parts of the two can be combined.
+
+- The **merged result of the good sides of both** is what gets applied.
+- If both patches carry errors and neither side is good, then the **winner
+  alone** is applied.
+- All of this is done quickly. The comparison is a step, not a project.
+
+### 3. Errors after the apply
+
+- Errors that appear after the apply are fixed by the agent.
+- But when the NUMBER of errors is large, that is no longer a local problem:
+  a **follow-up is sent to Argon** instead.
+- Once a prompt has been sent, the agent does **not** do extra work of its own
+  in the meantime.
+- It does not step outside its scope, it does not brainstorm and it does not
+  invent ideas. Analysing, brainstorming and hunting for the real problem are
+  **Argon's** work.
+
+---
+
 ## Workflow Guide
 
 ```
