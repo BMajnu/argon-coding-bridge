@@ -1938,7 +1938,7 @@ def _gemini_page_is_guest(page) -> bool:
         return False
     return (
         "sign in to save activity" in body
-        or "where should we start" in body
+        or "sign in or create an account" in body
     )
 
 
@@ -3736,10 +3736,12 @@ def _is_page_unauthenticated(page: Any) -> bool:
         body = (page.locator("body").inner_text(timeout=12000) or "").lower()
     except Exception:
         body = ""
+    # "Where should we start?" is NORMAL copy on a signed-in Gemini home
+    # page, so it must NOT be used as a guest marker. The guest sidebar item
+    # "Sign in to save activity" is the reliable one.
     if (
         "sign in to save activity" in body
-        or "where should we start" in body
-        or "sign in to continue" in body
+        or "sign in or create an account" in body
     ):
         return True
     # A signed-in Gemini always shows the account avatar / the chat history.

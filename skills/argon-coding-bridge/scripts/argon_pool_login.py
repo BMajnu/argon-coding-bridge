@@ -749,6 +749,53 @@ class GoogleLogin:
 
         return has_auth_cookie
 
+    def _reset_profile_accounts(self) -> None:
+        """Forget the accounts this profile used to hold.
+
+        A slot profile must hold exactly ONE account. The profile it was
+        seeded from can still carry the previous account's account-list
+        (Preferences) - and Google keeps THAT account active, so a fresh
+        sign-in is only "added" and Gemini still shows the guest page. Clearing
+        the list before the browser starts makes the account we sign in the
+        only one.
+        """
+        pref = self.profile_dir / "Default" / "Preferences"
+        if not pref.is_file():
+            return
+        try:
+            data = json.loads(pref.read_text(encoding="utf-8", errors="replace"))
+        except Exception:
+            return
+        changed = False
+        if data.get("account_info"):
+            data["account_info"] = []
+            changed = True
+        signin = data.get("signin")
+        if isinstance(signin, dict) and signin.get("accounts"):
+            signin["accounts"] = []
+            changed = True
+        if not changed:
+            return
+        try:
+            tmp = pref.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(data, separators=(",", ":")), encoding="utf-8")
+            tmp.replace(pref)
+        except Exception:
+            pass
+
+    def _clear_google_session(self) -> None:
+        """Drop every cookie so the next sign-in becomes the ACTIVE session.
+
+        Without this the jar keeps the seeded account's SID next to the new
+        one, and Google keeps honouring the old (dead or
+        verification-pending) session.
+        """
+        try:
+            ctx = self.start()
+            ctx.clear_cookies()
+        except Exception:
+            pass
+
     def verify_session(self) -> bool:
         """Check that this profile really holds a LIVE Google session.
 
@@ -775,7 +822,9 @@ class GoogleLogin:
             body = (page.locator("body").inner_text(timeout=15000) or "").lower()
         except Exception:
             return False
-        if "sign in to save activity" in body or "where should we start" in body:
+        # "Where should we start?" is normal copy on a signed-in Gemini home
+        # page - only the guest sidebar item counts.
+        if "sign in to save activity" in body or "sign in or create an account" in body:
             return False
         try:
             if page.locator(
@@ -784,7 +833,7 @@ class GoogleLogin:
                 return True
         except Exception:
             pass
-        return "sign in to save activity" not in body and "where should we start" not in body
+        return "sign in to save activity" not in body and "sign in or create an account" not in body
 
     def _detect_challenge(self, page: Any) -> Optional[str]:
         """
@@ -1145,6 +1194,14 @@ class GoogleLogin:
                         )
                     else:
                         self.switch_to_slot_profile(slot)
+                        # A slot profile holds exactly ONE account. The profile it was
+                        # seeded from can still carry the previous account's session and
+                        # a pending "verify it's you" challenge, and Google then keeps
+                        # THAT account active - the new sign-in is only "added", so
+                        # Gemini keeps showing the guest page. Start from a clean profile
+                        # so the account we sign in becomes the active one.
+                        self._reset_profile_accounts()
+                        self._clear_google_session()
                         res = self.login(
                             email=email,
                             password=password,
