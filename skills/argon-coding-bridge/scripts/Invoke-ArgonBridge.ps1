@@ -49,7 +49,15 @@ param(
     [int]$VerifyTimeout = 900,
     [string]$VerifyCmd = "",
     [switch]$SkipVerify,
-    [switch]$Rollback
+    [switch]$Rollback,
+    [switch]$Dual,
+    [string]$RecordWinner = "",
+    [switch]$OpenComparison,
+    [switch]$MergePatches,
+    [string]$FollowupPatch = "",
+    [string]$NewPatch = "",
+    [string]$ConflictChoices = "",
+    [string]$SecondSlot = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -57,7 +65,44 @@ $ErrorActionPreference = "Stop"
 $scriptsDir = $PSScriptRoot
 $loginScript = Join-Path $scriptsDir "login_pool_accounts.py"
 $dispatchScript = Join-Path $scriptsDir "dispatch_argon.py"
+$dualScript = Join-Path $scriptsDir "dual_dispatch.py"
+$compareScript = Join-Path $scriptsDir "compare_argon_patches.py"
 $applyRunner = Join-Path $scriptsDir "Run-ArgonPatch.ps1"
+
+if (-not [string]::IsNullOrWhiteSpace($RecordWinner)) {
+    Write-Host "[+] Recording winning lane '$RecordWinner' for: $ProjectPath" -ForegroundColor Cyan
+    & python $dispatchScript --project-path $ProjectPath --record-winner $RecordWinner
+    exit $LASTEXITCODE
+}
+
+if (($OpenComparison -or $MergePatches) -and [string]::IsNullOrWhiteSpace($Task) -and -not $Dual) {
+    if (-not (Test-Path $compareScript)) {
+        Write-Error "Comparison script not found at: $compareScript"
+        exit 1
+    }
+    $cmpArgs = @($compareScript, "--project-path", $ProjectPath)
+    if (-not [string]::IsNullOrWhiteSpace($FollowupPatch)) {
+        $cmpArgs += @("--followup-patch", $FollowupPatch)
+    }
+    if (-not [string]::IsNullOrWhiteSpace($NewPatch)) {
+        $cmpArgs += @("--new-patch", $NewPatch)
+    }
+    if ($OpenComparison) {
+        $cmpArgs += "--open"
+    }
+    if ($MergePatches) {
+        $cmpArgs += "--merge"
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ConflictChoices)) {
+        $cmpArgs += @("--choices", $ConflictChoices)
+    }
+    if ($AutoApply -or $ApplyOnly) {
+        $cmpArgs += "--apply"
+    }
+    Write-Host "[+] Running Argon Dual-Session Patch Comparison..." -ForegroundColor Cyan
+    & python @cmpArgs
+    exit $LASTEXITCODE
+}
 
 if ($LoginAssistant) {
     if (-not (Test-Path $loginScript)) {
@@ -147,6 +192,15 @@ if (-not [string]::IsNullOrWhiteSpace($VerifyCmd)) {
 }
 if ($SkipVerify) {
     $argList += "--skip-verify"
+}
+if ($Dual) {
+    $argList += "--dual"
+}
+if (-not [string]::IsNullOrWhiteSpace($SecondSlot)) {
+    $argList += @("--second-slot", $SecondSlot)
+}
+if ($OpenComparison) {
+    $argList += "--open-comparison"
 }
 
 Write-Host "[+] Invoking Gemini 4 Argon Dispatcher ($Mode)..." -ForegroundColor Cyan

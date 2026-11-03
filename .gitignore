@@ -22,6 +22,9 @@ __pycache__/
 # Delivered Argon patches land here
 downloads/
 
+# Scratch working folder (comparison reports, merged patches, notes)
+scratch/
+
 # Account pool credentials and local secrets (never commit or upload plaintext passwords)
 skills/argon-coding-bridge/config/accounts_pool.json
 **/accounts_pool*.json

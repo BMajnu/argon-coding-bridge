@@ -465,6 +465,17 @@ python "./skills/argon-coding-bridge/scripts/dispatch_argon.py" --task "Next cha
 
 # Force a brand new conversation for this project:
 python "./skills/argon-coding-bridge/scripts/dispatch_argon.py" --task "Next change" --project-path . --new-session
+
+# Dual-session dispatch (follow-up in the recorded winning chat + brand-new chat on a second slot):
+python "./skills/argon-coding-bridge/scripts/dispatch_argon.py" --dual --task "Next change" --project-path .
+
+# Record which lane won after comparing both delivered patches:
+python "./skills/argon-coding-bridge/scripts/dispatch_argon.py" --project-path . --record-winner followup
+python "./skills/argon-coding-bridge/scripts/dispatch_argon.py" --project-path . --record-winner new
+
+# Compare two delivered patches side by side, open comparison.html, and build/apply a single-run merged patch:
+python "./skills/argon-coding-bridge/scripts/compare_argon_patches.py" --project-path . --open
+python "./skills/argon-coding-bridge/scripts/compare_argon_patches.py" --project-path . --merge --choices "1=new,2=followup" --apply
 ```
 
 The map lives at `~/.gemini/argon_sessions.json` - in the user profile, next to the browser profile,

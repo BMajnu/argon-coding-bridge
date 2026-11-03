@@ -182,6 +182,24 @@ def _ensure_no_guessing_rule(prompt_body: str) -> str:
     return out + "\n"
 
 
+DUAL_FOLLOWUP_HEADER = (
+    "[FOLLOW-UP SESSION - CONTINUING WINNING CONVERSATION] I have uploaded a fresh snapshot "
+    "of the project codebase as a zip archive (`argon_context.zip`) with `TASK_BRIEF.md` and `API_INDEX.md`."
+)
+
+DUAL_NEW_SESSION_HEADER = (
+    "[NEW SESSION - FRESH CONVERSATION WITH ZERO PRIOR CHAT CONTEXT] I have uploaded the complete "
+    "project codebase as a zip archive (`argon_context.zip`) containing `TASK_BRIEF.md` and `API_INDEX.md`."
+)
+
+DUAL_NEW_SESSION_NOTE = """### 🧠 NEW SESSION FOR THIS PROJECT (FRESH CONVERSATION - NO PRIOR CHAT HISTORY)
+This is a brand-new conversation with NO earlier messages or context from previous rounds.
+- The attached archive (`argon_context.zip`, `TASK_BRIEF.md`, and `API_INDEX.md`) is a complete, fresh snapshot
+  of the project's current state and is the ONLY context you have.
+- Read `TASK_BRIEF.md` and `API_INDEX.md` carefully before making any changes, preserve existing conventions
+  and architecture, and never guess a missing file or symbol."""
+
+
 def build_context_note(is_continuation: bool = False) -> str:
     """Return the continuity note that is injected into the prompt.
 
@@ -245,6 +263,90 @@ def build_surgical_prompt(
     if diagnostic_evidence:
         rendered = rendered.rstrip() + "\n\n" + _format_diagnostic_evidence_block(diagnostic_evidence) + "\n"
     return rendered
+
+
+def build_followup_prompt(
+    task_description: str,
+    target_directory: str = "",
+    template_path: Path = PROMPT_TEMPLATE_PATH,
+    diagnostic_evidence: Optional[Dict[str, Any]] = None,
+    winning_chat_id: str = "",
+    winning_slot: str = "",
+) -> str:
+    """Build the FOLLOW-UP prompt for a chat that already holds the earlier project work."""
+    base = build_surgical_prompt(
+        task_description=task_description,
+        target_directory=target_directory,
+        template_path=template_path,
+        is_continuation=True,
+        diagnostic_evidence=diagnostic_evidence,
+    )
+    lines = base.splitlines()
+    if lines and lines[0].startswith("I have uploaded the relevant codebase context"):
+        lines[0] = DUAL_FOLLOWUP_HEADER
+    rebuilt = "\n".join(lines) + "\n"
+    provenance_parts = []
+    if winning_slot:
+        provenance_parts.append(f"slot `{winning_slot}`")
+    if winning_chat_id:
+        provenance_parts.append(f"conversation `{winning_chat_id}`")
+    if provenance_parts:
+        prov_line = (
+            "- Winning session provenance: this follow-up continues in "
+            + ", ".join(provenance_parts)
+            + " (the winning session from the previous round)."
+        )
+        rebuilt = rebuilt.replace(CONTINUATION_NOTE, CONTINUATION_NOTE + "\n" + prov_line, 1)
+    return _ensure_no_guessing_rule(rebuilt)
+
+
+def build_new_session_prompt(
+    task_description: str,
+    target_directory: str = "",
+    template_path: Path = PROMPT_TEMPLATE_PATH,
+    diagnostic_evidence: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Build the NEW-SESSION prompt for a fresh chat with no prior conversation history."""
+    base = build_surgical_prompt(
+        task_description=task_description,
+        target_directory=target_directory,
+        template_path=template_path,
+        is_continuation=False,
+        diagnostic_evidence=diagnostic_evidence,
+    )
+    lines = base.splitlines()
+    if lines and lines[0].startswith("I have uploaded the relevant codebase context"):
+        lines[0] = DUAL_NEW_SESSION_HEADER
+    rebuilt = "\n".join(lines) + "\n"
+    rebuilt = rebuilt.replace(FIRST_TASK_NOTE, DUAL_NEW_SESSION_NOTE, 1)
+    return _ensure_no_guessing_rule(rebuilt)
+
+
+def build_dual_prompts(
+    task_description: str,
+    target_directory: str = "",
+    template_path: Path = PROMPT_TEMPLATE_PATH,
+    diagnostic_evidence: Optional[Dict[str, Any]] = None,
+    winning_chat_id: str = "",
+    winning_slot: str = "",
+) -> tuple[str, str]:
+    """Build both (followup_prompt, new_session_prompt) for dual-session dispatch."""
+    return (
+        build_followup_prompt(
+            task_description=task_description,
+            target_directory=target_directory,
+            template_path=template_path,
+            diagnostic_evidence=diagnostic_evidence,
+            winning_chat_id=winning_chat_id,
+            winning_slot=winning_slot,
+        ),
+        build_new_session_prompt(
+            task_description=task_description,
+            target_directory=target_directory,
+            template_path=template_path,
+            diagnostic_evidence=diagnostic_evidence,
+        ),
+    )
 
 
 def find_delivered_patch(search_dirs, target_name: str = "apply_changes",
@@ -1001,6 +1103,15 @@ RE_PRINT = re.compile(
 # selector is intentionally excluded because it matches the Print toolbar button
 # that sits immediately to the left of the Download button.
 DOWNLOAD_BUTTON_SELECTORS = (
+    # The viewer's OWN toolbar comes FIRST. The loose `button[aria-label*=...]`
+    # selectors below match ANY button whose label contains the word - and a
+    # chat bubble in the conversation can carry that word in its label. The
+    # finder then clicks the bubble, the download never happens and the run
+    # fails with "the viewer's download button did not produce a .ps1 file".
+    "div.drive-viewer-toolstrip-custom-panel .drive-viewer-custom-button[aria-label*='ডাউনলোড']",
+    "div.drive-viewer-toolstrip-custom-panel .drive-viewer-custom-button[aria-label*='download' i]",
+    "div.drive-viewer-toolstrip-custom-panel .drive-viewer-custom-button[data-tooltip*='ডাউনলোড']",
+    "div.drive-viewer-toolstrip-custom-panel .drive-viewer-custom-button[data-tooltip*='download' i]",
     "button[aria-label*='ডাউনলোড']",
     "button[data-tooltip*='ডাউনলোড']",
     "button[mattooltip*='ডাউনলোড']",
@@ -1092,6 +1203,11 @@ def _is_download_and_not_print(el) -> bool:
     label_text, icon_text = _candidate_label_and_icon(el)
     combined = f"{label_text} {icon_text}".strip()
     if not combined:
+        return False
+    # A real toolbar button has a SHORT label ("ডাউনলোড করুন"). A conversation
+    # bubble carries a whole message in its label, and that message can
+    # contain the word "download" - clicking that bubble is never the button.
+    if len(label_text.strip()) > 60:
         return False
     if RE_PRINT.search(combined):
         return False
@@ -2008,10 +2124,31 @@ def _gemini_page_is_guest(page) -> bool:
         body = (page.locator("body").inner_text(timeout=12000) or "").lower()
     except Exception:
         return False
-    return (
+    if not (
         "sign in to save activity" in body
         or "sign in or create an account" in body
-    )
+    ):
+        return False
+    # The phrase ALONE is not proof of a guest: a SIGNED-IN Gemini page can
+    # carry it in a hidden menu item. A signed-in page always shows the chat
+    # history and the account avatar, so either of those proves the session is
+    # alive and the phrase must be ignored.
+    try:
+        if page.locator("a[href*='/app/']").count() > 0:
+            return False
+    except Exception:
+        pass
+    try:
+        avatar = page.locator(
+            "a[aria-label*='Google Account'], "
+            "button[aria-label*='Google Account'], "
+            "a[aria-label*='Google অ্যাকাউন্ট']"
+        )
+        if avatar.count() > 0 and avatar.first.is_visible():
+            return False
+    except Exception:
+        pass
+    return True
 
 
 # --------------------------------------------------------------------------- #
@@ -2545,6 +2682,51 @@ class TaskState:
             self.save()
 
 
+def _acquire_session_store_lock(path: Path, timeout: float = 15.0) -> Optional[tuple]:
+    """Take an exclusive lock on the session store file.
+
+    The two dual lanes are two processes that both update the session store.
+    Without a lock the lane that writes last restores its own older snapshot
+    and the sibling lane's record is lost. The lock is a file that only one
+    process can create, and a lock left behind by a dead process is reclaimed
+    after `timeout` so a run can never block forever.
+
+    Returns (handle, lock_path) or None when the lock cannot be taken.
+    """
+    lock_path = Path(str(path) + ".lock")
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            handle = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            return handle, lock_path
+        except FileExistsError:
+            if time.monotonic() > deadline:
+                try:
+                    os.unlink(str(lock_path))
+                except Exception:
+                    pass
+                deadline = time.monotonic() + timeout
+                continue
+            time.sleep(0.05)
+        except Exception:
+            return None
+
+
+def _release_session_store_lock(lock: Optional[tuple]) -> None:
+    """Release the lock taken by _acquire_session_store_lock."""
+    if not lock:
+        return
+    handle, lock_path = lock
+    try:
+        os.close(handle)
+    except Exception:
+        pass
+    try:
+        os.unlink(str(lock_path))
+    except Exception:
+        pass
+
+
 class SessionStore:
     """Per-project map of the Gemini conversation to continue in.
     The store is a small JSON file at ``~/.gemini/argon_sessions.json``, next to
@@ -2553,8 +2735,8 @@ class SessionStore:
     chat per project: a new delivery replaces the previous entry.
     """
 
-    def __init__(self, path: Path = SESSION_STORE_PATH) -> None:
-        self.path = Path(path)
+    def __init__(self, path: Optional[Path] = None) -> None:
+        self.path = Path(path or SESSION_STORE_PATH)
         self.data: Dict[str, Any] = {}
         # The store exists from the moment it is used: a missing file is
         # created with the default shape.
@@ -2592,13 +2774,19 @@ class SessionStore:
         return self.data
 
     def save(self) -> None:
-        """Write the store back to disk."""
+        """Write the store back to disk.
+
+        The content goes to a temporary file that is then moved into place, so
+        a reader never sees half a file and two writers cannot corrupt it.
+        """
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.path.write_text(
+            tmp_path = self.path.with_name(self.path.name + ".tmp")
+            tmp_path.write_text(
                 json.dumps(self.data, indent=2, ensure_ascii=False) + "\n",
                 encoding="utf-8",
             )
+            os.replace(str(tmp_path), str(self.path))
         except Exception as exc:
             print(f"[!] Could not save the session store: {exc}")
 
@@ -2628,6 +2816,16 @@ class SessionStore:
                 return None
         return entry
 
+    @staticmethod
+    def normalize_winner_lane(winner: Optional[str]) -> Optional[str]:
+        """Normalize a winner lane label ('followup'/'old' or 'new')."""
+        cleaned = (winner or "").strip().lower()
+        if cleaned in ("followup", "follow-up", "follow_up", "old"):
+            return "followup"
+        if cleaned in ("new", "new-session", "new_session"):
+            return "new"
+        return None
+
     def remember(
         self,
         project_path: Any,
@@ -2636,16 +2834,43 @@ class SessionStore:
         chat_id: str = "",
         chat_title: str = "",
         profile_dir: str = "",
+        lane: Optional[str] = None,
+        patch_path: str = "",
     ) -> Optional[str]:
         """Store the conversation for a project and return its chat URL.
 
-        One chat per project: the previous entry for the same project root is
-        replaced, so the next follow-up task continues in this conversation.
-
-        The chat TITLE and the PROFILE the run used are stored as well, so a
-        session can always be found again - by its name in the Gemini sidebar,
-        by its link, or by the browser profile it was run in.
+        The two dual lanes run as two processes and both write this store, so
+        the read-modify-write is serialised with a lock file: otherwise the
+        lane that writes last would put its own (older) snapshot back and wipe
+        the sibling lane's record.
         """
+        lock = _acquire_session_store_lock(self.path)
+        try:
+            return self._remember_locked(
+                project_path=project_path,
+                mode=mode,
+                slot=slot,
+                chat_id=chat_id,
+                chat_title=chat_title,
+                profile_dir=profile_dir,
+                lane=lane,
+                patch_path=patch_path,
+            )
+        finally:
+            _release_session_store_lock(lock)
+
+    def _remember_locked(
+        self,
+        project_path: Any,
+        mode: str = "gemini",
+        slot: Optional[str] = None,
+        chat_id: str = "",
+        chat_title: str = "",
+        profile_dir: str = "",
+        lane: Optional[str] = None,
+        patch_path: str = "",
+    ) -> Optional[str]:
+        """The body of remember(); the caller holds the store lock."""
         if not chat_id:
             return None
         self.load()
@@ -2658,26 +2883,223 @@ class SessionStore:
         slot_part = normalize_slot(slot) if slot else "/u/0/"
         url_slot = "/u/0/" if _profile_is_isolated_slot(profile_dir) else slot_part
         chat_url = f"https://gemini.google.com{url_slot}app/{chat_id}"
-        entry: Dict[str, Any] = {
-            "mode": clean_mode,
-            "slot": slot_part,
-            "profile_number": _slot_number(slot_part),
-            "chat_id": str(chat_id),
-            "chat_url": chat_url,
-            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        }
-        if chat_title:
-            entry["chat_title"] = str(chat_title)
-        if profile_dir:
-            entry["profile_dir"] = str(profile_dir)
+        now_str = time.strftime("%Y-%m-%d %H:%M:%S")
 
         sessions = self.data.setdefault("sessions", {})
-        existing = self._find_key(resolved)
-        if existing is not None and existing != resolved:
-            sessions.pop(existing, None)
+        existing_key = self._find_key(resolved)
+        prev_entry: Dict[str, Any] = {}
+        if existing_key is not None and isinstance(sessions.get(existing_key), dict):
+            prev_entry = dict(sessions[existing_key])
+            if existing_key != resolved:
+                sessions.pop(existing_key, None)
+
+        lanes: Dict[str, Any] = {}
+        if isinstance(prev_entry.get("lanes"), dict):
+            for lk, lv in prev_entry["lanes"].items():
+                if isinstance(lv, dict):
+                    lanes[lk] = dict(lv)
+
+        norm_lane = self.normalize_winner_lane(lane) if lane else None
+        lane_record: Dict[str, Any] = {
+            "slot": slot_part,
+            "chat_id": str(chat_id),
+            "chat_url": chat_url,
+            "chat_title": str(chat_title) if chat_title else "",
+            "profile_dir": str(profile_dir) if profile_dir else "",
+            "profile_number": _slot_number(slot_part),
+            "updated_at": now_str,
+        }
+        if patch_path:
+            lane_record["patch_path"] = str(patch_path)
+
+        if norm_lane:
+            merged_lane = dict(lanes.get(norm_lane) or {})
+            for k, v in lane_record.items():
+                if v != "" or k not in merged_lane:
+                    merged_lane[k] = v
+            lanes[norm_lane] = merged_lane
+
+        entry: Dict[str, Any] = dict(prev_entry)
+        entry["mode"] = clean_mode
+        entry["updated_at"] = now_str
+        entry["lanes"] = lanes
+        entry.setdefault("winner", prev_entry.get("winner"))
+
+        if norm_lane is None or norm_lane == "followup" or not entry.get("chat_id"):
+            entry["slot"] = slot_part
+            entry["profile_number"] = _slot_number(slot_part)
+            entry["chat_id"] = str(chat_id)
+            entry["chat_url"] = chat_url
+            if chat_title:
+                entry["chat_title"] = str(chat_title)
+            if profile_dir:
+                entry["profile_dir"] = str(profile_dir)
+
         sessions[resolved] = entry
         self.save()
-        return entry["chat_url"]
+        return chat_url
+
+    def remember_dual_round(
+        self,
+        project_path: Any,
+        mode: str = "gemini",
+        followup_lane: Optional[Dict[str, Any]] = None,
+        new_lane: Optional[Dict[str, Any]] = None,
+        round_id: str = "",
+        dual_dir: str = "",
+        comparison_html: str = "",
+        merged_patch: str = "",
+    ) -> Dict[str, Any]:
+        """Store both lanes ('followup' and 'new') of a dual round and reset winner to None."""
+        self.load()
+        try:
+            resolved = str(Path(str(project_path)).expanduser().resolve())
+        except Exception:
+            resolved = str(project_path)
+
+        sessions = self.data.setdefault("sessions", {})
+        existing_key = self._find_key(resolved)
+        entry: Dict[str, Any] = {}
+        if existing_key is not None and isinstance(sessions.get(existing_key), dict):
+            entry = dict(sessions[existing_key])
+            if existing_key != resolved:
+                sessions.pop(existing_key, None)
+
+        lanes: Dict[str, Any] = {}
+        if isinstance(entry.get("lanes"), dict):
+            for lk, lv in entry["lanes"].items():
+                if isinstance(lv, dict):
+                    lanes[lk] = dict(lv)
+
+        for lane_key, lane_input in (("followup", followup_lane), ("new", new_lane)):
+            if isinstance(lane_input, dict) and lane_input:
+                cur = dict(lanes.get(lane_key) or {})
+                cur.update({k: v for k, v in lane_input.items() if v is not None})
+                if cur.get("slot"):
+                    cur["slot"] = normalize_slot(cur["slot"])
+                    cur["profile_number"] = _slot_number(cur["slot"])
+                lanes[lane_key] = cur
+
+        entry["mode"] = (mode or "gemini").strip().lower()
+        entry["lanes"] = lanes
+        entry["winner"] = None
+        entry["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        if round_id:
+            entry["round_id"] = str(round_id)
+        if dual_dir:
+            entry["dual_dir"] = str(dual_dir)
+        if comparison_html:
+            entry["comparison_html"] = str(comparison_html)
+        if merged_patch:
+            entry["merged_patch"] = str(merged_patch)
+
+        f_lane = lanes.get("followup") or {}
+        if f_lane.get("chat_id"):
+            entry["slot"] = f_lane.get("slot") or entry.get("slot") or "/u/0/"
+            entry["profile_number"] = _slot_number(entry["slot"])
+            entry["chat_id"] = str(f_lane["chat_id"])
+            entry["chat_url"] = str(f_lane.get("chat_url") or _url_for_chat_id(str(f_lane["chat_id"])))
+
+        sessions[resolved] = entry
+        self.save()
+        return entry
+
+    def record_winner(self, project_path: Any, winner: str) -> Optional[Dict[str, Any]]:
+        """Record which lane ('followup' or 'new') won the round and promote its chat to top level."""
+        norm_winner = self.normalize_winner_lane(winner)
+        if norm_winner not in ("followup", "new"):
+            raise ValueError(f"Invalid winner lane {winner!r}; expected 'followup' (or 'old') or 'new'.")
+
+        self.load()
+        key = self._find_key(project_path)
+        if key is None:
+            return None
+        sessions = self.data.get("sessions") or {}
+        entry = sessions.get(key)
+        if not isinstance(entry, dict):
+            return None
+
+        lanes = entry.get("lanes") if isinstance(entry.get("lanes"), dict) else {}
+        lanes = {k: dict(v) for k, v in lanes.items() if isinstance(v, dict)}
+        winning_lane = dict(lanes.get(norm_winner) or {})
+
+        if not winning_lane.get("chat_id") and entry.get("chat_id") and norm_winner == "followup":
+            # The top-level chat IS the follow-up chat (remember() promotes it),
+            # so it may stand in for that lane. It must never stand in for the
+            # 'new' lane - that would record the follow-up chat as the winner
+            # of the new session.
+            slot_fallback = normalize_slot(entry.get("slot") or "/u/0/")
+            winning_lane = {
+                "slot": slot_fallback,
+                "chat_id": str(entry["chat_id"]),
+                "chat_url": str(entry.get("chat_url") or _url_for_chat_id(str(entry["chat_id"]))),
+                "chat_title": str(entry.get("chat_title") or ""),
+                "profile_dir": str(entry.get("profile_dir") or ""),
+                "profile_number": _slot_number(slot_fallback),
+            }
+            lanes[norm_winner] = winning_lane
+
+        if not winning_lane.get("chat_id"):
+            return None
+
+        win_slot = normalize_slot(winning_lane.get("slot") or entry.get("slot") or "/u/0/")
+        win_cid = str(winning_lane["chat_id"])
+        win_prof = str(winning_lane.get("profile_dir") or entry.get("profile_dir") or "")
+        url_slot = "/u/0/" if _profile_is_isolated_slot(win_prof) else win_slot
+        win_url = str(winning_lane.get("chat_url") or f"https://gemini.google.com{url_slot}app/{win_cid}")
+        win_title = str(winning_lane.get("chat_title") or entry.get("chat_title") or "")
+
+        winning_lane["slot"] = win_slot
+        winning_lane["profile_number"] = _slot_number(win_slot)
+        winning_lane["chat_id"] = win_cid
+        winning_lane["chat_url"] = win_url
+        if win_title:
+            winning_lane["chat_title"] = win_title
+        if win_prof:
+            winning_lane["profile_dir"] = win_prof
+        lanes[norm_winner] = winning_lane
+
+        entry["slot"] = win_slot
+        entry["profile_number"] = _slot_number(win_slot)
+        entry["chat_id"] = win_cid
+        entry["chat_url"] = win_url
+        if win_title:
+            entry["chat_title"] = win_title
+        if win_prof:
+            entry["profile_dir"] = win_prof
+        entry["lanes"] = lanes
+        entry["winner"] = norm_winner
+        entry["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        sessions[key] = entry
+        self.save()
+        return entry
+
+    def get_winner(self, project_path: Any, mode: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Return the recorded winning lane metadata for `project_path`, or None if no winner is recorded."""
+        entry = self.lookup(project_path, mode=mode)
+        if not isinstance(entry, dict):
+            return None
+        norm_winner = self.normalize_winner_lane(entry.get("winner"))
+        if norm_winner not in ("followup", "new"):
+            return None
+        lanes = entry.get("lanes") if isinstance(entry.get("lanes"), dict) else {}
+        lane_data = lanes.get(norm_winner) if isinstance(lanes.get(norm_winner), dict) else {}
+        chat_id = str(lane_data.get("chat_id") or entry.get("chat_id") or "").strip()
+        if not chat_id:
+            return None
+        slot_val = normalize_slot(lane_data.get("slot") or entry.get("slot") or "/u/0/")
+        prof_val = str(lane_data.get("profile_dir") or entry.get("profile_dir") or "")
+        url_slot = "/u/0/" if _profile_is_isolated_slot(prof_val) else slot_val
+        chat_url = str(lane_data.get("chat_url") or entry.get("chat_url") or f"https://gemini.google.com{url_slot}app/{chat_id}")
+        return {
+            "winner": norm_winner,
+            "slot": slot_val,
+            "profile_number": _slot_number(slot_val),
+            "chat_id": chat_id,
+            "chat_url": chat_url,
+            "chat_title": str(lane_data.get("chat_title") or entry.get("chat_title") or ""),
+            "profile_dir": prof_val,
+        }
 
 
 # --------------------------------------------------------------------------- #
@@ -4817,6 +5239,22 @@ def list_sessions() -> int:
         delivered = state.get("delivered") or ""
         if delivered:
             print(f"  delivery     : {delivered}")
+        winner_val = entry.get("winner")
+        lanes_map = entry.get("lanes") if isinstance(entry.get("lanes"), dict) else {}
+        if winner_val or lanes_map:
+            print(f"  winner       : {winner_val or '(none recorded)'}")
+        for lane_key in ("followup", "new"):
+            ld = lanes_map.get(lane_key)
+            if isinstance(ld, dict) and (ld.get("chat_id") or ld.get("chat_url") or ld.get("slot")):
+                status_tag = ""
+                if winner_val in ("followup", "new"):
+                    status_tag = " [WINNER]" if winner_val == lane_key else " [dropped]"
+                l_slot = ld.get("slot") or ""
+                l_cid = ld.get("chat_id") or ""
+                l_url = ld.get("chat_url") or ""
+                print(f"  lane [{lane_key:<8}]: slot={l_slot} chat_id={l_cid} url={l_url}{status_tag}")
+                if ld.get("patch_path"):
+                    print(f"                   patch={ld['patch_path']}")
         updated = state.get("updated_at") or entry.get("updated_at") or ""
         if updated:
             print(f"  updated      : {updated}")
@@ -4824,6 +5262,30 @@ def list_sessions() -> int:
     print(f"  session map : {store.path}")
     print(f"  task states : {tasks.path}")
     return 0
+
+
+def record_winner_cli(project_path: str, winner: str, mode: str = "gemini") -> int:
+    """Record the winning lane ('followup'/'old' or 'new') for `project_path` from the CLI."""
+    store = SessionStore()
+    try:
+        updated = store.record_winner(project_path, winner)
+    except ValueError as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return EXIT_FAILURE
+    if updated is None:
+        print(
+            f"[ERROR] Could not record winner {winner!r} for {Path(project_path).resolve()}: "
+            "no matching session or lane chat_id found in the session store.",
+            file=sys.stderr,
+        )
+        return EXIT_FAILURE
+    print(f"[+] Recorded winner for project: {Path(project_path).resolve()}")
+    print(f"    winner       : {updated.get('winner')}")
+    print(f"    winning slot : {updated.get('slot')} (profile number {updated.get('profile_number')})")
+    print(f"    winning chat : {updated.get('chat_id')}")
+    print(f"    winning url  : {updated.get('chat_url')}")
+    print(f"    session map  : {store.path}")
+    return EXIT_SUCCESS
 
 
 def forget_sessions(target: str = "") -> int:
@@ -5156,9 +5618,17 @@ def dispatch_to_argon(
     verify_timeout: int = 900,
     verify_cmd: Optional[str] = None,
     skip_verify: bool = False,
+    prompt_file: Optional[str] = None,
+    delivery_dir: Optional[str] = None,
+    lane: Optional[str] = None,
+    skip_package: bool = False,
 ) -> int:
     proj_root = Path(project_path).resolve()
     zip_path = proj_root / output_zip if not Path(output_zip).is_absolute() else Path(output_zip)
+    active_downloads_dir = (
+        Path(delivery_dir).resolve() if delivery_dir else (proj_root / "downloads")
+    )
+    active_downloads_dir.mkdir(parents=True, exist_ok=True)
 
     # 1. Load account pool configuration & session/task state stores
     pool_cfg = PoolConfig()
@@ -5213,8 +5683,8 @@ def dispatch_to_argon(
                     )
                 return EXIT_SUCCESS
 
-    # 2. Package codebase context (skipped on --resume since no new prompt is sent)
-    if not resume_chat:
+    # 2. Package codebase context (skipped on --resume or when --skip-package reuses a pre-built archive)
+    if not resume_chat and not (skip_package and zip_path.is_file()):
         package_context(
             project_path=str(proj_root),
             output_zip=str(zip_path),
@@ -5283,19 +5753,18 @@ def dispatch_to_argon(
     ).strip().lower() not in ("applied", "delivered"):
         prior_diag_evidence = prior_task_entry["diagnostic_evidence"]
 
-    # 4. Build surgical prompt (carries the absolute target directory and any
-    #    measured diagnostic evidence from a previous failed run so Argon can
-    #    identify the root cause first)
-    prompt_text = (
-        ""
-        if resume_chat
-        else build_surgical_prompt(
+    # 4. Build surgical prompt (or read pre-rendered prompt from --prompt-file for dual lanes)
+    if resume_chat:
+        prompt_text = ""
+    elif prompt_file and Path(prompt_file).is_file():
+        prompt_text = Path(prompt_file).read_text(encoding="utf-8")
+    else:
+        prompt_text = build_surgical_prompt(
             task,
             target_directory=str(proj_root),
             is_continuation=is_continuation,
             diagnostic_evidence=prior_diag_evidence,
         )
-    )
     print(f"[+] Target directory: {proj_root}")
     print(f"[+] Target Mode: {mode} -> {target_url}")
     print(f"[+] Active Pool Slot: {active_slot} ({target_email or 'default profile session'})")
@@ -5414,7 +5883,7 @@ def dispatch_to_argon(
 
             def _on_download(download) -> None:
                 try:
-                    downloads_dir = proj_root / "downloads"
+                    downloads_dir = active_downloads_dir
                     dest, discard_reason = _validate_and_save_download(download, downloads_dir)
                     if dest is not None:
                         delivered["path"] = dest
@@ -5660,7 +6129,7 @@ def dispatch_to_argon(
                     handled_delivery_hashes.add(prev_hash)
             except Exception:
                 prev_state = {}
-            for stale in (proj_root / "downloads" / "apply_changes.ps1",):
+            for stale in (active_downloads_dir / "apply_changes.ps1",):
                 try:
                     if stale.is_file():
                         handled_delivery_hashes.add(
@@ -5804,6 +6273,7 @@ def dispatch_to_argon(
                 chat_url = session_store.remember(
                     proj_root, mode, active_slot, chat_id,
                     chat_title=chat_title, profile_dir=profile_dir_str,
+                    lane=lane,
                 )
                 effective_chat_url = chat_url or effective_chat_url
                 task_state.set(
@@ -5927,6 +6397,7 @@ def dispatch_to_argon(
                                 # run actually used: a per-slot profile stores
                                 # /u/0/, the shared master profile stores /u/<slot>/.
                                 profile_dir=str(profile_dir),
+                                lane=lane,
                             )
                         task_state.set(
                             proj_root,
@@ -6018,6 +6489,7 @@ def dispatch_to_argon(
                                 # run actually used: a per-slot profile stores
                                 # /u/0/, the shared master profile stores /u/<slot>/.
                                 profile_dir=str(profile_dir),
+                                lane=lane,
                             )
                         task_state.set(
                             proj_root,
@@ -6031,11 +6503,13 @@ def dispatch_to_argon(
                     if delivered_path is None:
                         delivered_path = delivered.get("path")
                     if delivered_path is None:
+                        search_folders = (
+                            [active_downloads_dir]
+                            if delivery_dir
+                            else [active_downloads_dir, Path.home() / "Downloads"]
+                        )
                         delivered_path = find_delivered_patch(
-                            [
-                                proj_root / "downloads",
-                                Path.home() / "Downloads",
-                            ],
+                            search_folders,
                             newer_than=dispatch_started,
                         )
                     if delivered_path is not None:
@@ -6056,7 +6530,7 @@ def dispatch_to_argon(
                     if new_chip is not None:
                         captured = capture_generated_file(
                             page,
-                            proj_root / "downloads",
+                            active_downloads_dir,
                             chip=new_chip,
                             previous_hashes=handled_delivery_hashes,
                         )
@@ -6192,6 +6666,20 @@ def dispatch_to_argon(
                 return saved_notes
 
             if delivered_path is not None:
+                if delivery_dir:
+                    canonical_lane_patch = active_downloads_dir / "apply_changes.ps1"
+                    try:
+                        if delivered_path.resolve() != canonical_lane_patch.resolve():
+                            _copy_with_retry(delivered_path, canonical_lane_patch)
+                            delivered_path = canonical_lane_patch
+                    except Exception:
+                        pass
+                if chat_id and lane:
+                    session_store.remember(
+                        proj_root, mode, active_slot, chat_id,
+                        chat_title=chat_title, profile_dir=profile_dir_str,
+                        lane=lane, patch_path=str(delivered_path),
+                    )
                 print(f"[SUCCESS] Delivered patch file: {delivered_path}")
                 _, summary_text = _copy_and_save_response_summary(
                     page,
@@ -6238,12 +6726,18 @@ def dispatch_to_argon(
             if extracted_patch:
                 if not refuse_invalid_patch(extracted_patch, project_path=proj_root, patch_name="apply_changes.ps1"):
                     return EXIT_FAILURE
-                out_ps1 = proj_root / "apply_changes.ps1"
+                out_ps1 = (active_downloads_dir / "apply_changes.ps1") if delivery_dir else (proj_root / "apply_changes.ps1")
                 out_ps1.write_text(extracted_patch + "\n", encoding="utf-8")
+                if chat_id and lane:
+                    session_store.remember(
+                        proj_root, mode, active_slot, chat_id,
+                        chat_title=chat_title, profile_dir=profile_dir_str,
+                        lane=lane, patch_path=str(out_ps1),
+                    )
                 print(f"[SUCCESS] Extracted patch script to: {out_ps1}")
                 _, summary_text = _copy_and_save_response_summary(
                     page,
-                    proj_root / "downloads",
+                    active_downloads_dir,
                     chat_title=chat_title,
                     chat_url=effective_chat_url,
                 )
@@ -6476,6 +6970,56 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Skip post-apply project build/lint verification.",
     )
     parser.add_argument(
+        "--dual",
+        action="store_true",
+        help="Run dual-session dispatch: single dispatch on the first round when the project "
+             "has no session history; from the second round onward, send a follow-up prompt "
+             "to the recorded winner's chat and a new-session prompt to a brand-new chat on "
+             "a second pool slot concurrently.",
+    )
+    parser.add_argument(
+        "--record-winner",
+        choices=["followup", "new", "old"],
+        default=None,
+        metavar="LANE",
+        help="Record which lane won the previous round ('followup'/'old' or 'new') in the "
+             "project's session entry (~/.gemini/argon_sessions.json).",
+    )
+    parser.add_argument(
+        "--second-slot",
+        default=None,
+        metavar="SLOT",
+        help="Explicit pool slot for the new-session lane during --dual dispatch.",
+    )
+    parser.add_argument(
+        "--lane",
+        choices=["followup", "new"],
+        default=None,
+        help="Tag this dispatch run as the 'followup' or 'new' lane of a dual dispatch.",
+    )
+    parser.add_argument(
+        "--prompt-file",
+        default=None,
+        metavar="PATH",
+        help="Read the pre-rendered surgical prompt from PATH instead of building it in memory.",
+    )
+    parser.add_argument(
+        "--delivery-dir",
+        default=None,
+        metavar="DIR",
+        help="Directory where the delivered apply_changes.ps1 for this lane is saved.",
+    )
+    parser.add_argument(
+        "--skip-package",
+        action="store_true",
+        help="Reuse an existing argon_context.zip without re-running package_context.",
+    )
+    parser.add_argument(
+        "--open-comparison",
+        action="store_true",
+        help="Open comparison.html in the default browser when --dual finishes.",
+    )
+    parser.add_argument(
         "--max-verify-rounds",
         type=int,
         default=1,
@@ -6541,8 +7085,30 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.forget_session is not None:
         return forget_sessions(args.forget_session)
 
+    if args.record_winner is not None:
+        return record_winner_cli(args.project_path, args.record_winner, mode=args.mode)
+
     if not args.resume and not (args.task or "").strip():
         parser.error("the following arguments are required: --task (unless --resume is used)")
+
+    if args.dual:
+        from dual_dispatch import run_dual_dispatch
+
+        return run_dual_dispatch(
+            task=args.task,
+            project_path=args.project_path,
+            mode=args.mode,
+            slot=args.slot,
+            second_slot=args.second_slot,
+            headless=args.headless,
+            manual_setup=args.manual_setup,
+            target_files=args.files,
+            output_zip=args.output_zip,
+            verify_timeout=args.verify_timeout,
+            verify_cmd=args.verify_cmd,
+            skip_verify=args.skip_verify,
+            open_comparison=args.open_comparison,
+        )
 
     # A run that finishes WITHOUT a delivery is carried over into a NEW session
     # by default (see --no-carry-over).
@@ -6603,6 +7169,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             verify_timeout=args.verify_timeout,
             verify_cmd=args.verify_cmd,
             skip_verify=args.skip_verify,
+            prompt_file=args.prompt_file,
+            delivery_dir=args.delivery_dir,
+            lane=args.lane,
+            skip_package=args.skip_package,
         )
 
     last = EXIT_FAILURE
@@ -6627,6 +7197,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             verify_timeout=args.verify_timeout,
             verify_cmd=args.verify_cmd,
             skip_verify=args.skip_verify,
+            prompt_file=args.prompt_file,
+            delivery_dir=args.delivery_dir,
+            lane=args.lane,
+            skip_package=args.skip_package,
         )
         if last == EXIT_QUOTA_LIMITED:
             saw_quota = True
