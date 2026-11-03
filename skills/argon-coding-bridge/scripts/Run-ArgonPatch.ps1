@@ -669,11 +669,18 @@ try {
         $hsPattern = "(?s)" + [regex]::Escape($openHs) + "\r?\n.*?\r?\n" + [regex]::Escape($closeHs)
         $strippedForNotes = [regex]::Replace($rawPatchText, $hsPattern, "")
         $noteMatches = [regex]::Matches($strippedForNotes, '(?ms)^[ \t]*#\s*---\s*NOTES\b.*?^[ \t]*#\s*---\s*END NOTES\s*---')
-        if ($noteMatches.Count -gt 0) {
+        if ($noteMatches.Count -gt 0 -and -not $SkipVerify) {
             $lastNoteBlock = $noteMatches[$noteMatches.Count - 1].Value.Trim()
             $backupDirForNotes = Join-Path $projectRoot ".argon_backup"
             New-Item -ItemType Directory -Path $backupDirForNotes -Force | Out-Null
-            $notesFile = Join-Path $backupDirForNotes ("argon_notes_" + (Get-Date -Format "yyyyMMdd_HHmmss") + ".md")
+            $existingNotes = Get-ChildItem -LiteralPath $backupDirForNotes -Filter "argon_notes_*.md" -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.LastWriteTime -ge (Get-Date).AddSeconds(-120) } |
+                Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if ($existingNotes) {
+                $notesFile = $existingNotes.FullName
+            } else {
+                $notesFile = Join-Path $backupDirForNotes ("argon_notes_" + (Get-Date -Format "yyyyMMdd_HHmmss") + ".md")
+            }
             $notesHeader = ('#' * 1) + " Argon notes and suggestions`n`nRecorded by Gemini 4 Argon while producing the patch.`n`n"
             [System.IO.File]::WriteAllText($notesFile, $notesHeader + $lastNoteBlock + "`n", [System.Text.UTF8Encoding]::new($false))
             Write-ArgonInfo "Saved Argon notes to: $notesFile"

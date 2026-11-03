@@ -139,9 +139,6 @@ if ($Resume) {
 if ($MaxAccounts -gt 0) {
     $argList += @("--max-accounts", "$MaxAccounts")
 }
-if ($MaxVerifyRounds -gt 0) {
-    $argList += @("--max-verify-rounds", "$MaxVerifyRounds")
-}
 if ($VerifyTimeout -gt 0) {
     $argList += @("--verify-timeout", "$VerifyTimeout")
 }

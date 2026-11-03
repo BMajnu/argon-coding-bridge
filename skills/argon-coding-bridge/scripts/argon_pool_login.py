@@ -42,11 +42,92 @@ if not logger.handlers:
 
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "accounts_pool.json"
 
+GEMINI_CONTINUE_URL = "https://gemini.google.com/u/0/app"
 GOOGLE_ADD_SESSION_URL = (
     "https://accounts.google.com/v3/signin/identifier"
     "?flowName=GlifWebSignIn&flowEntry=AddSession"
+    "&continue=https%3A%2F%2Fgemini.google.com%2Fu%2F0%2Fapp"
 )
 GEMINI_WEB_URL = "https://gemini.google.com{slot}app"
+
+
+def is_isolated_slot_profile(profile_dir: Optional[Union[str, Path]]) -> bool:
+    """Return True when profile_dir is a per-slot profile (holds one account at index 0)."""
+    if profile_dir is None:
+        return True
+    try:
+        resolved = Path(profile_dir).expanduser().resolve()
+        return resolved.parent.name == "argon_profiles" or resolved.name.startswith("slot-")
+    except Exception:
+        return False
+
+
+def build_signin_url(isolated_profile: bool = True) -> str:
+    """Return the Google sign-in URL for a slot profile.
+
+    Never derives `authuser` from the slot number: in a per-slot profile the
+    account index is always 0, the `continue` target is
+    `https://gemini.google.com/u/0/app`, and no `authuser` parameter is sent.
+    """
+    return GOOGLE_ADD_SESSION_URL
+
+
+def sanitize_signin_url(url: str, isolated_profile: bool = True) -> str:
+    """Strip `authuser` and normalize any `/u/<N>/` continue path to `/u/0/`."""
+    if not url:
+        return GOOGLE_ADD_SESSION_URL
+    cleaned = re.sub(r"([?&])authuser=[^&#]*&?", r"\1", str(url), flags=re.IGNORECASE)
+    cleaned = re.sub(r"[?&]$", "", cleaned)
+    cleaned = cleaned.replace("?&", "?")
+    if isolated_profile:
+        cleaned = re.sub(r"/u/\d+/", "/u/0/", cleaned)
+        cleaned = re.sub(r"%2Fu%2F\d+%2F", "%2Fu%2F0%2F", cleaned, flags=re.IGNORECASE)
+    return cleaned
+
+
+def reset_slot_profile_accounts(profile_dir: Union[str, Path], clear_cookies: bool = False) -> None:
+    """Reset the stored account list (and optionally cookie DB) of a slot profile on disk.
+
+    Must run BEFORE Chrome starts on `profile_dir` so Chrome does not load the
+    seeded account from `Default/Preferences` into memory and overwrite disk on exit.
+    """
+    prof = Path(profile_dir).expanduser().resolve()
+    pref = prof / "Default" / "Preferences"
+    if pref.is_file():
+        try:
+            data = json.loads(pref.read_text(encoding="utf-8", errors="replace"))
+            changed = False
+            if data.get("account_info"):
+                data["account_info"] = []
+                changed = True
+            signin = data.get("signin")
+            if isinstance(signin, dict) and signin.get("accounts"):
+                signin["accounts"] = []
+                changed = True
+            google_cfg = data.get("google")
+            if isinstance(google_cfg, dict) and isinstance(google_cfg.get("services"), dict):
+                svc = google_cfg["services"]
+                for k in ("account_id", "last_username", "username", "consented_to_sync"):
+                    if k in svc:
+                        svc.pop(k, None)
+                        changed = True
+            if changed:
+                tmp = pref.with_suffix(".json.tmp")
+                tmp.write_text(json.dumps(data, separators=(",", ":")), encoding="utf-8")
+                tmp.replace(pref)
+        except Exception:
+            pass
+    if clear_cookies:
+        for rel in ("Default/Network/Cookies", "Default/Cookies"):
+            base_cookie = prof / rel
+            for suffix in ("", "-journal", "-wal", "-shm"):
+                cand = Path(str(base_cookie) + suffix)
+                try:
+                    if cand.is_file():
+                        cand.unlink()
+                except OSError:
+                    pass
+
 
 CHROME_LAUNCH_ARGS = [
     "--disable-blink-features=AutomationControlled",
@@ -617,7 +698,7 @@ class GoogleLogin:
         self._playwright: Any = None
         self.context: Any = None
 
-    def switch_to_slot_profile(self, slot: Union[str, int]) -> Path:
+    def switch_to_slot_profile(self, slot: Union[str, int], reset_accounts: bool = False) -> Path:
         """Switch this GoogleLogin instance to the given slot's isolated profile directory."""
         norm = normalize_slot(slot)
         target_dir = self.pool_config.profile_dir_for_slot(norm)
@@ -625,10 +706,14 @@ class GoogleLogin:
         if not (target_dir.is_dir() and (target_dir / "Default").is_dir()):
             if base_dir.is_dir() and (base_dir / "Default").is_dir() and target_dir.resolve() != base_dir.resolve():
                 seed_slot_profile(base_dir, target_dir)
-        if self.context is not None and self.profile_dir.resolve() != target_dir.resolve():
+        if self.context is not None and (reset_accounts or self.profile_dir.resolve() != target_dir.resolve()):
             self.close()
         self.profile_dir = target_dir
+        if reset_accounts:
+            reset_slot_profile_accounts(target_dir, clear_cookies=True)
         self.start()
+        if reset_accounts:
+            self._clear_google_session()
         return target_dir
 
     def __enter__(self) -> "GoogleLogin":
@@ -759,29 +844,12 @@ class GoogleLogin:
         the list before the browser starts makes the account we sign in the
         only one.
         """
-        pref = self.profile_dir / "Default" / "Preferences"
-        if not pref.is_file():
-            return
-        try:
-            data = json.loads(pref.read_text(encoding="utf-8", errors="replace"))
-        except Exception:
-            return
-        changed = False
-        if data.get("account_info"):
-            data["account_info"] = []
-            changed = True
-        signin = data.get("signin")
-        if isinstance(signin, dict) and signin.get("accounts"):
-            signin["accounts"] = []
-            changed = True
-        if not changed:
-            return
-        try:
-            tmp = pref.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(data, separators=(",", ":")), encoding="utf-8")
-            tmp.replace(pref)
-        except Exception:
-            pass
+        was_running = self.context is not None
+        if was_running:
+            self.close()
+        reset_slot_profile_accounts(self.profile_dir, clear_cookies=True)
+        if was_running:
+            self.start()
 
     def _clear_google_session(self) -> None:
         """Drop every cookie so the next sign-in becomes the ACTIVE session.
@@ -822,6 +890,24 @@ class GoogleLogin:
             body = (page.locator("body").inner_text(timeout=15000) or "").lower()
         except Exception:
             return False
+        url_now = (page.url or "").lower()
+        if any(
+            tok in url_now
+            for tok in (
+                "accounts.google.com/v3/signin",
+                "accounts.google.com/signin",
+                "accounts.google.com/servicelogin",
+                "/signin/rejected",
+                "/challenge/",
+            )
+        ):
+            return False
+        try:
+            sign_in_links = page.locator("a[href*='ServiceLogin'], a[aria-label*='Sign in']")
+            if sign_in_links.count() > 0 and sign_in_links.first.is_visible():
+                return False
+        except Exception:
+            pass
         # "Where should we start?" is normal copy on a signed-in Gemini home
         # page - only the guest sidebar item counts.
         if "sign in to save activity" in body or "sign in or create an account" in body:
@@ -946,12 +1032,21 @@ class GoogleLogin:
                 except Exception:
                     pass
 
+        if self.context is None and is_isolated_slot_profile(self.profile_dir):
+            reset_slot_profile_accounts(self.profile_dir, clear_cookies=True)
         page = self._active_page()
 
         try:
-            _emit("Opening Google AddSession sign-in page...")
-            page.goto(GOOGLE_ADD_SESSION_URL, wait_until="domcontentloaded", timeout=45000)
+            signin_url = build_signin_url(isolated_profile=is_isolated_slot_profile(self.profile_dir))
+            _emit(f"Opening Google sign-in page ({signin_url})...")
+            page.goto(signin_url, wait_until="domcontentloaded", timeout=45000)
             page.wait_for_timeout(800)
+            cur_url = (page.url or "").lower()
+            if "/signin/rejected" in cur_url or "authuser=" in cur_url:
+                _emit("Detected rejected or authuser-bound sign-in URL; resetting session and retrying without authuser...")
+                self._clear_google_session()
+                page.goto(sanitize_signin_url(signin_url, isolated_profile=True), wait_until="domcontentloaded", timeout=45000)
+                page.wait_for_timeout(800)
 
             # If Google displays an account chooser first, click "Use another account"
             ident_locator = page.locator("input#identifierId, input[type='email']")
@@ -1193,15 +1288,14 @@ class GoogleLogin:
                             slot=slot,
                         )
                     else:
-                        self.switch_to_slot_profile(slot)
                         # A slot profile holds exactly ONE account. The profile it was
                         # seeded from can still carry the previous account's session and
                         # a pending "verify it's you" challenge, and Google then keeps
                         # THAT account active - the new sign-in is only "added", so
-                        # Gemini keeps showing the guest page. Start from a clean profile
-                        # so the account we sign in becomes the active one.
-                        self._reset_profile_accounts()
-                        self._clear_google_session()
+                        # Gemini keeps showing the guest page. Reset Preferences and
+                        # cookies BEFORE starting Chrome so the account we sign in
+                        # becomes the active one at index 0.
+                        self.switch_to_slot_profile(slot, reset_accounts=True)
                         res = self.login(
                             email=email,
                             password=password,
@@ -1252,7 +1346,7 @@ class GoogleLogin:
         return results
 
     def open_gemini(self, slot: Optional[str] = None) -> Any:
-        """Open Gemini Web (https://gemini.google.com/u/<slot>/app) in the slot's persistent profile."""
+        """Open Gemini Web (https://gemini.google.com/u/0/app) in the slot's persistent profile."""
         if slot:
             try:
                 self.pool_config.set_active_slot(slot)
@@ -1261,7 +1355,8 @@ class GoogleLogin:
         slot_part = normalize_slot(slot) if slot else self.pool_config.active_slot()
         self.switch_to_slot_profile(slot_part)
         page = self._active_page()
-        page.goto(GEMINI_WEB_URL.format(slot=slot_part), wait_until="domcontentloaded", timeout=45000)
+        url_slot = "/u/0/" if is_isolated_slot_profile(self.profile_dir) else slot_part
+        page.goto(GEMINI_WEB_URL.format(slot=url_slot), wait_until="domcontentloaded", timeout=45000)
         return page
 
     def open_aistudio(self, slot: Optional[str] = None) -> Any:

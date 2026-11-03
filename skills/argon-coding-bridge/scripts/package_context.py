@@ -83,6 +83,18 @@ NO_GUESSING_DIRECTIVE = (
     "than an incomplete answer."
 )
 
+ROOT_CAUSE_DIRECTIVE = (
+    "If something in this project is broken, do not change anything until you can\n"
+    "state the root cause and the EVIDENCE for it (the exact file and line, the\n"
+    "exact DOM node you measured, the exact value you read).\n"
+    "\n"
+    "- Every symptom must be traced to a concrete cause in THIS code base.\n"
+    "- If you cannot find the cause in the archive, say exactly what you need -\n"
+    "  do not invent a fix and do not guess a signature, a path or a value.\n"
+    "- Put the root cause and its evidence in the NOTES block of your patch, under\n"
+    "  the heading `## ROOT CAUSE`."
+)
+
 
 def is_secret(filename: str) -> bool:
     """Return True only when filename looks like genuine key or credential material.
@@ -91,11 +103,13 @@ def is_secret(filename: str) -> bool:
     appears somewhere in its name; when in doubt, include the file.
     """
     fn = Path(filename).name.lower()
-    if fn.startswith(".env"):
+    if fn.startswith(".env") or fn in (".netrc", ".npmrc", ".pypirc"):
         return True
-    if any(fn.endswith(ext) for ext in (".pem", ".key", ".keystore", ".pfx", ".p12")):
+    if any(fn.endswith(ext) for ext in (".pem", ".key", ".keystore", ".pfx", ".p12", ".kdbx")):
         return True
     if any(k in fn for k in ("id_rsa", "id_ed25519", "id_ecdsa", "id_dsa")):
+        return True
+    if re.search(r"accounts?[_-]?pool", fn):
         return True
     if fn.endswith(".json"):
         if re.search(r"accounts?[_-]?pool", fn):
@@ -154,6 +168,8 @@ GENERATED_ARTEFACTS = {
     "task_brief.md",
     "api_index.md",
     "accounts_pool.json",
+    "argon_sessions.json",
+    "argon_task_state.json",
 }
 
 
@@ -163,7 +179,7 @@ def is_generated_artefact(rel_path: Path) -> bool:
         return True
     if name.startswith("apply_changes") and (name.endswith(".ps1") or ".ps1.bak-" in name):
         return True
-    if re.search(r"accounts?[_-]?pool", name) and name.endswith(".json"):
+    if re.search(r"accounts?[_-]?pool", name):
         return True
     norm_rel = rel_path.as_posix().lower().lstrip("/")
     if norm_rel == "skills/argon-coding-bridge/config/accounts_pool.json" or norm_rel.endswith(
@@ -533,6 +549,10 @@ def _compose_task_brief(
         ]
 
     top_sections = nl.join([
+        f"{h2} FIND THE ROOT CAUSE FIRST",
+        "",
+        ROOT_CAUSE_DIRECTIVE,
+        "",
         f"{h2} THE EXACT API OF THIS PROJECT",
         "",
         EXACT_API_SECTION_TEXT,
@@ -769,8 +789,12 @@ $TargetRoot = '{proj_root}'
      (exiting non-zero) if any file does not match.
 
 ### 5. RECORD WHAT YOU FOUND (REQUIRED)
-   - Append a trailing comment block at the very end of `apply_changes.ps1` after the last write:
+   - Append a trailing comment block at the very end of `apply_changes.ps1` after the last write.
+     The NOTES block of every delivered patch MUST start with a `## ROOT CAUSE` section naming the
+     root cause and its evidence (even when the change is trivial):
      `# --- NOTES: inconsistencies and suggestions found while reading the project ---`
+     `# ## ROOT CAUSE`
+     `# NOTE: <file>:<line> - <exact root cause, measured evidence, and why this change fixes it>`
      `# NOTE: <file> - <what is inconsistent, why it matters, and what you would do instead>`
      `# --- END NOTES ---`
 """

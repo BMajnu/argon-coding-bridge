@@ -33,6 +33,7 @@ from argon_pool_login import (
     PoolConfig,
     find_chrome_executable,
     is_profile_busy,
+    reset_slot_profile_accounts,
     seed_slot_profile,
 )
 
@@ -729,13 +730,20 @@ class PoolLoginAssistantApp:
         slot = acc.get("slot", "/u/0/") if acc else self.pool_config.active_slot()
         if acc:
             self.copy_email()
+        profile_dir = self.pool_config.profile_dir_for_slot(slot)
+        if not is_profile_busy(profile_dir):
+            if not (profile_dir.is_dir() and (profile_dir / "Default").is_dir()):
+                seed_slot_profile(self.pool_config.profile_dir, profile_dir)
+            reset_slot_profile_accounts(profile_dir, clear_cookies=True)
         self._launch_chrome_url(GOOGLE_ADD_SESSION_URL, "Google Add Account Page", slot=slot)
 
     def open_gemini_web(self) -> None:
         acc = self._current_account()
         slot = self.pool_config.set_active_slot(acc.get("slot", "/u/0/")) if acc else self.pool_config.active_slot()
-        url = GEMINI_WEB_URL.format(slot=slot)
-        self._launch_chrome_url(url, f"Gemini Web ({url})", slot=slot)
+        # A per-slot profile holds exactly one account at index 0. Opening /u/<N>/
+        # lands on the guest page and makes manual sign-in fail with authuser=N.
+        url = GEMINI_WEB_URL.format(slot="/u/0/")
+        self._launch_chrome_url(url, f"Gemini Web ({slot} -> {url})", slot=slot)
 
     def open_ai_studio(self) -> None:
         """Removed: Google AI Studio is no longer supported.

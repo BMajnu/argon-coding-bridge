@@ -154,9 +154,23 @@ VERIFY_COMMAND_RULE = (
     "not sure."
 )
 
+ROOT_CAUSE_RULE = (
+    "## FIND THE ROOT CAUSE FIRST\n\n"
+    "If something in this project is broken, do not change anything until you can\n"
+    "state the root cause and the EVIDENCE for it (the exact file and line, the\n"
+    "exact DOM node you measured, the exact value you read).\n\n"
+    "- Every symptom must be traced to a concrete cause in THIS code base.\n"
+    "- If you cannot find the cause in the archive, say exactly what you need -\n"
+    "  do not invent a fix and do not guess a signature, a path or a value.\n"
+    "- Put the root cause and its evidence in the NOTES block of your patch, under\n"
+    "  the heading `## ROOT CAUSE`."
+)
+
 
 def _ensure_no_guessing_rule(prompt_body: str) -> str:
     out = prompt_body.rstrip()
+    if "FIND THE ROOT CAUSE FIRST" not in out:
+        out = out + "\n\n" + ROOT_CAUSE_RULE
     if "API_INDEX.md lists every public declaration" not in out:
         out = out + "\n\n" + EXACT_API_RULE
     if "characters backslash and n" not in out:
@@ -182,6 +196,7 @@ def build_surgical_prompt(
     target_directory: str = "",
     template_path: Path = PROMPT_TEMPLATE_PATH,
     is_continuation: bool = False,
+    diagnostic_evidence: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Build the surgical prompt from templates/argon_task_prompt_template.md.
 
@@ -207,9 +222,12 @@ def build_surgical_prompt(
             body = body.replace("{{TARGET_DIRECTORY}}", target)
         if "{{CONTEXT_NOTE}}" in body:
             body = body.replace("{{CONTEXT_NOTE}}", note)
-        return _ensure_no_guessing_rule(body)
+        rendered = _ensure_no_guessing_rule(body)
+        if diagnostic_evidence:
+            rendered = rendered.rstrip() + "\n\n" + _format_diagnostic_evidence_block(diagnostic_evidence) + "\n"
+        return rendered
     h3 = "#" * 3
-    return _ensure_no_guessing_rule(
+    rendered = _ensure_no_guessing_rule(
         "I have uploaded the relevant codebase context as a zip archive (`argon_context.zip`). "
         "Inside the archive, you will find `TASK_BRIEF.md` containing the project overview and file structure.\n\n"
         f"{h3} 🎯 Primary Objective:\n{task_description.strip()}\n\n"
@@ -224,6 +242,9 @@ def build_surgical_prompt(
         "the chat; keep the reply short: what changed, which files changed and why, the file reference, "
         "and how to verify. An inline code block is a fallback used only when file delivery is unavailable."
     )
+    if diagnostic_evidence:
+        rendered = rendered.rstrip() + "\n\n" + _format_diagnostic_evidence_block(diagnostic_evidence) + "\n"
+    return rendered
 
 
 def find_delivered_patch(search_dirs, target_name: str = "apply_changes",
@@ -1695,11 +1716,11 @@ def _extract_notes(patch_text: str) -> str:
     notes = []
     for raw in cleaned.splitlines():
         s = raw.strip()
-        if not s.startswith("#") or re.match(r"^#{2,}\s", s):
+        if not s.startswith("#") or re.match(r"^#{3,}\s", s):
             continue
         body = s.lstrip("#").strip()
         if re.search(
-            r"(note|inconsisten|issue|concern|warning|suggest|recommend|caveat|todo|"
+            r"(root\s*cause|note|inconsisten|issue|concern|warning|suggest|recommend|caveat|todo|"
             r"fixme|smell|drift|stale|mismatch)",
             body,
             re.IGNORECASE,
@@ -1708,11 +1729,19 @@ def _extract_notes(patch_text: str) -> str:
     return "\n".join(notes)
 
 
-def _save_notes(patch_text: str, project_path: Path) -> Optional[Path]:
-    """Write the recorded notes next to the project so they are not lost."""
+def _save_notes(
+    patch_text: str,
+    project_path: Path,
+    existing_notes_path: Optional[Path] = None,
+) -> Optional[Path]:
+    """Write the recorded notes next to the project so they are not lost.
+
+    Reuses `existing_notes_path` when provided so a single run never writes
+    more than one `argon_notes_<timestamp>.md` file.
+    """
     notes = _extract_notes(patch_text)
     if not notes.strip():
-        return None
+        return existing_notes_path
     note_lines = [ln for ln in notes.splitlines() if ln.strip()]
     item_lines = [
         ln
@@ -1723,7 +1752,11 @@ def _save_notes(patch_text: str, project_path: Path) -> Optional[Path]:
     try:
         out_dir = Path(project_path) / ".argon_backup"
         out_dir.mkdir(parents=True, exist_ok=True)
-        out = out_dir / ("argon_notes_" + time.strftime("%Y%m%d_%H%M%S") + ".md")
+        out = (
+            Path(existing_notes_path)
+            if existing_notes_path is not None
+            else out_dir / ("argon_notes_" + time.strftime("%Y%m%d_%H%M%S") + ".md")
+        )
         out.write_text(
             "# Argon notes and suggestions\n\n"
             "Recorded by Gemini 4 Argon while producing the patch.\n\n"
@@ -1887,7 +1920,7 @@ def apply_extracted_patch(
 def get_target_url(
     mode: str,
     slot: Optional[str] = None,
-    isolated_profile: bool = False,
+    isolated_profile: bool = True,
 ) -> str:
     """
     Return the canonical workspace URL for the given mode.
@@ -1924,14 +1957,53 @@ def get_target_url(
 
 def _profile_is_isolated_slot(profile_dir: Any) -> bool:
     """True when the profile is a per-slot profile (one account, index 0)."""
+    if not profile_dir:
+        return True
     try:
-        return Path(str(profile_dir)).expanduser().resolve().parent.name == "argon_profiles"
+        resolved = Path(str(profile_dir)).expanduser().resolve()
+        return resolved.parent.name == "argon_profiles" or resolved.name.startswith("slot-")
     except Exception:
         return False
 
 
+def _normalize_gemini_chat_url(url: str, isolated_profile: bool = True) -> str:
+    """Ensure a Gemini Web URL uses `/u/0/` when opened in a 1-account isolated slot profile."""
+    raw = (url or "").strip()
+    if not raw:
+        return raw
+    if isolated_profile and "gemini.google.com" in raw.lower():
+        raw = re.sub(r"(gemini\.google\.com)/u/\d+/", r"\1/u/0/", raw, flags=re.IGNORECASE)
+    return raw
+
+
 def _gemini_page_is_guest(page) -> bool:
-    """True when the page shows Gemini's anonymous guest experience."""
+    """True when the page shows Gemini's anonymous guest experience.
+
+    Never uses 'Where should we start?' because a signed-in Gemini home page
+    also contains that phrase. Relies only on 'Sign in to save activity',
+    'Sign in or create an account', an accounts.google.com/signin URL, or a
+    visible Sign in link.
+    """
+    try:
+        url = (page.url or "").lower()
+    except Exception:
+        url = ""
+    if any(
+        tok in url
+        for tok in (
+            "accounts.google.com/v3/signin",
+            "accounts.google.com/signin",
+            "accounts.google.com/servicelogin",
+            "/signin/rejected",
+        )
+    ):
+        return True
+    try:
+        sign_in_links = page.locator("a[href*='ServiceLogin'], a[aria-label*='Sign in']")
+        if sign_in_links.count() > 0 and sign_in_links.first.is_visible():
+            return True
+    except Exception:
+        pass
     try:
         body = (page.locator("body").inner_text(timeout=12000) or "").lower()
     except Exception:
@@ -2584,7 +2656,8 @@ class SessionStore:
 
         clean_mode = (mode or "gemini").strip().lower()
         slot_part = normalize_slot(slot) if slot else "/u/0/"
-        chat_url = f"https://gemini.google.com{slot_part}app/{chat_id}"
+        url_slot = "/u/0/" if _profile_is_isolated_slot(profile_dir) else slot_part
+        chat_url = f"https://gemini.google.com{url_slot}app/{chat_id}"
         entry: Dict[str, Any] = {
             "mode": clean_mode,
             "slot": slot_part,
@@ -2788,6 +2861,8 @@ def _retry(fn, page, attempts: int = 3, delay: float = 2.0) -> bool:
         try:
             if fn(page):
                 return True
+            if _argon_picker_is_disabled(page):
+                return False
         except Exception:
             pass
         if attempt < attempts - 1:
@@ -3051,20 +3126,99 @@ def _open_picker(page) -> bool:
     return False
 
 
-def _click_option_in_picker(page, pattern) -> bool:
-    """Click a matching option INSIDE the open picker.
+_LAST_PICKER_ARGON_STATE: Dict[int, Dict[str, Any]] = {}
 
-    The sidebar chat history can also contain the text "4 Argon" (an old chat
-    title). Clicking that would navigate away from the composer, so a global
-    text match is only allowed when it really sits inside a listbox / menu.
+
+def _detect_signed_in_account(
+    page: Any,
+    fallback_email: Optional[str] = None,
+    slot: Optional[str] = None,
+) -> str:
+    """Read which Google account is currently signed into the page."""
+    try:
+        avatars = page.locator(
+            "a[aria-label*='Google Account'], button[aria-label*='Google Account'], "
+            "a[aria-label*='Google অ্যাকাউন্ট'], button[aria-label*='Google অ্যাকাউন্ট'], "
+            "[aria-label*='@']"
+        )
+        for i in range(min(avatars.count(), 6)):
+            el = avatars.nth(i)
+            for attr in ("aria-label", "title", "data-email"):
+                try:
+                    val = str(el.get_attribute(attr) or "").strip()
+                except Exception:
+                    val = ""
+                if not val:
+                    continue
+                m = re.search(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", val)
+                if m:
+                    return m.group(0)
+    except Exception:
+        pass
+    if fallback_email:
+        return str(fallback_email).strip()
+    if slot:
+        return f"slot {slot}"
+    return "current profile account"
+
+
+def _element_is_disabled(el) -> bool:
+    """Return True when a picker option (or its enclosing menuitem/option) is disabled."""
+    try:
+        if (el.get_attribute("aria-disabled") or "").strip().lower() == "true":
+            return True
+    except Exception:
+        pass
+    try:
+        if el.get_attribute("disabled") is not None:
+            return True
+    except Exception:
+        pass
+    try:
+        if bool(
+            el.evaluate(
+                r"""node => {
+                    let cur = node;
+                    for (let depth = 0; depth < 5 && cur; depth++, cur = cur.parentElement) {
+                        const role = (cur.getAttribute && (cur.getAttribute('role') || '')).toLowerCase();
+                        if (role === 'listbox' || role === 'menu') break;
+                        const ariaDis = (cur.getAttribute && (cur.getAttribute('aria-disabled') || '')).toLowerCase();
+                        if (ariaDis === 'true') return true;
+                        if (cur.hasAttribute && cur.hasAttribute('disabled')) return true;
+                        if (cur.disabled === true) return true;
+                        const cls = (cur.getAttribute && (cur.getAttribute('class') || '')) || '';
+                        if (/(?:^|\s|-)disabled(?:\s|$)/i.test(cls)) return true;
+                    }
+                    return false;
+                }"""
+            )
+        ):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _inspect_option_in_picker(page, pattern) -> str:
+    """Inspect and click a matching option inside the open picker.
+
+    Returns:
+      - 'clicked'  : a matching enabled option was found and clicked.
+      - 'disabled' : a matching option was present in the picker, but disabled
+                     (aria-disabled='true' or disabled attribute) - meaning the
+                     account has no Argon quota/tier available right now.
+      - 'missing'  : no matching option was found in the picker at all (meaning
+                     the picker did not open).
     """
+    saw_disabled_match = False
     for sel in (
         "[role='listbox'] [role='option']",
         "[role='menu'] [role='menuitem']",
-        "[role='listbox'] *",
-        "[role='menu'] *",
+        "[role='menu'] [role='menuitemradio']",
         "mat-option",
         "li[role='option']",
+        "[role='listbox'] *",
+        "[role='menu'] *",
     ):
         try:
             loc = page.locator(sel)
@@ -3079,27 +3233,35 @@ def _click_option_in_picker(page, pattern) -> bool:
                     continue
                 if not (pattern.search(text) or pattern.search(label)):
                     continue
-                # A disabled entry cannot be clicked - Playwright would retry
-                # for 30 seconds and then time out, which used to stall the
-                # whole run. Skip it and try the next match.
-                try:
-                    if (el.get_attribute("aria-disabled") or "").strip().lower() == "true":
-                        continue
-                except Exception:
-                    pass
-                try:
-                    if el.get_attribute("disabled") is not None:
-                        continue
-                except Exception:
-                    pass
+                if _element_is_disabled(el):
+                    saw_disabled_match = True
+                    continue
                 try:
                     el.click(timeout=3000)
-                    return True
+                    return "clicked"
                 except Exception:
                     continue
         except Exception:
             continue
-    return False
+    if saw_disabled_match:
+        return "disabled"
+    return "missing"
+
+
+def _click_option_in_picker(page, pattern) -> bool:
+    """Click a matching option INSIDE the open picker.
+
+    The sidebar chat history can also contain the text "4 Argon" (an old chat
+    title). Clicking that would navigate away from the composer, so a global
+    text match is only allowed when it really sits inside a listbox / menu.
+    """
+    return _inspect_option_in_picker(page, pattern) == "clicked"
+
+
+def _argon_picker_is_disabled(page) -> bool:
+    """Return True when the most recent model check saw '4 Argon' present but disabled."""
+    info = _LAST_PICKER_ARGON_STATE.get(id(page)) or {}
+    return bool(info.get("disabled"))
 
 
 def ensure_argon_model(page, attempts: int = 3) -> bool:
@@ -3110,13 +3272,16 @@ def ensure_argon_model(page, attempts: int = 3) -> bool:
     the CHIP, which shows the model that will really answer, and not against
     loose text on the page.
 
-    The check runs right before EVERY prompt - a fresh task and a follow-up in
-    an existing conversation alike, because an existing conversation can drop
-    back to Flash at any time.
+    Distinguishes a disabled '4 Argon' option (aria-disabled='true' / disabled,
+    meaning this account has no Argon available right now and the bridge must
+    rotate to the next pool account) from a missing option (meaning the picker
+    did not open).
 
     Returns True only when the chip reads Argon.
     """
+    _LAST_PICKER_ARGON_STATE.pop(id(page), None)
     last_seen = ""
+    last_picker_state = "missing"
     for attempt in range(max(1, attempts)):
         chip = _model_chip(page)
         if chip is not None:
@@ -3134,7 +3299,8 @@ def ensure_argon_model(page, attempts: int = 3) -> bool:
                 page.wait_for_timeout(1200)
             except Exception:
                 pass
-        _click_option_in_picker(page, RE_ARGON)
+        picker_state = _inspect_option_in_picker(page, RE_ARGON)
+        last_picker_state = picker_state
         try:
             page.wait_for_timeout(1400)
         except Exception:
@@ -3146,6 +3312,19 @@ def ensure_argon_model(page, attempts: int = 3) -> bool:
             page.wait_for_timeout(500)
         except Exception:
             pass
+        if picker_state == "disabled":
+            acct = _detect_signed_in_account(page)
+            _LAST_PICKER_ARGON_STATE[id(page)] = {
+                "disabled": True,
+                "account": acct,
+                "chip": last_seen,
+            }
+            print(
+                f"[!] The '4 Argon' option is present in the model picker but DISABLED "
+                f"(aria-disabled) on account {acct}: this account has no Argon available right now.",
+                file=sys.stderr,
+            )
+            return False
         chip2 = _model_chip(page)
         if chip2 is not None:
             name2 = _model_name(chip2)
@@ -3154,10 +3333,17 @@ def ensure_argon_model(page, attempts: int = 3) -> bool:
             if _chip_is_argon(chip2):
                 print(f"[+] Model switched to Argon ({name2!r}).")
                 return True
-    print(
-        f"[!] The model chip reads {last_seen!r} and not 4 Argon - refusing to send.",
-        file=sys.stderr,
-    )
+    if last_picker_state == "missing":
+        print(
+            f"[!] The '4 Argon' option was not found in the model picker (the picker may not "
+            f"have opened) and the model chip reads {last_seen!r} - refusing to send.",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"[!] The model chip reads {last_seen!r} and not 4 Argon - refusing to send.",
+            file=sys.stderr,
+        )
     return False
 
 
@@ -3291,8 +3477,33 @@ def _zip_input(page):
         return None
 
 
+def _verify_zip_has_no_credentials(zip_path: Path) -> bool:
+    """Verify that a context archive does not contain credential or secret files before uploading."""
+    try:
+        import zipfile as _zf
+        from package_context import is_secret
+
+        zp = Path(zip_path)
+        if not zp.is_file():
+            return True
+        with _zf.ZipFile(zp, "r") as zf:
+            for member in zf.namelist():
+                name = Path(member).name
+                if is_secret(name) or re.search(r"accounts?[_-]?pool", name, re.IGNORECASE):
+                    print(
+                        f"[ERROR] Refusing to upload {zp.name}: archive contains credential file {member!r}.",
+                        file=sys.stderr,
+                    )
+                    return False
+        return True
+    except Exception:
+        return True
+
+
 def attach_zip(page, zip_path: Path) -> bool:
     """Attach the context zip to the composer and verify it really landed."""
+    if not _verify_zip_has_no_credentials(Path(zip_path)):
+        return False
     # 1. Open the upload menu first - that is when the file input appears.
     _open_upload_menu(page)
     el = _zip_input(page)
@@ -3811,9 +4022,15 @@ def _resolve_reopen_url(
     fallback_url: str,
     task_state: TaskState,
     session_store: SessionStore,
+    isolated_profile: bool = False,
 ) -> str:
-    """Return the best conversation URL to reopen for an in-progress or resumed task."""
-    slot_part = normalize_slot(active_slot) if active_slot else "/u/0/"
+    """Return the best conversation URL to reopen for an in-progress or resumed task.
+
+    `isolated_profile` must be True only for a per-slot profile (one account,
+    browser index 0). The shared master profile holds every account, so its URL
+    has to keep the slot index - defaulting to True would open the wrong one.
+    """
+    slot_part = "/u/0/" if isolated_profile else (normalize_slot(active_slot) if active_slot else "/u/0/")
 
     def _url_for_chat_id(cid: str) -> str:
         return f"https://gemini.google.com{slot_part}app/{cid}"
@@ -3836,10 +4053,10 @@ def _resolve_reopen_url(
         return _url_for_chat_id(ss_cid)
 
     if ts_entry.get("chat_url"):
-        return str(ts_entry["chat_url"])
+        return _normalize_gemini_chat_url(str(ts_entry["chat_url"]), isolated_profile=isolated_profile)
     if current_url:
-        return current_url
-    return fallback_url
+        return _normalize_gemini_chat_url(current_url, isolated_profile=isolated_profile)
+    return _normalize_gemini_chat_url(fallback_url, isolated_profile=isolated_profile)
 
 
 GEMINI_ERROR_MARKERS = (
@@ -3927,17 +4144,160 @@ def _detect_gemini_error(page) -> Optional[str]:
     return None
 
 
+def _collect_diagnostic_evidence(
+    page: Any,
+    proj_root: Path,
+    reason: str,
+    slot: str = "/u/0/",
+    email: Optional[str] = None,
+    profile_dir: Optional[Path] = None,
+    chat_title: str = "",
+    chat_url: str = "",
+    screenshot_path: Optional[Path] = None,
+    preflight: Optional[List[str]] = None,
+    error_output: str = "",
+    ruled_out: Optional[List[str]] = None,
+    next_step: str = "",
+) -> Dict[str, Any]:
+    """Collect measured diagnostic evidence when a run fails so Argon can state the root cause."""
+    live_url = ""
+    try:
+        if page is not None:
+            live_url = str(getattr(page, "url", "") or "")
+    except Exception:
+        live_url = ""
+    effective_url = (live_url or chat_url or "").strip()
+    cid = _extract_chat_id(effective_url) or ""
+    title_now = chat_title
+    if not title_now and page is not None:
+        try:
+            title_now = _chat_title(page)
+        except Exception:
+            title_now = ""
+    chip_name = ""
+    if page is not None:
+        try:
+            chip_el = _model_chip(page)
+            chip_name = _model_name(chip_el) if chip_el is not None else ""
+        except Exception:
+            chip_name = ""
+    page_excerpt = ""
+    if page is not None:
+        try:
+            raw_body = _page_body_snapshot(page)
+            non_empty = [ln.strip() for ln in raw_body.splitlines() if ln.strip()]
+            tail_text = "\n".join(non_empty[-25:])
+            page_excerpt = tail_text[-1500:] if len(tail_text) > 1500 else tail_text
+        except Exception:
+            page_excerpt = ""
+    acct = (
+        _detect_signed_in_account(page, fallback_email=email, slot=slot)
+        if page is not None
+        else (email or f"slot {slot}")
+    )
+    evidence: Dict[str, Any] = {
+        "captured_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "reason": reason,
+        "url": effective_url or "https://gemini.google.com/u/0/app",
+        "chat_id": cid or "(none)",
+        "chat_title": title_now or "(untitled / not yet created)",
+        "slot": slot or "/u/0/",
+        "account": acct,
+        "profile_dir": str(profile_dir) if profile_dir else "",
+        "model_chip": chip_name or "(not visible)",
+        "argon_disabled": bool(_argon_picker_is_disabled(page)) if page is not None else False,
+        "screenshot_path": str(screenshot_path) if screenshot_path else "",
+        "preflight_checklist": list(preflight or []),
+        "error_output": (error_output or "").strip()[-4000:],
+        "page_text_excerpt": page_excerpt,
+        "ruled_out": list(ruled_out or []),
+        "next_step": next_step,
+    }
+    try:
+        out_dir = Path(proj_root).resolve() / ".argon_backup"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        ev_file = out_dir / "last_diagnostic_evidence.json"
+        ev_file.write_text(json.dumps(evidence, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    except Exception:
+        pass
+    return evidence
+
+
+def _format_diagnostic_evidence_block(evidence: Dict[str, Any]) -> str:
+    """Format the measured diagnostic evidence block to hand to Argon in the follow-up prompt."""
+    if not evidence or not isinstance(evidence, dict):
+        return ""
+    h2 = "#" * 2
+    h3 = "#" * 3
+    b_char = chr(45)
+    lines = [
+        f"{h2} DIAGNOSTIC EVIDENCE FROM PREVIOUS FAILED RUN (MEASURED ON LIVE MACHINE)",
+        "",
+        "Use these measured facts to state the exact root cause under `## ROOT CAUSE` in your",
+        "NOTES block before changing anything - do not guess:",
+        "",
+        f"{b_char} Open URL: `{evidence.get('url') or '(unknown)'}`",
+        f"{b_char} Conversation ID: `{evidence.get('chat_id') or '(none)'}`",
+        f"{b_char} Conversation Title: `{evidence.get('chat_title') or '(untitled)'}`",
+        f"{b_char} Pool Slot & Account: `{evidence.get('slot') or '/u/0/'}` (`{evidence.get('account') or 'unknown'}`)",
+        f"{b_char} Profile Directory: `{evidence.get('profile_dir') or '(unknown)'}`",
+        f"{b_char} Model Chip Seen: `{evidence.get('model_chip') or '(not visible)'}`"
+        + (" (4 Argon option was aria-disabled in picker)" if evidence.get("argon_disabled") else ""),
+        f"{b_char} Screenshot Path: `{evidence.get('screenshot_path') or '(none)'}`",
+        f"{b_char} Failure Reason: `{evidence.get('reason') or '(unknown)'}`",
+    ]
+    pf = evidence.get("preflight_checklist") or []
+    if pf:
+        lines += ["", f"{h3} Pre-Flight Checklist Output", "```text", *[str(x) for x in pf], "```"]
+    ruled = evidence.get("ruled_out") or []
+    if ruled:
+        lines += ["", f"{h3} What the Bridge Already Ruled Out"]
+        for item in ruled:
+            lines.append(f"{b_char} {item}")
+    err_out = (evidence.get("error_output") or "").strip()
+    if err_out:
+        lines += ["", f"{h3} Error / Verifier Diagnostics Output", "```text", err_out, "```"]
+    excerpt = (evidence.get("page_text_excerpt") or "").strip()
+    if excerpt:
+        lines += ["", f"{h3} Measured Page Text Excerpt", "```text", excerpt, "```"]
+    return "\n".join(lines)
+
+
+def _print_run_failure_summary(evidence: Dict[str, Any]) -> None:
+    """Print the conversation title, exact link, account, profile directory, screenshot, and next step."""
+    if not evidence:
+        return
+    print("\n" + "=" * 78, file=sys.stderr)
+    print("  [!] RUN ENDED WITHOUT A DELIVERY - DIAGNOSTIC SUMMARY", file=sys.stderr)
+    print("=" * 78, file=sys.stderr)
+    print(f"  reason             : {evidence.get('reason') or '(unknown)'}", file=sys.stderr)
+    print(f"  conversation title : {evidence.get('chat_title') or '(not yet created / untitled)'}", file=sys.stderr)
+    print(f"  conversation link  : {evidence.get('url') or 'https://gemini.google.com/u/0/app'}", file=sys.stderr)
+    print(f"  account            : {evidence.get('slot') or '/u/0/'} ({evidence.get('account') or 'unknown'})", file=sys.stderr)
+    if evidence.get("profile_dir"):
+        print(f"  profile directory  : {evidence.get('profile_dir')}", file=sys.stderr)
+    if evidence.get("model_chip"):
+        print(f"  model chip         : {evidence.get('model_chip')}", file=sys.stderr)
+    if evidence.get("screenshot_path"):
+        print(f"  screenshot         : {evidence.get('screenshot_path')}", file=sys.stderr)
+    if evidence.get("next_step"):
+        print(f"  what to do next    : {evidence.get('next_step')}", file=sys.stderr)
+    print("=" * 78 + "\n", file=sys.stderr)
+
+
 def _build_carry_over_prompt(
     original_prompt: str,
     previous_text: str,
     notes: str,
     reason: str,
+    diagnostic_evidence: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """Build the prompt for a NEW session that carries the previous context.
+    """Build the prompt for a NEW session that carries the previous context and diagnostic evidence.
 
     The previous round may already have changed files, so the new prompt tells
-    Argon what the previous conversation managed to do and asks it to continue
-    from there instead of starting the work over.
+    Argon what the previous conversation managed to do, includes the measured
+    diagnostic evidence, and asks it to continue from there instead of starting
+    the work over.
     """
     trimmed = (previous_text or "").strip()
     if len(trimmed) > 6000:
@@ -3955,6 +4315,11 @@ def _build_carry_over_prompt(
         "already done.",
         "",
     ]
+    if diagnostic_evidence:
+        parts += [
+            _format_diagnostic_evidence_block(diagnostic_evidence),
+            "",
+        ]
     if (notes or "").strip():
         parts += [
             "### Notes the previous round recorded",
@@ -3976,9 +4341,10 @@ def _build_carry_over_prompt(
     parts += [
         "### What to do now",
         "",
-        "Finish the remaining work in THIS conversation and deliver the complete patch as",
-        "a generated file named `apply_changes.ps1`, exactly as the contract above",
-        "requires. The full project context is attached again as `argon_context.zip`.",
+        "First state the exact root cause and measured evidence under `## ROOT CAUSE` in the",
+        "NOTES block, then finish the remaining work in THIS conversation and deliver the",
+        "complete patch as a generated file named `apply_changes.ps1`, exactly as the contract",
+        "above requires. The full project context is attached again as `argon_context.zip`.",
         "",
     ]
     return "\n".join(parts)
@@ -4188,9 +4554,13 @@ def _format_elapsed(seconds: float) -> str:
     return f"{mins} min {secs} s"
 
 
-def _start_fresh_chat(page, slot: str) -> bool:
-    """Open a NEW conversation (not the previous one)."""
-    slot_part = normalize_slot(slot) if slot else "/u/0/"
+def _start_fresh_chat(page, slot: str, isolated_profile: bool = True) -> bool:
+    """Open a NEW conversation (not the previous one).
+
+    In an isolated per-slot profile, the signed-in account sits at index 0, so
+    the URL must use `/u/0/` rather than the pool slot number.
+    """
+    slot_part = "/u/0/" if isolated_profile else (normalize_slot(slot) if slot else "/u/0/")
     try:
         page.goto(f"https://gemini.google.com{slot_part}app", wait_until="domcontentloaded", timeout=60000)
         page.wait_for_timeout(8000)
@@ -4234,21 +4604,36 @@ def _carry_over_to_new_session(
     task: str = "",
     target_files: Optional[List[str]] = None,
     deadline: Optional[float] = None,
+    profile_dir: Optional[Path] = None,
+    diagnostic_evidence: Optional[Dict[str, Any]] = None,
 ) -> Optional[Path]:
     """Start a NEW session and send the carry-over prompt there.
 
     Used when a run finished WITHOUT a delivery: Gemini stopped working (or the
     answer never came), so the work is taken to a fresh conversation together
-    with the context of what the previous round already did.
+    with the context and measured diagnostic evidence of what the previous round
+    already did.
     """
     print(
         "[!] The run finished WITHOUT a delivery - carrying the previous context "
-        "over into a NEW session.",
+        "and diagnostic evidence over into a NEW session.",
         file=sys.stderr,
     )
-    new_prompt = _build_carry_over_prompt(prompt_text, previous_text, notes, reason)
+    base_prompt = (prompt_text or "").strip() or build_surgical_prompt(
+        task or "Continue and complete the previous task",
+        target_directory=str(proj_root),
+        is_continuation=True,
+    )
+    new_prompt = _build_carry_over_prompt(
+        base_prompt,
+        previous_text,
+        notes,
+        reason,
+        diagnostic_evidence=diagnostic_evidence,
+    )
 
-    if not _start_fresh_chat(page, slot):
+    isolated = _profile_is_isolated_slot(profile_dir) if profile_dir is not None else True
+    if not _start_fresh_chat(page, slot, isolated_profile=isolated):
         print("[!] Could not open a new chat for the carry-over.", file=sys.stderr)
         return None
 
@@ -4313,7 +4698,13 @@ def _carry_over_to_new_session(
     chat_url = page.url
     if chat_id:
         try:
-            chat_url = session_store.remember(proj_root, mode, slot, chat_id, chat_title=chat_title) or page.url
+            prof_str = str(profile_dir) if profile_dir is not None else ""
+            chat_url = (
+                session_store.remember(
+                    proj_root, mode, slot, chat_id, chat_title=chat_title, profile_dir=prof_str
+                )
+                or page.url
+            )
             task_state.set(
                 proj_root,
                 chat_id=chat_id,
@@ -4854,33 +5245,47 @@ def dispatch_to_argon(
     if resume_chat and resume_entry is not None:
         if slot is None and resume_entry.get("slot"):
             active_slot = normalize_slot(resume_entry["slot"])
+            slot_profile = _profile_dir_for_slot(base_profile, active_slot)
         pool_cfg.set_active_slot(active_slot)
         active_account = pool_cfg.get_by_slot(active_slot)
         target_email = resume_entry.get("email") or (active_account.get("email") if active_account else None)
+        isolated_slot = _profile_is_isolated_slot(slot_profile)
         target_url = _resolve_reopen_url(
             proj_root=proj_root,
             mode=mode,
             active_slot=active_slot,
             current_url=str(resume_entry.get("chat_url") or ""),
-            fallback_url=get_target_url(mode, active_slot, isolated_profile=_profile_is_isolated_slot(slot_profile)),
+            fallback_url=get_target_url(mode, active_slot, isolated_profile=isolated_slot),
             task_state=task_state_store,
             session_store=session_store,
+            isolated_profile=isolated_slot,
         )
     elif is_continuation and session is not None:
         if slot is None and session.get("slot"):
             active_slot = normalize_slot(session["slot"])
+            slot_profile = _profile_dir_for_slot(base_profile, active_slot)
         pool_cfg.set_active_slot(active_slot)
         active_account = pool_cfg.get_by_slot(active_slot)
         target_email = active_account.get("email") if active_account else None
-        target_url = str(session["chat_url"])
+        isolated_slot = _profile_is_isolated_slot(slot_profile)
+        target_url = _normalize_gemini_chat_url(str(session["chat_url"]), isolated_profile=isolated_slot)
     else:
         pool_cfg.set_active_slot(active_slot)
         active_account = pool_cfg.get_by_slot(active_slot)
         target_email = active_account.get("email") if active_account else None
-        target_url = get_target_url(mode, active_slot, isolated_profile=_profile_is_isolated_slot(slot_profile))
+        isolated_slot = _profile_is_isolated_slot(slot_profile)
+        target_url = get_target_url(mode, active_slot, isolated_profile=isolated_slot)
 
-    # 4. Build surgical prompt (carries the absolute target directory so the
-    #    delivered script applies everything in one run, wherever it is run from)
+    prior_task_entry = task_state_store.get(proj_root) or {}
+    prior_diag_evidence: Optional[Dict[str, Any]] = None
+    if isinstance(prior_task_entry.get("diagnostic_evidence"), dict) and str(
+        prior_task_entry.get("state") or ""
+    ).strip().lower() not in ("applied", "delivered"):
+        prior_diag_evidence = prior_task_entry["diagnostic_evidence"]
+
+    # 4. Build surgical prompt (carries the absolute target directory and any
+    #    measured diagnostic evidence from a previous failed run so Argon can
+    #    identify the root cause first)
     prompt_text = (
         ""
         if resume_chat
@@ -4888,6 +5293,7 @@ def dispatch_to_argon(
             task,
             target_directory=str(proj_root),
             is_continuation=is_continuation,
+            diagnostic_evidence=prior_diag_evidence,
         )
     )
     print(f"[+] Target directory: {proj_root}")
@@ -5031,7 +5437,21 @@ def dispatch_to_argon(
                     "[!] The Gemini workspace did not become ready in time.",
                     file=sys.stderr,
                 )
-                _take_step_screenshot(page, proj_root, "preflight_failure.png")
+                shot_ws = _take_step_screenshot(page, proj_root, "preflight_failure.png")
+                ev_ws = _collect_diagnostic_evidence(
+                    page=page,
+                    proj_root=proj_root,
+                    reason="Gemini workspace composer did not become ready before timeout",
+                    slot=active_slot,
+                    email=target_email,
+                    profile_dir=profile_dir,
+                    chat_url=target_url,
+                    screenshot_path=shot_ws,
+                    ruled_out=["Browser launched on slot profile"],
+                    next_step="Run Open_Argon_Login.bat to verify the account session, then re-run this task.",
+                )
+                task_state_store.set(proj_root, state="preflight_failed", diagnostic_evidence=ev_ws)
+                _print_run_failure_summary(ev_ws)
                 return EXIT_PREFLIGHT_FAILED
 
             if _is_page_unauthenticated(page):
@@ -5054,18 +5474,34 @@ def dispatch_to_argon(
                     file=sys.stderr,
                 )
                 print("!" * 72 + "\n", file=sys.stderr)
-                _take_step_screenshot(page, proj_root, "failed.png")
+                shot_unauth = _take_step_screenshot(page, proj_root, "failed.png")
+                ev_unauth = _collect_diagnostic_evidence(
+                    page=page,
+                    proj_root=proj_root,
+                    reason="Profile is not signed in (anonymous guest page or Google sign-in screen)",
+                    slot=active_slot,
+                    email=target_email,
+                    profile_dir=profile_dir,
+                    chat_url=target_url,
+                    screenshot_path=shot_unauth,
+                    ruled_out=["Browser launched and page loaded"],
+                    next_step="Run Open_Argon_Login.bat, then re-run this task.",
+                )
+                task_state_store.set(proj_root, state="not_signed_in", diagnostic_evidence=ev_unauth)
+                _print_run_failure_summary(ev_unauth)
                 return EXIT_NOT_SIGNED_IN
 
             _select_profile_account_if_needed(page, target_email)
 
             early_quota = _detect_quota_limit(page)
             if early_quota:
+                acct_now = _detect_signed_in_account(page, target_email, active_slot)
                 print(
-                    f"\n[!] Account at slot {active_slot} has hit its usage limit ({early_quota}).",
+                    f"\n[!] Account {acct_now} at slot {active_slot} has hit its usage limit ({early_quota}).",
                     file=sys.stderr,
                 )
                 print("    Moving on to the next account in the pool.", file=sys.stderr)
+                _mark_quota_limited(active_slot)
                 return EXIT_QUOTA_LIMITED
 
             # Rule 1.1 & 1.2: Before attaching the zip or sending, check whether
@@ -5119,19 +5555,81 @@ def dispatch_to_argon(
                 print("      " + line)
 
             if not (mode_ok and model_ok and think_ok and attached):
+                if _argon_picker_is_disabled(page):
+                    acct_now = _detect_signed_in_account(page, target_email, active_slot)
+                    shot_dis = _take_step_screenshot(page, proj_root, "preflight_failure.png")
+                    print(
+                        f"\n[!] Account {acct_now} (slot {active_slot}): this account has no Argon available "
+                        f"('4 Argon' option is disabled in the model picker).",
+                        file=sys.stderr,
+                    )
+                    print(
+                        f"    Marking {active_slot} as quota_limited and rotating to the next pool account.",
+                        file=sys.stderr,
+                    )
+                    _mark_quota_limited(active_slot)
+                    ev_dis = _collect_diagnostic_evidence(
+                        page=page,
+                        proj_root=proj_root,
+                        reason=f"Account {acct_now} ({active_slot}) has no Argon available ('4 Argon' is aria-disabled in the model picker)",
+                        slot=active_slot,
+                        email=acct_now,
+                        profile_dir=profile_dir,
+                        chat_url=getattr(page, "url", "") or target_url,
+                        screenshot_path=shot_dis,
+                        preflight=preflight,
+                        ruled_out=[
+                            "Google session is signed in (not guest)",
+                            "Model picker opened and '4 Argon' option was located in the menu",
+                        ],
+                        next_step=(
+                            "Rotating to the next pool account automatically. If all pool accounts are "
+                            "exhausted, run Open_Argon_Login.bat to add or sign in another account, then re-run this task."
+                        ),
+                    )
+                    task_state_store.set(proj_root, state="quota_limited", diagnostic_evidence=ev_dis)
+                    _print_run_failure_summary(ev_dis)
+                    return EXIT_QUOTA_LIMITED
                 preflight_quota = _detect_quota_limit(page)
                 if preflight_quota:
+                    acct_now = _detect_signed_in_account(page, target_email, active_slot)
                     print(
-                        f"\n[!] Account at slot {active_slot} has hit its usage limit ({preflight_quota}).",
+                        f"\n[!] Account {acct_now} at slot {active_slot} has hit its usage limit ({preflight_quota}).",
                         file=sys.stderr,
                     )
                     print("    Moving on to the next account in the pool.", file=sys.stderr)
+                    _mark_quota_limited(active_slot)
                     return EXIT_QUOTA_LIMITED
                 shot_saved = _take_step_screenshot(page, proj_root, "preflight_failure.png")
                 print(
                     manual_setup_instructions(mode, str(shot_saved) if shot_saved else None),
                     file=sys.stderr,
                 )
+                ruled = ["Browser launched and workspace composer rendered", "Google account is signed in (not guest)"]
+                if mode_ok:
+                    ruled.append("Task mode toggle verified active")
+                if model_ok:
+                    ruled.append("Model chip verified as 4 Argon")
+                if attached:
+                    ruled.append(f"Archive {zip_path.name} verified attached")
+                ev_pf = _collect_diagnostic_evidence(
+                    page=page,
+                    proj_root=proj_root,
+                    reason="Pre-flight workspace check failed (" + ", ".join(preflight) + ")",
+                    slot=active_slot,
+                    email=target_email,
+                    profile_dir=profile_dir,
+                    chat_url=getattr(page, "url", "") or target_url,
+                    screenshot_path=shot_saved,
+                    preflight=preflight,
+                    ruled_out=ruled,
+                    next_step=(
+                        "Check the conversation link and screenshot above, or run Open_Argon_Login.bat "
+                        "if the session expired, then re-run this task."
+                    ),
+                )
+                task_state_store.set(proj_root, state="preflight_failed", diagnostic_evidence=ev_pf)
+                _print_run_failure_summary(ev_pf)
                 return EXIT_PREFLIGHT_FAILED
 
             # ------------------------------------------------------------- send --
@@ -5195,6 +5693,31 @@ def dispatch_to_argon(
                         composer = _find_composer(page)
                         if composer is not None:
                             if not ensure_argon_model(page):
+                                shot_send_gate = _take_step_screenshot(page, proj_root, "preflight_failure.png")
+                                if _argon_picker_is_disabled(page):
+                                    acct_now = _detect_signed_in_account(page, target_email, active_slot)
+                                    print(
+                                        f"[!] Account {acct_now} (slot {active_slot}): this account has no Argon available "
+                                        f"('4 Argon' is disabled in the model picker).",
+                                        file=sys.stderr,
+                                    )
+                                    _mark_quota_limited(active_slot)
+                                    ev_sg = _collect_diagnostic_evidence(
+                                        page=page,
+                                        proj_root=proj_root,
+                                        reason=f"Account {acct_now} ({active_slot}) has no Argon available ('4 Argon' disabled before send)",
+                                        slot=active_slot,
+                                        email=acct_now,
+                                        profile_dir=profile_dir,
+                                        chat_url=getattr(page, "url", "") or target_url,
+                                        screenshot_path=shot_send_gate,
+                                        preflight=preflight,
+                                        ruled_out=["Task mode active", f"Archive {zip_path.name} attached"],
+                                        next_step="Rotating to the next pool account automatically.",
+                                    )
+                                    task_state_store.set(proj_root, state="quota_limited", diagnostic_evidence=ev_sg)
+                                    _print_run_failure_summary(ev_sg)
+                                    return EXIT_QUOTA_LIMITED
                                 print(
                                     "[!] Refusing to send: the model is not 4 Argon.",
                                     file=sys.stderr,
@@ -5205,7 +5728,21 @@ def dispatch_to_argon(
                                     "by hand.",
                                     file=sys.stderr,
                                 )
-                                _take_step_screenshot(page, proj_root, "preflight_failure.png")
+                                ev_sg = _collect_diagnostic_evidence(
+                                    page=page,
+                                    proj_root=proj_root,
+                                    reason="Model chip was not '4 Argon' right before send",
+                                    slot=active_slot,
+                                    email=target_email,
+                                    profile_dir=profile_dir,
+                                    chat_url=getattr(page, "url", "") or target_url,
+                                    screenshot_path=shot_send_gate,
+                                    preflight=preflight,
+                                    ruled_out=["Task mode active", f"Archive {zip_path.name} attached"],
+                                    next_step="Switch the model to '4 Argon (Complex tasks)' in the browser or run Open_Argon_Login.bat, then re-run this task.",
+                                )
+                                task_state_store.set(proj_root, state="preflight_failed", diagnostic_evidence=ev_sg)
+                                _print_run_failure_summary(ev_sg)
                                 return EXIT_PREFLIGHT_FAILED
                             _type_and_send(page, composer, prompt_text)
                             sent_hms = time.strftime("%H:%M:%S")
@@ -5334,6 +5871,11 @@ def dispatch_to_argon(
                     fallback_url=target_url,
                     task_state=task_state,
                     session_store=session_store,
+                    # The shared master profile holds EVERY account, so the slot
+                    # index must be kept there; only a per-slot profile forces
+                    # /u/0/. Defaulting to True here would silently talk to the
+                    # wrong account.
+                    isolated_profile=_profile_is_isolated_slot(profile_dir),
                 )
                 reopen_attempts += 1
                 print(
@@ -5352,6 +5894,8 @@ def dispatch_to_argon(
                     pass
                 context = None
 
+                isolated_reopen = _profile_is_isolated_slot(profile_dir)
+                reopen_url = _normalize_gemini_chat_url(reopen_url, isolated_profile=isolated_reopen)
                 while time.monotonic() < deadline and reopen_attempts <= max_reopen_attempts:
                     time.sleep(3.0)
                     if _profile_is_busy(profile_dir):
@@ -5377,7 +5921,13 @@ def dispatch_to_argon(
                         last_known_url = page.url or reopen_url
                         live_cid = _extract_chat_id(last_known_url)
                         if live_cid:
-                            session_store.remember(proj_root, mode, active_slot, live_cid)
+                            session_store.remember(
+                                proj_root, mode, active_slot, live_cid,
+                                # The stored chat URL must match the profile the
+                                # run actually used: a per-slot profile stores
+                                # /u/0/, the shared master profile stores /u/<slot>/.
+                                profile_dir=str(profile_dir),
+                            )
                         task_state.set(
                             proj_root,
                             state="waiting",
@@ -5415,14 +5965,33 @@ def dispatch_to_argon(
 
                     quota = _detect_quota_limit(page)
                     if quota:
+                        acct_now = _detect_signed_in_account(page, target_email, active_slot)
+                        shot_q = _take_step_screenshot(page, proj_root, "quota_limited.png")
                         print(
-                            f"\n[!] This account hit its usage limit ({quota}).",
+                            f"\n[!] Account {acct_now} (slot {active_slot}) hit its usage limit ({quota}).",
                             file=sys.stderr,
                         )
                         print(
                             "    Moving on to the next account in the pool.",
                             file=sys.stderr,
                         )
+                        _mark_quota_limited(active_slot)
+                        ev_q = _collect_diagnostic_evidence(
+                            page=page,
+                            proj_root=proj_root,
+                            reason=f"Account {acct_now} ({active_slot}) hit usage limit ({quota}) while waiting",
+                            slot=active_slot,
+                            email=acct_now,
+                            profile_dir=profile_dir,
+                            chat_title=chat_title,
+                            chat_url=last_known_url or effective_chat_url,
+                            screenshot_path=shot_q,
+                            preflight=preflight,
+                            ruled_out=["Workspace pre-flight passed", "Prompt was sent to conversation"],
+                            next_step="Rotating to the next pool account automatically.",
+                        )
+                        task_state.set(proj_root, state="quota_limited", diagnostic_evidence=ev_q)
+                        _print_run_failure_summary(ev_q)
                         return EXIT_QUOTA_LIMITED
 
                     now_mono = time.monotonic()
@@ -5443,7 +6012,13 @@ def dispatch_to_argon(
                         last_state_write = time.time()
                         live_cid = _extract_chat_id(last_known_url)
                         if live_cid:
-                            session_store.remember(proj_root, mode, active_slot, live_cid)
+                            session_store.remember(
+                                proj_root, mode, active_slot, live_cid,
+                                # The stored chat URL must match the profile the
+                                # run actually used: a per-slot profile stores
+                                # /u/0/, the shared master profile stores /u/<slot>/.
+                                profile_dir=str(profile_dir),
+                            )
                         task_state.set(
                             proj_root,
                             state="waiting",
@@ -5606,12 +6181,12 @@ def dispatch_to_argon(
                     saved_notes = None
                 if saved_notes is None and (summary_md or "").strip():
                     try:
-                        saved_notes = _save_notes(summary_md, proj_root)
+                        saved_notes = _save_notes(summary_md, proj_root, existing_notes_path=saved_notes)
                     except Exception:
                         saved_notes = None
                 if saved_notes is None and (script_text or "").strip():
                     try:
-                        saved_notes = _save_notes(script_text, proj_root)
+                        saved_notes = _save_notes(script_text, proj_root, existing_notes_path=saved_notes)
                     except Exception:
                         saved_notes = None
                 return saved_notes
@@ -5698,9 +6273,44 @@ def dispatch_to_argon(
                         previous_body = page.locator("body").inner_text(timeout=8000) or ""
                     except Exception:
                         previous_body = ""
+                failed_shot = _take_step_screenshot(page, proj_root, "failed.png")
+                live_title = _chat_title(page) or chat_title
+                live_url = getattr(page, "url", "") or last_known_url or effective_chat_url
+                diag_ev = _collect_diagnostic_evidence(
+                    page=page,
+                    proj_root=proj_root,
+                    reason=reason,
+                    slot=active_slot,
+                    email=target_email,
+                    profile_dir=profile_dir,
+                    chat_title=live_title,
+                    chat_url=live_url,
+                    screenshot_path=failed_shot,
+                    preflight=preflight,
+                    ruled_out=[
+                        "Google session authenticated (not on guest page)",
+                        "Pre-flight checks passed (Task mode, 4 Argon model, and context zip attached)",
+                        "Prompt was pasted and verified as delivered into the conversation",
+                    ],
+                    next_step=(
+                        f"Open the conversation link above in slot profile {profile_dir} "
+                        f"(or run Open_Argon_Login.bat -> 'Open in Gemini Web'), download apply_changes.ps1 "
+                        f"if Argon finished late and run Open_Argon_Apply.bat, or re-run with --resume."
+                    ),
+                )
+                task_state.set(
+                    proj_root,
+                    state="failed",
+                    chat_title=live_title,
+                    chat_url=live_url,
+                    slot=active_slot,
+                    profile_dir=str(profile_dir),
+                    diagnostic_evidence=diag_ev,
+                )
                 carried = None
                 if carry_over:
                     carried = _carry_over_to_new_session(
+                        page=page,
                         prompt_text=prompt_text,
                         proj_root=proj_root,
                         mode=mode,
@@ -5715,6 +6325,8 @@ def dispatch_to_argon(
                         reason=reason,
                         task=task,
                         target_files=target_files,
+                        profile_dir=profile_dir,
+                        diagnostic_evidence=diag_ev,
                     )
                 if carried is not None:
                     delivered_path = carried
@@ -5736,6 +6348,7 @@ def dispatch_to_argon(
                         state="delivered",
                         delivered=str(delivered_path),
                         delivery_hash=_hash_text(delivered_text),
+                        diagnostic_evidence=None,
                     )
                     if auto_apply:
                         ok = apply_delivered_patch(proj_root, delivered_path)
@@ -5762,7 +6375,7 @@ def dispatch_to_argon(
                         ok = True
                     return EXIT_SUCCESS if ok else EXIT_FAILURE
 
-                _take_step_screenshot(page, proj_root, "failed.png")
+                _print_run_failure_summary(diag_ev)
                 print(f"[!] Neither a delivered file nor a PowerShell patch block was detected ({reason}).")
                 print(f"    If Argon delivered a file, run: Open_Argon_Apply.bat  (searches {Path.home() / 'Downloads'})")
                 return EXIT_FAILURE
@@ -5862,14 +6475,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Skip post-apply project build/lint verification.",
     )
+    parser.add_argument(
+        "--max-verify-rounds",
+        type=int,
+        default=1,
+        help=argparse.SUPPRESS,
+    )
     return parser
 
 
 def _pool_slots_in_order(pool_cfg, start_slot: Optional[str]) -> list:
     """Pool slots to try, starting at `start_slot` and wrapping around.
 
-    Any slot marked `quota_limited` is skipped so the run immediately advances
-    to a healthy account in wrap-around order.
+    Any slot marked `quota_limited` (including slots whose '4 Argon' option was
+    disabled in the model picker) is skipped so the run immediately advances to
+    a healthy account in wrap-around order.
     """
     if pool_cfg is None:
         return []
@@ -5892,9 +6512,10 @@ def _pool_slots_in_order(pool_cfg, start_slot: Optional[str]) -> list:
             break
     rotated = ordered[start_idx:] + ordered[:start_idx]
 
+    skip_statuses = {"quota_limited", "argon_disabled", "no_argon"}
     fresh = [
         a for a in rotated
-        if str(a.get("status", "")).strip().lower() != "quota_limited"
+        if str(a.get("status", "")).strip().lower() not in skip_statuses
     ]
     return [normalize_slot(a["slot"]) for a in fresh if a.get("slot")]
 

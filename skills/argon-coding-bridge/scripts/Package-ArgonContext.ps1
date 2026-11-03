@@ -105,7 +105,8 @@ $secretPatterns = @(
     "^(?:google_?|gcp_?|aws_?|firebase_?|oauth_?|service[_-]account[_-]?)?credentials(?:[_.-].*)?\.json$",
     "^client_secrets?(?:[_.-].*)?\.json$",
     "^(?:secrets?|passwords?|service[_-]account)\.json$",
-    ".*accounts?[_-]?pool.*\.json$"
+    "^\.(?:netrc|npmrc|pypirc)$",
+    ".*accounts?[_-]?pool.*"
 )
 
 function Test-IsDependencyOrBuildDir([string]$relativePath) {
@@ -153,7 +154,9 @@ $generatedArtefacts = @(
     'argon_response.md',
     'task_brief.md',
     'api_index.md',
-    'accounts_pool.json'
+    'accounts_pool.json',
+    'argon_sessions.json',
+    'argon_task_state.json'
 )
 $generatedDirs = @('.argon_backup', 'downloads', '__pycache__')
 
@@ -161,7 +164,7 @@ function Test-IsGeneratedArtefact([string]$relPath) {
     $name = [System.IO.Path]::GetFileName($relPath).ToLowerInvariant()
     if ($generatedArtefacts -contains $name) { return $true }
     if ($name -like 'apply_changes*.ps1' -or $name -like 'apply_changes.ps1.bak-*') { return $true }
-    if ($name -like '*accounts_pool*.json' -or $name -like '*account_pool*.json' -or $name -like '*account-pool*.json') { return $true }
+    if ($name -like '*accounts_pool*' -or $name -like '*account_pool*' -or $name -like '*account-pool*') { return $true }
     $normRel = ($relPath -replace '\\', '/').ToLowerInvariant().TrimStart('/')
     if ($normRel -eq 'skills/argon-coding-bridge/config/accounts_pool.json' -or $normRel.EndsWith('/config/accounts_pool.json')) {
         return $true
@@ -418,6 +421,18 @@ function Complete-ArgonTaskBrief([string]$BaseBrief, [string]$ProjectRoot, $Sele
         ) -join "`n"
     }
     $topLines = @(
+        "$h2 FIND THE ROOT CAUSE FIRST",
+        "",
+        "If something in this project is broken, do not change anything until you can",
+        "state the root cause and the EVIDENCE for it (the exact file and line, the",
+        "exact DOM node you measured, the exact value you read).",
+        "",
+        "- Every symptom must be traced to a concrete cause in THIS code base.",
+        "- If you cannot find the cause in the archive, say exactly what you need -",
+        "  do not invent a fix and do not guess a signature, a path or a value.",
+        "- Put the root cause and its evidence in the NOTES block of your patch, under",
+        "  the heading ``$h2 ROOT CAUSE``.",
+        "",
         "$h2 THE EXACT API OF THIS PROJECT",
         "",
         "API_INDEX.md lists every public declaration with its file and line. Use THAT -",
@@ -651,8 +666,12 @@ applies every change in one run no matter where it is executed from:
      (exiting non-zero) if any file does not match.
 
 ### 5. RECORD WHAT YOU FOUND (REQUIRED)
-   - Append a trailing comment block at the very end of ``apply_changes.ps1`` after the last write:
+   - Append a trailing comment block at the very end of ``apply_changes.ps1`` after the last write.
+     The NOTES block of every delivered patch MUST start with a ``## ROOT CAUSE`` section naming the
+     root cause and its evidence (even when the change is trivial):
      ``# --- NOTES: inconsistencies and suggestions found while reading the project ---``
+     ``# ## ROOT CAUSE``
+     ``# NOTE: <file>:<line> - <exact root cause, measured evidence, and why this change fixes it>``
      ``# NOTE: <file> - <what is inconsistent, why it matters, and what you would do instead>``
      ``# --- END NOTES ---``
 "@

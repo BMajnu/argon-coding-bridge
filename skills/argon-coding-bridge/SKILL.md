@@ -233,9 +233,13 @@ that cannot lie - the **model chip** next to the composer, which shows the model
 answer:
 
 1. **Before the send** - `ensure_argon_model()` reads the chip. If it does not name Argon, the model
-   picker is opened, the `4 Argon` entry is clicked (a *disabled* entry is skipped instead of
-   stalling the run) and the chip is read again. If the chip still does not read Argon after
-   repeated attempts, **the prompt is not sent** and the run stops with exit code `3`.
+   picker is opened and `_inspect_option_in_picker()` inspects the `4 Argon` option:
+   - If `4 Argon` is **present but disabled** (`aria-disabled="true"` or `disabled`), the bridge reads
+     which account is signed in, reports `"this account has no Argon available"`, marks the slot
+     `quota_limited` in `accounts_pool.json`, and returns exit code `5` (`EXIT_QUOTA_LIMITED`) so the
+     dispatcher immediately **rotates to the next pool account** instead of stopping.
+   - If `4 Argon` is **missing** (the picker did not open) and the chip still does not read Argon
+     after repeated attempts, **the prompt is not sent** and the run stops with exit code `3`.
 2. **After the send** - the chip is read once more, and a warning is printed if the UI fell back to
    another model.
 

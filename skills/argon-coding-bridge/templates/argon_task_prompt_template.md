@@ -17,6 +17,20 @@ I have uploaded the relevant codebase context as a zip archive (`argon_context.z
 
 ---
 
+## FIND THE ROOT CAUSE FIRST
+
+If something in this project is broken, do not change anything until you can
+state the root cause and the EVIDENCE for it (the exact file and line, the
+exact DOM node you measured, the exact value you read).
+
+- Every symptom must be traced to a concrete cause in THIS code base.
+- If you cannot find the cause in the archive, say exactly what you need -
+  do not invent a fix and do not guess a signature, a path or a value.
+- Put the root cause and its evidence in the NOTES block of your patch, under
+  the heading `## ROOT CAUSE`.
+
+---
+
 ### 🛡️ STRICT SURGICAL EDIT GUARDRAILS (CRITICAL):
 1. **NO UNNECESSARY FILE REWRITES:**
    - Do NOT rewrite entire files from scratch if only a function, class, or section needs modification.
@@ -139,9 +153,14 @@ able to be done better. Do not silently fix it and do not leave it only in the c
 it down so it survives.
 
 1. **In the script**: put every finding in a comment block at the very END of `apply_changes.ps1`,
-   after the last write, using this exact shape so it can be extracted automatically:
+   after the last write, using this exact shape so it can be extracted automatically. The NOTES
+   block of every delivered patch MUST start with a `## ROOT CAUSE` section naming the root cause
+   and its evidence (even when the change is trivial, state what the problem was and why the
+   change fixes it):
    ```powershell
    # --- NOTES: inconsistencies and suggestions found while reading the project ---
+   # ## ROOT CAUSE
+   # NOTE: <file>:<line> - <exact root cause, measured evidence, and why this change fixes it>
    # NOTE: <file> - <what is inconsistent, why it matters, and what you would do instead>
    # NOTE: <file> - <second finding, and the concrete better approach>
    # --- END NOTES ---
