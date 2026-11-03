@@ -152,6 +152,7 @@ $generatedArtefacts = @(
     'argon_response.txt',
     'argon_response.md',
     'task_brief.md',
+    'api_index.md',
     'accounts_pool.json'
 )
 $generatedDirs = @('.argon_backup', 'downloads', '__pycache__')
@@ -181,18 +182,276 @@ function Format-ArgonFileSize([long]$bytes) {
     return ("{0:N0} bytes" -f $bytes)
 }
 
+$declarationExtensions = @(
+    ".rs", ".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".vue", ".svelte",
+    ".go", ".java", ".kt", ".kts", ".cs", ".swift", ".dart", ".c", ".cpp", ".h",
+    ".hpp", ".rb", ".php", ".ex", ".exs", ".ps1", ".sh"
+)
+
+function Get-ArgonVerificationCommand([string]$ProjectRoot) {
+    $cargoToml = Join-Path $ProjectRoot "Cargo.toml"
+    if (Test-Path -LiteralPath $cargoToml -PathType Leaf) {
+        $hasClippy = $null -ne (Get-Command "cargo-clippy" -ErrorAction SilentlyContinue)
+        if ($hasClippy) {
+            return "cargo check && cargo clippy --all-targets"
+        }
+        return "cargo check"
+    }
+
+    $pkgJson = Join-Path $ProjectRoot "package.json"
+    if (Test-Path -LiteralPath $pkgJson -PathType Leaf) {
+        $hasLint = $false
+        $hasTest = $false
+        try {
+            $pkgObj = Get-Content -LiteralPath $pkgJson -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($pkgObj -and $pkgObj.scripts) {
+                if ($pkgObj.scripts.PSObject.Properties.Name -contains "lint" -and -not [string]::IsNullOrWhiteSpace([string]$pkgObj.scripts.lint)) {
+                    $hasLint = $true
+                }
+                if ($pkgObj.scripts.PSObject.Properties.Name -contains "test") {
+                    $tVal = [string]$pkgObj.scripts.test
+                    if (-not [string]::IsNullOrWhiteSpace($tVal) -and ($tVal.ToLowerInvariant() -notlike "*no test specified*")) {
+                        $hasTest = $true
+                    }
+                }
+            }
+        } catch {}
+        $cmds = @()
+        if ($hasLint) { $cmds += "npm run lint" } else { $cmds += "npx tsc --noEmit" }
+        if ($hasTest) { $cmds += "npm test" }
+        return ($cmds -join " && ")
+    }
+
+    $pyMarkers = @("pyproject.toml", "setup.cfg", "tox.ini") | ForEach-Object { Join-Path $ProjectRoot $_ } | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf }
+    if (@($pyMarkers).Count -gt 0) {
+        $combined = ""
+        foreach ($pm in $pyMarkers) {
+            try { $combined += "`n" + ([System.IO.File]::ReadAllText($pm, [System.Text.Encoding]::UTF8)).ToLowerInvariant() } catch {}
+        }
+        $hasRuff = $combined.Contains("[tool.ruff") -or $combined.Contains("[ruff") -or (Test-Path -LiteralPath (Join-Path $ProjectRoot "ruff.toml") -PathType Leaf) -or (Test-Path -LiteralPath (Join-Path $ProjectRoot ".ruff.toml") -PathType Leaf)
+        $cmds = @()
+        if ($hasRuff) { $cmds += "ruff check ." } else { $cmds += "python -m compileall -q ." }
+        $hasPytest = $combined.Contains("pytest") -or (Test-Path -LiteralPath (Join-Path $ProjectRoot "pytest.ini") -PathType Leaf) -or (Test-Path -LiteralPath (Join-Path $ProjectRoot "conftest.py") -PathType Leaf)
+        if ($hasPytest) { $cmds += "pytest -q" }
+        return ($cmds -join " && ")
+    }
+
+    if (Test-Path -LiteralPath (Join-Path $ProjectRoot "go.mod") -PathType Leaf) {
+        return "go build ./... && go vet ./..."
+    }
+    if (Test-Path -LiteralPath (Join-Path $ProjectRoot "pom.xml") -PathType Leaf) {
+        return "mvn -q -DskipTests compile"
+    }
+    $gradleKts = Join-Path $ProjectRoot "build.gradle.kts"
+    $gradleGroovy = Join-Path $ProjectRoot "build.gradle"
+    if ((Test-Path -LiteralPath $gradleKts -PathType Leaf) -or (Test-Path -LiteralPath $gradleGroovy -PathType Leaf)) {
+        $isKt = (Test-Path -LiteralPath $gradleKts -PathType Leaf) -or (Test-Path -LiteralPath (Join-Path $ProjectRoot "src\main\kotlin") -PathType Container)
+        if ($isKt) { return "./gradlew compileKotlin" }
+        return "./gradlew compileJava"
+    }
+    $slnOrCsproj = @(Get-ChildItem -LiteralPath $ProjectRoot -File -ErrorAction SilentlyContinue | Where-Object { $_.Extension -in @(".sln", ".csproj") })
+    if ($slnOrCsproj.Count -gt 0) {
+        return "dotnet build"
+    }
+    $makefile = Join-Path $ProjectRoot "Makefile"
+    if (Test-Path -LiteralPath $makefile -PathType Leaf) {
+        $mkText = [System.IO.File]::ReadAllText($makefile, [System.Text.Encoding]::UTF8)
+        $cmds = @("make")
+        if ($mkText -match '(?m)^test\s*:(?!=)') { $cmds += "make test" }
+        return ($cmds -join " && ")
+    }
+    if (Test-Path -LiteralPath (Join-Path $ProjectRoot "mix.exs") -PathType Leaf) {
+        return "mix compile --warnings-as-errors"
+    }
+    $gemfile = Join-Path $ProjectRoot "Gemfile"
+    if (Test-Path -LiteralPath $gemfile -PathType Leaf) {
+        $gemText = ([System.IO.File]::ReadAllText($gemfile, [System.Text.Encoding]::UTF8)).ToLowerInvariant()
+        if ($gemText.Contains("rubocop") -or (Test-Path -LiteralPath (Join-Path $ProjectRoot ".rubocop.yml") -PathType Leaf)) {
+            return "bundle exec rubocop"
+        }
+    }
+    return ""
+}
+
+function Test-ArgonDeclarationLine([string]$Ext, [string]$RawLine, [string]$Stripped) {
+    if ([string]::IsNullOrWhiteSpace($Stripped)) { return $false }
+    if ($Stripped.StartsWith("//") -or $Stripped.StartsWith("/*") -or $Stripped.StartsWith("*") -or $Stripped.StartsWith("<!--")) { return $false }
+    if (@(".py", ".ps1", ".sh", ".rb", ".ex", ".exs") -contains $Ext -and $Stripped.StartsWith("#")) { return $false }
+
+    if ($Ext -eq ".rs") {
+        return ($Stripped -match '^(?:pub(?:\s*\([^)]*\))?\s+)?(?:(?:async|unsafe|const|default|extern(?:\s+"[^"]*")?)\s+)*(?:fn|struct|enum|trait|type|const|static|mod|macro_rules!)\s+[A-Za-z_]\w*|^impl(?:\s*<[^>]*>)?\s+[A-Za-z_:<>\w\s,''&]+')
+    }
+    if (@(".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".vue", ".svelte") -contains $Ext) {
+        return ($Stripped -match '^(?:export\s+(?:default\s+)?(?:declare\s+)?(?:abstract\s+)?(?:async\s+)?(?:function|const|let|var|class|interface|type|enum)\b|export\s+default\b|(?:async\s+)?function\s+[A-Za-z_$][\w$]*|class\s+[A-Za-z_$][\w$]*|(?:interface|type|enum)\s+[A-Za-z_$][\w$]*)')
+    }
+    if ($Ext -eq ".py") {
+        if ($Stripped -match '^(?:async\s+def|def|class)\s+[A-Za-z_]\w*') { return $true }
+        if ($RawLine -eq $RawLine.TrimStart() -and $Stripped -match '^[A-Z][A-Z0-9_]{2,}\s*(?::[^=\n]+)?=') { return $true }
+        return $false
+    }
+    if ($Ext -eq ".go") {
+        return ($Stripped -match '^(?:func|type|const|var)\s+(?:\([^)]+\)\s*)?[A-Za-z_(]')
+    }
+    if (@(".java", ".kt", ".kts", ".cs", ".swift", ".dart", ".c", ".cpp", ".h", ".hpp", ".php", ".rb", ".ex", ".exs") -contains $Ext) {
+        return ($Stripped -match '^(?:(?:public|protected|internal|private|static|final|abstract|open|suspend|override|data|sealed|inline|extern|virtual|async|partial|readonly)\s+)*(?:class|interface|enum|record|struct|object|trait|protocol|extension|fun|func|def|defp|defmodule|val|var|void|[A-Za-z_][\w<>,.\[\]?]*\s+[A-Za-z_]\w*\s*\()')
+    }
+    if ($Ext -eq ".ps1") {
+        return ($Stripped -match '^(?:function|filter)\s+[A-Za-z_][\w-]*|^param\s*\(')
+    }
+    if ($Ext -eq ".sh") {
+        return ($Stripped -match '^(?:function\s+[A-Za-z_]\w*|[A-Za-z_]\w*\s*\(\s*\))')
+    }
+    return $false
+}
+
+function Get-ArgonFileDeclarations([string]$FullPath, [string]$RelPath) {
+    $ext = [System.IO.Path]::GetExtension($RelPath).ToLowerInvariant()
+    $results = [System.Collections.Generic.List[object]]::new()
+    if ($declarationExtensions -notcontains $ext) { return $results }
+    if (-not (Test-Path -LiteralPath $FullPath -PathType Leaf)) { return $results }
+    try {
+        $rawText = [System.IO.File]::ReadAllText($FullPath, [System.Text.Encoding]::UTF8)
+    } catch {
+        return $results
+    }
+    $fileLines = $rawText -split "\r?\n"
+    $totalLines = $fileLines.Count
+    for ($idx = 0; $idx -lt $totalLines; $idx++) {
+        $rawLine = $fileLines[$idx]
+        $stripped = $rawLine.Trim()
+        if (-not (Test-ArgonDeclarationLine -Ext $ext -RawLine $rawLine -Stripped $stripped)) { continue }
+        $sigParts = [System.Collections.Generic.List[string]]::new()
+        $sigParts.Add($stripped)
+        $isConstAssign = ($ext -eq ".py" -and $rawLine -eq $rawLine.TrimStart() -and $stripped -match '^[A-Z][A-Z0-9_]{2,}\s*(?::[^=\n]+)?=')
+        if (-not $isConstAssign) {
+            $openParens = ($stripped.Split("(").Length - 1) - ($stripped.Split(")").Length - 1)
+            $lookahead = $idx + 1
+            while ($openParens -gt 0 -and $lookahead -lt [math]::Min($totalLines, $idx + 20)) {
+                $nxt = $fileLines[$lookahead].Trim()
+                if ($nxt -and -not $nxt.StartsWith("#") -and -not $nxt.StartsWith("//")) {
+                    $sigParts.Add($nxt)
+                    $openParens += ($nxt.Split("(").Length - 1) - ($nxt.Split(")").Length - 1)
+                }
+                $lookahead++
+            }
+        }
+        $sig = (($sigParts -join " ") -replace '\s+', ' ').Trim()
+        $results.Add([PSCustomObject]@{ Line = ($idx + 1); Signature = $sig })
+    }
+    return $results
+}
+
+function Build-ArgonApiIndex([string]$ProjectRoot, $SelectedFiles) {
+    $h1 = '#'
+    $h2 = ('#' * 2)
+    $bullet = [string][char]45
+    $perFile = [System.Collections.Generic.List[object]]::new()
+    $totalDecls = 0
+    $scannedFiles = 0
+
+    $sortedRels = @($SelectedFiles | Sort-Object { ($_ -replace '\\', '/').ToLowerInvariant() })
+    foreach ($rel in $sortedRels) {
+        $ext = [System.IO.Path]::GetExtension($rel).ToLowerInvariant()
+        if ($declarationExtensions -notcontains $ext) { continue }
+        $scannedFiles++
+        $full = Join-Path $ProjectRoot $rel
+        $decls = Get-ArgonFileDeclarations -FullPath $full -RelPath $rel
+        $totalDecls += $decls.Count
+        $relPosix = ($rel -replace '\\', '/')
+        $perFile.Add([PSCustomObject]@{ RelPosix = $relPosix; Decls = $decls })
+    }
+
+    $out = [System.Collections.Generic.List[string]]::new()
+    $out.Add("$h1 API_INDEX.md - Complete Public & Source Declaration Index")
+    $out.Add("Project Root: $([System.IO.Path]::GetFileName($ProjectRoot))")
+    $out.Add("Source Files Scanned: $scannedFiles")
+    $out.Add("Total Declarations: $totalDecls (complete - no truncation)")
+    $out.Add("")
+    $out.Add("API_INDEX.md lists every public declaration with its file and line. Use THAT -")
+    $out.Add("never invent a function name, a parameter or a return type. If a symbol you need")
+    $out.Add("is not in API_INDEX.md and not in the archive, DO NOT GUESS: name the missing")
+    $out.Add("symbol and stop.")
+    $out.Add("")
+    foreach ($item in $perFile) {
+        $out.Add("$h2 $($item.RelPosix) ($($item.Decls.Count) declaration(s))")
+        if ($item.Decls.Count -eq 0) {
+            $out.Add("$bullet (no declarations matched)")
+        } else {
+            foreach ($d in $item.Decls) {
+                $out.Add(("{0} {1}:{2} -> {3}" -f $bullet, $item.RelPosix, $d.Line, $d.Signature))
+            }
+        }
+        $out.Add("")
+    }
+    return (($out -join "`n").TrimEnd() + "`n")
+}
+
 function Complete-ArgonTaskBrief([string]$BaseBrief, [string]$ProjectRoot, $SelectedFiles, $ExcludedEntries) {
     $h2 = ('#' * 2)
     $h3 = ('#' * 3)
     $bullet = [string][char]45
+
+    $detectedCmd = Get-ArgonVerificationCommand -ProjectRoot $ProjectRoot
+    $pyRels = @($SelectedFiles | Sort-Object | Where-Object { [System.IO.Path]::GetExtension($_).ToLowerInvariant() -eq ".py" } | ForEach-Object { ($_ -replace '\\', '/') })
+    if ($detectedCmd) {
+        $verifyBlock = @(
+            "Detected command: ``$detectedCmd``",
+            "If automatic detection is not sure, name the exact command that verifies this",
+            "project under ``$h2 VERIFICATION COMMAND`` in your reply and notes so the bridge",
+            "can run it directly."
+        ) -join "`n"
+    } elseif ($pyRels.Count -gt 0) {
+        $fallbackPy = "python -m py_compile " + ($pyRels -join " ")
+        $verifyBlock = @(
+            "Detected root marker command: ``(none - no root build marker matched)``",
+            "Archive verification command: ``$fallbackPy``",
+            "Argon: confirm or name the exact command that verifies this project under",
+            "``$h2 VERIFICATION COMMAND`` in your reply and notes so the bridge can read it",
+            "straight from the archive when automatic root detection is not sure."
+        ) -join "`n"
+    } else {
+        $verifyBlock = @(
+            "Detected command: ``(none - automatic detection did not match a project root build marker)``",
+            "Argon: name the exact command that verifies this project under",
+            "``$h2 VERIFICATION COMMAND`` in your reply and notes so the bridge can read it",
+            "straight from the archive when automatic detection is not sure."
+        ) -join "`n"
+    }
+    $topLines = @(
+        "$h2 THE EXACT API OF THIS PROJECT",
+        "",
+        "API_INDEX.md lists every public declaration with its file and line. Use THAT -",
+        "never invent a function name, a parameter or a return type. If a symbol you need",
+        "is not in API_INDEX.md and not in the archive, DO NOT GUESS: name the missing",
+        "symbol and stop.",
+        "",
+        "$h2 VERIFICATION COMMAND",
+        "",
+        $verifyBlock
+    ) -join "`n"
+
+    $critMarker = "$h2 CRITICAL INSTRUCTIONS FOR GEMINI 4 ARGON:"
+    if ($BaseBrief.Contains($critMarker)) {
+        $BaseBrief = $BaseBrief.Replace($critMarker, ($topLines + "`n`n" + $critMarker))
+    } else {
+        $BaseBrief = $BaseBrief.TrimEnd() + "`n`n" + $topLines
+    }
+
     $lines = [System.Collections.Generic.List[string]]::new()
     $lines.Add($BaseBrief.TrimEnd())
     $lines.Add("")
-    $lines.Add("$h3 6. DO NOT GUESS MISSING CONTEXT (CRITICAL)")
+    $lines.Add("$h3 6. DO NOT GUESS MISSING CONTEXT & KEEP PAYLOADS BYTE-EXACT (CRITICAL)")
     $lines.Add("If something you need is not in this archive - a file, an API endpoint, a")
     $lines.Add("function, a configuration - DO NOT GUESS and DO NOT INVENT it. Say exactly")
     $lines.Add("which file or symbol is missing and stop there. A wrong guess is much worse")
     $lines.Add("than an incomplete answer.")
+    $lines.Add("")
+    $lines.Add("Inside a patch, a Rust (or any) char or string literal for a newline is the TWO")
+    $lines.Add("characters backslash and n (\n) - never a real newline. The same applies to")
+    $lines.Add("\t, \r, \\ and to every other escape. The patch must not contain a raw")
+    $lines.Add("control character at all. A straight apostrophe ' must stay a straight")
+    $lines.Add("apostrophe - never a typographic quote. Keep opening and closing braces")
+    $lines.Add("balanced in every replacement block.")
     $lines.Add("")
     $lines.Add("$h2 COMPLETE PACKED FILE TREE ($($SelectedFiles.Count) files - no truncation)")
     $lines.Add("")
@@ -397,6 +656,9 @@ applies every change in one run no matter where it is executed from:
      ``# NOTE: <file> - <what is inconsistent, why it matters, and what you would do instead>``
      ``# --- END NOTES ---``
 "@
+    $apiIndexPath = Join-Path $stagingDir "API_INDEX.md"
+    $apiIndexContent = Build-ArgonApiIndex -ProjectRoot $absProjectPath -SelectedFiles $selectedFiles
+    [System.IO.File]::WriteAllText($apiIndexPath, $apiIndexContent, [System.Text.UTF8Encoding]::new($false))
     $briefContent = Complete-ArgonTaskBrief -BaseBrief $briefContent -ProjectRoot $absProjectPath -SelectedFiles $selectedFiles -ExcludedEntries $excludedEntries
     [System.IO.File]::WriteAllText($briefPath, $briefContent, [System.Text.UTF8Encoding]::new($false))
     $localBriefPath = Join-Path $absProjectPath "TASK_BRIEF.md"

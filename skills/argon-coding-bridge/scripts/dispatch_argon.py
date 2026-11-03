@@ -85,6 +85,7 @@ SESSION_STORE_VERSION = "1.0.0"
 #   5 = usage limit reached (quota_limited)
 #   6 = browser launch failed
 #   7 = slot busy
+#   8 = build/lint verification failed after all verification rounds
 EXIT_SUCCESS = 0
 EXIT_FAILURE = 1
 EXIT_NOT_SIGNED_IN = 2
@@ -93,6 +94,8 @@ EXIT_BROWSER_CLOSED = 4
 EXIT_QUOTA_LIMITED = 5
 EXIT_BROWSER_LAUNCH_FAILED = 6
 EXIT_SLOT_BUSY = 7
+EXIT_BUILD_FAILED = 8
+EXIT_VERIFY_FAILED = 8
 SESSION_STORE_DESCRIPTION = (
     "Per-project Gemini session map. A follow-up task on the same project continues "
     "in the SAME conversation, so the earlier codebase understanding stays available."
@@ -129,11 +132,40 @@ NO_GUESSING_RULE = (
     "than an incomplete answer."
 )
 
+EXACT_API_RULE = (
+    "API_INDEX.md lists every public declaration with its file and line. Use THAT -\n"
+    "never invent a function name, a parameter or a return type. If a symbol you need\n"
+    "is not in API_INDEX.md and not in the archive, DO NOT GUESS: name the missing\n"
+    "symbol and stop."
+)
+
+BYTE_EXACT_RULE = (
+    "Inside a patch, a Rust (or any) char literal for a newline is the TWO characters\n"
+    "backslash and n (\\n) - never a real newline. The same applies to \\t, \\r, \\\\ and\n"
+    "to every other escape. The patch must not contain a raw control character at all.\n"
+    "A straight apostrophe ' must stay a straight apostrophe - never a typographic quote.\n"
+    "Never start a payload line with " + chr(64) + chr(39) + ", never use double-quoted here-strings with $,\n"
+    "and keep all opening and closing braces balanced."
+)
+
+VERIFY_COMMAND_RULE = (
+    "In TASK_BRIEF.md and in your NOTES block under VERIFICATION COMMAND, name the exact\n"
+    "command that verifies (builds/lints/tests) this project when automatic detection is\n"
+    "not sure."
+)
+
 
 def _ensure_no_guessing_rule(prompt_body: str) -> str:
-    if "DO NOT GUESS and DO NOT INVENT it" in prompt_body:
-        return prompt_body
-    return prompt_body.rstrip() + "\n\n" + NO_GUESSING_RULE + "\n"
+    out = prompt_body.rstrip()
+    if "API_INDEX.md lists every public declaration" not in out:
+        out = out + "\n\n" + EXACT_API_RULE
+    if "characters backslash and n" not in out:
+        out = out + "\n\n" + BYTE_EXACT_RULE
+    if "VERIFICATION COMMAND" not in out:
+        out = out + "\n\n" + VERIFY_COMMAND_RULE
+    if "DO NOT GUESS and DO NOT INVENT it" not in out:
+        out = out + "\n\n" + NO_GUESSING_RULE
+    return out + "\n"
 
 
 def build_context_note(is_continuation: bool = False) -> str:
@@ -239,14 +271,275 @@ def _copy_with_retry(src: Path, dst: Path, attempts: int = 12, delay: float = 0.
         raise last
 
 
+TYPOGRAPHIC_QUOTES = (chr(0x2018), chr(0x2019), chr(0x201C), chr(0x201D))
+PROSE_ONLY_EXTENSIONS = {".md", ".txt", ".rst"}
+
+
+def _extract_patch_payload_blocks(patch_text: str) -> List[Dict[str, Any]]:
+    """Extract every here-string payload block (@'...'@ and @"..."@) with its target file and label."""
+    blocks: List[Dict[str, Any]] = []
+    if not patch_text:
+        return blocks
+
+    open_sq = chr(64) + chr(39)
+    close_sq = chr(39) + chr(64)
+    open_dq = chr(64) + chr(34)
+    close_dq = chr(34) + chr(64)
+
+    file_assign_re = re.compile(
+        r"(?:\$(?:relPath|rel|relativePath|file|targetRel)\s*=\s*['\"]([^'\"]+)['\"]|"
+        r"Join-Path\s+\$TargetRoot\s+['\"]([^'\"]+)['\"]|"
+        r"(?:-RelPath|File\s*=)\s*['\"]([^'\"]+)['\"])",
+        re.IGNORECASE,
+    )
+    label_assign_re = re.compile(
+        r"(?:\$([A-Za-z_]\w*)\s*=\s*$|(?:-Label|Label\s*=)\s*['\"]([^'\"]+)['\"])",
+        re.IGNORECASE,
+    )
+    hs_re = re.compile(
+        r"(" + re.escape(open_sq) + r"|" + re.escape(open_dq) + r")[ \t]*\r?\n(.*?)\r?\n(" +
+        re.escape(close_sq) + r"|" + re.escape(close_dq) + r")",
+        re.DOTALL,
+    )
+
+    block_idx = 0
+    for m in hs_re.finditer(patch_text):
+        block_idx += 1
+        opener = m.group(1)
+        body = m.group(2)
+        quote_kind = "single" if opener == open_sq else "double"
+        prefix = patch_text[: m.start()]
+
+        current_file = "<unknown>"
+        for fm in file_assign_re.finditer(prefix):
+            cand = fm.group(1) or fm.group(2) or fm.group(3) or ""
+            if cand and ".argon_backup" not in cand:
+                current_file = cand.replace("\\", "/")
+
+        prefix_tail = prefix[-400:]
+        current_label = f"block #{block_idx}"
+        var_matches = list(re.finditer(r"\$([A-Za-z_]\w*)\s*=\s*$", prefix_tail))
+        if var_matches:
+            current_label = "$" + var_matches[-1].group(1)
+        else:
+            lbl_matches = list(label_assign_re.finditer(prefix_tail))
+            if lbl_matches:
+                lm = lbl_matches[-1]
+                current_label = ("$" + lm.group(1)) if lm.group(1) else (lm.group(2) or current_label)
+
+        blocks.append(
+            {
+                "index": block_idx,
+                "file": current_file,
+                "label": current_label,
+                "quote_kind": quote_kind,
+                "body": body,
+                "script_offset": m.start(2),
+            }
+        )
+    return blocks
+
+
+def validate_patch_payloads(patch_text: str, project_path: Optional[Path] = None) -> List[Dict[str, Any]]:
+    """Validate every payload block in a delivered patch script BEFORE writing any file.
+
+    Refuses when:
+      1. A block contains a raw control character (< 0x20 other than CR 0x0D or LF 0x0A).
+      2. A line of the block starts with @' (or '@), which would terminate or corrupt the here-string.
+      3. A block sits inside a double-quoted here-string (@"..."@) and contains '$'.
+      4. A block contains a typographic quote (U+2018, U+2019, U+201C, U+201D) where the target
+         language requires a straight quote.
+    """
+    defects: List[Dict[str, Any]] = []
+    if not patch_text:
+        return defects
+
+    open_sq = chr(64) + chr(39)
+    close_sq = chr(39) + chr(64)
+    open_dq = chr(64) + chr(34)
+    close_dq = chr(34) + chr(64)
+
+    if patch_text.count(open_sq) != patch_text.count(close_sq):
+        defects.append(
+            {
+                "file": "<script>",
+                "label": "here-string",
+                "offset": 0,
+                "reason": "unbalanced single-quoted here-string delimiters (@' vs '@)",
+            }
+        )
+    if patch_text.count(open_dq) != patch_text.count(close_dq):
+        defects.append(
+            {
+                "file": "<script>",
+                "label": "here-string",
+                "offset": 0,
+                "reason": 'unbalanced double-quoted here-string delimiters (@" vs "@)',
+            }
+        )
+
+    blocks = _extract_patch_payload_blocks(patch_text)
+    for blk in blocks:
+        file_rel = str(blk["file"])
+        label = str(blk["label"])
+        quote_kind = str(blk["quote_kind"])
+        body = str(blk["body"])
+
+        # 1. Raw control characters (< 0x20 other than CR or LF)
+        for idx, ch in enumerate(body):
+            code = ord(ch)
+            if code < 0x20 and ch not in ("\r", "\n"):
+                defects.append(
+                    {
+                        "file": file_rel,
+                        "label": label,
+                        "offset": idx,
+                        "reason": f"raw control character 0x{code:02X} at offset {idx}",
+                    }
+                )
+                break
+
+        # 2. A line of the block starts with @' (or '@)
+        pos = 0
+        for raw_ln in body.splitlines(keepends=True):
+            stripped_ln = raw_ln.rstrip("\r\n")
+            if stripped_ln.startswith(open_sq) or stripped_ln.startswith(close_sq):
+                defects.append(
+                    {
+                        "file": file_rel,
+                        "label": label,
+                        "offset": pos,
+                        "reason": f"line starts with {open_sq} ({stripped_ln[:2]}) at offset {pos} (would end or corrupt here-string early)",
+                    }
+                )
+                break
+            pos += len(raw_ln)
+
+        # 3. Block sits inside a double-quoted here-string (@"..."@) and contains '$'
+        if quote_kind == "double" and "$" in body:
+            dollar_idx = body.find("$")
+            defects.append(
+                {
+                    "file": file_rel,
+                    "label": label,
+                    "offset": dollar_idx,
+                    "reason": f"double-quoted here-string contains '$' at offset {dollar_idx} (PowerShell would interpolate and corrupt code)",
+                }
+            )
+
+        # 4. Typographic quote where target language needs a straight quote
+        ext = Path(file_rel).suffix.lower() if file_rel != "<unknown>" else ""
+        needs_straight_quote = ext not in PROSE_ONLY_EXTENSIONS
+        existing_file_text = ""
+        if project_path is not None and file_rel != "<unknown>":
+            cand_path = Path(project_path) / file_rel
+            if cand_path.is_file():
+                try:
+                    existing_file_text = cand_path.read_text(encoding="utf-8", errors="ignore")
+                except Exception:
+                    existing_file_text = ""
+        for idx, ch in enumerate(body):
+            if ch in TYPOGRAPHIC_QUOTES:
+                if needs_straight_quote or (existing_file_text and ch not in existing_file_text):
+                    defects.append(
+                        {
+                            "file": file_rel,
+                            "label": label,
+                            "offset": idx,
+                            "reason": (
+                                f"typographic quote U+{ord(ch):04X} at offset {idx} "
+                                "where target language requires a straight quote"
+                            ),
+                        }
+                    )
+                    break
+
+    return defects
+
+
+def refuse_invalid_patch(
+    patch_text: str,
+    project_path: Optional[Path] = None,
+    patch_name: str = "apply_changes.ps1",
+) -> bool:
+    """Validate patch payloads before any file is touched. Print refusals and return False on any defect."""
+    defects = validate_patch_payloads(patch_text, project_path=project_path)
+    if not defects:
+        return True
+    print(
+        f"[ERROR] Refusing to apply {patch_name} - {len(defects)} payload defect(s) detected before writing any file:",
+        file=sys.stderr,
+    )
+    for d in defects:
+        print(
+            f"  [REFUSED] file={d['file']}  label={d['label']}  offset={d['offset']}  reason={d['reason']}",
+            file=sys.stderr,
+        )
+    return False
+
+
+def _snapshot_project_files(project_path: Path) -> Dict[str, bytes]:
+    """Snapshot raw bytes of eligible project files before applying a patch."""
+    snap: Dict[str, bytes] = {}
+    project_path = Path(project_path).resolve()
+    skip_dirs = {".argon_backup", "downloads", "__pycache__", "node_modules", ".git", "venv", ".venv", "target", "dist"}
+    for root, dirs, files in os.walk(project_path):
+        dirs[:] = [d for d in dirs if d.lower() not in skip_dirs]
+        for fn in files:
+            if fn.lower().startswith("apply_changes") and ".ps1" in fn.lower():
+                continue
+            p = Path(root) / fn
+            try:
+                if not p.is_file() or p.stat().st_size > 15 * 1024 * 1024:
+                    continue
+                rel = p.relative_to(project_path).as_posix()
+                snap[rel] = p.read_bytes()
+            except Exception:
+                continue
+    return snap
+
+
+def verify_written_files_bytes(project_path: Path, before_files: Dict[str, bytes]) -> List[Dict[str, Any]]:
+    """Compare written files with their pre-patch bytes and report any newly introduced raw control character."""
+    issues: List[Dict[str, Any]] = []
+    after_files = _snapshot_project_files(project_path)
+    for rel, new_bytes in sorted(after_files.items()):
+        old_bytes = before_files.get(rel, b"")
+        if new_bytes == old_bytes:
+            continue
+        old_ctrl_counts: Dict[int, int] = {}
+        for b in old_bytes:
+            if b < 0x20 and b not in (0x0D, 0x0A):
+                old_ctrl_counts[b] = old_ctrl_counts.get(b, 0) + 1
+        seen_ctrl_counts: Dict[int, int] = {}
+        for idx, b in enumerate(new_bytes):
+            if b < 0x20 and b not in (0x0D, 0x0A):
+                seen_ctrl_counts[b] = seen_ctrl_counts.get(b, 0) + 1
+                if seen_ctrl_counts[b] > old_ctrl_counts.get(b, 0):
+                    msg = f"raw control byte 0x{b:02X} at byte offset {idx} was not in the old file"
+                    print(f"[ERROR] Written file byte defect in {rel}: {msg}", file=sys.stderr)
+                    issues.append({"file": rel, "offset": idx, "byte": b, "reason": msg})
+    return issues
+
+
 def apply_delivered_patch(project_path: Path, patch_path: Path) -> bool:
     """Apply a delivered apply_changes.ps1 against the project root.
 
-    The staging, the BOM strip, the parse check, the backup and the rollback
-    hint all live in Run-ArgonPatch.ps1, so the same rules apply whether the
-    patch arrived as a download or as an inline code block.
+    Validates every payload block BEFORE touching any file, then runs
+    Run-ArgonPatch.ps1 and verifies written files for raw control bytes.
     """
     project_path = project_path.resolve()
+    patch_path = Path(patch_path)
+    try:
+        patch_text = patch_path.read_text(encoding="utf-8", errors="replace")
+    except Exception as exc:
+        print(f"[!] Could not read delivered patch {patch_path}: {exc}", file=sys.stderr)
+        return False
+
+    if not refuse_invalid_patch(patch_text, project_path=project_path, patch_name=patch_path.name):
+        return False
+
+    before_files = _snapshot_project_files(project_path)
     runner = SCRIPTS_DIR / "Run-ArgonPatch.ps1"
     shell = shutil.which("pwsh") or shutil.which("powershell") or "powershell"
 
@@ -256,6 +549,7 @@ def apply_delivered_patch(project_path: Path, patch_path: Path) -> bool:
             "-File", str(runner),
             "-ProjectPath", str(project_path),
             "-PatchFile", str(patch_path),
+            "-SkipVerify",
         ]
     else:
         staged = project_path / "apply_changes.ps1"
@@ -272,10 +566,16 @@ def apply_delivered_patch(project_path: Path, patch_path: Path) -> bool:
     print(f"[+] Applying delivered patch: {patch_path}")
     try:
         res = subprocess.run(cmd, cwd=str(project_path), timeout=300)
-        return res.returncode == 0
+        if res.returncode != 0:
+            return False
     except subprocess.TimeoutExpired:
         print(f"[!] Applying patch timed out after 300 s: {patch_path}", file=sys.stderr)
         return False
+
+    byte_issues = verify_written_files_bytes(project_path, before_files)
+    if byte_issues:
+        return False
+    return True
 
 
 def _chip_matches_patch_name(chip) -> bool:
@@ -1458,6 +1758,9 @@ def apply_extracted_patch(
 
     shell = shutil.which("pwsh") or shutil.which("powershell") or "powershell"
     if ps1_patch:
+        if not refuse_invalid_patch(ps1_patch, project_path=project_path, patch_name="apply_changes.ps1"):
+            return False
+        before_files = _snapshot_project_files(project_path)
         patch_script_path = project_path / "apply_changes.ps1"
         patch_script_path.write_text(ps1_patch + "\n", encoding="utf-8")
         print(f"[+] Saved extracted PowerShell patch to: {patch_script_path}")
@@ -1474,10 +1777,14 @@ def apply_extracted_patch(
                 cwd=str(project_path),
                 timeout=300,
             )
-            return res.returncode == 0
+            if res.returncode != 0:
+                return False
         except subprocess.TimeoutExpired:
             print(f"[!] Patch execution timed out after 300 s: {patch_script_path}", file=sys.stderr)
             return False
+        if verify_written_files_bytes(project_path, before_files):
+            return False
+        return True
 
     raw_response_file = project_path / "argon_response.txt"
     raw_response_file.write_text(response_text, encoding="utf-8")
@@ -4008,6 +4315,473 @@ def forget_sessions(target: str = "") -> int:
     return 0
 
 
+def _extract_verification_command_from_text(text: str) -> str:
+    """Extract a verification command from TASK_BRIEF.md or Argon notes under VERIFICATION COMMAND."""
+    if not text:
+        return ""
+    sec_m = re.search(
+        r"(?ims)^[ \t]*#*[ \t]*VERIFICATION\s+COMMAND[ \t]*:?[ \t]*\r?\n(.*?)(?=^[ \t]*#{1,6}[ \t]+\S|\Z)",
+        text,
+    )
+    candidates: List[str] = []
+    if sec_m:
+        sec_body = sec_m.group(1) or ""
+        for m_bt in re.findall(r"`([^`\r\n]+)`", sec_body):
+            candidates.append(m_bt.strip())
+        for raw_ln in sec_body.splitlines():
+            clean_ln = re.sub(r"^[ \t#>*+-]+", "", raw_ln).strip()
+            for pfx in ("detected command:", "detected root marker command:", "archive verification command:"):
+                if clean_ln.lower().startswith(pfx):
+                    clean_ln = clean_ln.split(":", 1)[1].strip().strip("`").strip()
+            if clean_ln:
+                candidates.append(clean_ln)
+    for m_inline in re.findall(r"(?im)^[ \t#]*verification\s+command\s*:\s*`?([^`\r\n]+)`?", text):
+        candidates.append(m_inline.strip())
+    for cand in candidates:
+        low = cand.lower()
+        if (
+            not cand
+            or low.startswith("(none")
+            or "if automatic detection" in low
+            or "detected command" in low
+            or "verification command" in low
+        ):
+            continue
+        if any(
+            low.startswith(prefix)
+            for prefix in (
+                "cargo ", "npm ", "npx ", "pnpm ", "yarn ", "ruff ", "python", "pytest",
+                "go ", "mvn ", "./gradlew", "gradlew", "dotnet ", "make", "mix ", "bundle ",
+                "pwsh ", "powershell ",
+            )
+        ):
+            return cand
+    return ""
+
+
+def detect_project_verification_command(
+    project_path: Path,
+    zip_path: Optional[Path] = None,
+    extra_texts: Optional[List[str]] = None,
+) -> str:
+    """Detect the project verification command from root markers or fallback to TASK_BRIEF.md / notes."""
+    from package_context import detect_verification_command as _pkg_detect
+
+    proj_root = Path(project_path).resolve()
+    cmd = _pkg_detect(proj_root)
+    if cmd:
+        return cmd
+
+    texts: List[str] = list(extra_texts or [])
+    brief_file = proj_root / "TASK_BRIEF.md"
+    if brief_file.is_file():
+        try:
+            texts.append(brief_file.read_text(encoding="utf-8", errors="ignore"))
+        except Exception:
+            pass
+    if zip_path is not None and Path(zip_path).is_file():
+        try:
+            import zipfile as _zf
+
+            with _zf.ZipFile(zip_path, "r") as zf:
+                if "TASK_BRIEF.md" in zf.namelist():
+                    texts.append(zf.read("TASK_BRIEF.md").decode("utf-8", errors="ignore"))
+        except Exception:
+            pass
+    for t in texts:
+        extracted = _extract_verification_command_from_text(t)
+        if extracted:
+            return extracted
+    return ""
+
+
+def _count_verification_errors(output: str, returncode: int) -> int:
+    """Count how many compiler/linter/test error lines came back."""
+    if returncode == 0:
+        return 0
+    lines = [ln.strip() for ln in (output or "").splitlines() if ln.strip()]
+    if not lines:
+        return 1
+
+    rust_diag = [
+        ln for ln in lines
+        if re.match(r"^error(\[[A-Z0-9]+\])?\s*:", ln)
+        and not re.search(r"could not compile|aborting due to \d+ previous error", ln, re.IGNORECASE)
+    ]
+    if rust_diag:
+        return len(rust_diag)
+
+    summary_m = re.search(r"aborting due to (\d+) previous error", output or "", re.IGNORECASE)
+    if summary_m:
+        try:
+            return max(1, int(summary_m.group(1)))
+        except Exception:
+            pass
+
+    err_lines = [
+        ln for ln in lines
+        if (
+            re.search(r"\berror\s+TS\d+\s*:", ln)
+            or re.match(r"^\S+:\d+:\d+:\s*(?:error|fatal|[A-Z]+\d+)\b", ln, re.IGNORECASE)
+            or re.match(r"^(?:FAILED|ERROR|E)\b", ln)
+            or re.search(r"\b(?:SyntaxError|IndentationError|ImportError|TypeError|ValueError|CompileError):", ln)
+            or (
+                re.search(r"(?i)(?:^|\b)(?:error|fatal|failed|exception)(?:\b|\[|:)", ln)
+                and not re.search(r"(?i)\b0\s+errors?\b|\b0\s+failed\b|could not compile", ln)
+            )
+        )
+    ]
+    if err_lines:
+        return len(err_lines)
+    return max(1, len(lines))
+
+
+def run_verification_command(
+    project_path: Path,
+    command: str,
+    timeout_seconds: int = 900,
+) -> tuple[bool, int, str]:
+    """Run the verification command in project_path with a deadline, capturing stdout and stderr."""
+    project_path = Path(project_path).resolve()
+    try:
+        proc = subprocess.run(
+            command,
+            cwd=str(project_path),
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            errors="replace",
+            timeout=max(1, int(timeout_seconds)),
+        )
+        combined = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+        if proc.returncode == 0:
+            return True, 0, combined
+        err_count = _count_verification_errors(combined, proc.returncode)
+        return False, err_count, combined
+    except subprocess.TimeoutExpired as exc:
+        out_part = exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+        err_part = exc.stderr.decode("utf-8", errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+        combined = (
+            "\n".join([f"Verification command timed out after {timeout_seconds} seconds: {command}", out_part, err_part])
+        ).strip()
+        return False, max(1, _count_verification_errors(combined, 1)), combined
+    except Exception as exc:
+        msg = f"Could not execute verification command ({command}): {exc}"
+        return False, 1, msg
+
+
+def _trim_verification_diagnostics(output: str, max_chars: int = 10000) -> str:
+    text = (output or "").strip()
+    if len(text) <= max_chars:
+        return text
+    half = max_chars // 2
+    return text[:half] + "\n...(middle of compiler output trimmed)...\n" + text[-half:]
+
+
+def build_verification_followup_prompt(
+    command: str,
+    diagnostics: str,
+    target_directory: str,
+    round_num: int = 1,
+    max_rounds: int = 3,
+) -> str:
+    """Build the focused same-conversation follow-up prompt when verification fails.
+
+    Contains ONLY:
+      1. The verification command that failed,
+      2. Its diagnostic output (trimmed to the relevant part), and
+      3. The instruction to fix exactly those errors and deliver a new apply_changes.ps1
+         that applies on TOP of the current tree.
+    """
+    trimmed = _trim_verification_diagnostics(diagnostics)
+    fence = "`" * 3
+    lines = [
+        f"Verification round {round_num}/{max_rounds} failed when running `{command}` in `{target_directory}`.",
+        "",
+        f"Command that failed: `{command}`",
+        "",
+        "Diagnostics output (stdout + stderr):",
+        f"{fence}text",
+        trimmed or "(command exited non-zero with no output)",
+        f"{fence}",
+        "",
+        "Fix ONLY the errors reported above and deliver a new `apply_changes.ps1` attached file that:",
+        f"1. Starts with `$ErrorActionPreference = 'Stop'` and `$TargetRoot = '{target_directory}'`.",
+        "2. Applies on TOP of the current project tree (the tree that already has your previous patch applied).",
+        "3. Uses exact signatures from `API_INDEX.md` (never invent functions, methods, structs, or parameters).",
+        "4. Keeps every literal and escape byte-exact (`\\n`, `\\t`, `\\r`, `\\\\` as two characters, straight quotes `'` and `\"`, no raw control characters, no `" + chr(64) + chr(39) + "` at line start, and balanced `{}` braces).",
+        "5. Backs up each touched file into `.argon_backup/<timestamp>/`, verifies each written file (`[Verified] <relative path>`), prints `[SUCCESS] N file(s) patched.`, and ends with the `# --- NOTES` ... `# --- END NOTES ---` comment block.",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _record_verification_in_notes(
+    notes_path: Optional[Path],
+    project_path: Path,
+    command: str,
+    round_num: int,
+    max_rounds: int,
+    passed: bool,
+    err_count: int,
+    diagnostics: str = "",
+) -> Optional[Path]:
+    """Record the verification result in the Argon notes file."""
+    out_dir = Path(project_path) / ".argon_backup"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    target = notes_path if (notes_path is not None and Path(notes_path).is_file()) else (
+        out_dir / ("argon_notes_" + time.strftime("%Y%m%d_%H%M%S") + ".md")
+    )
+    status_str = "clean" if passed else f"FAILED ({err_count} error(s))"
+    h2 = "#" * 2
+    section_lines = [
+        "",
+        f"{h2} Build / Lint Verification Result",
+        f"Command: `{command or '(skipped - no matching project marker)'}`",
+        f"Round: {round_num}/{max_rounds}",
+        f"Result: {status_str}",
+    ]
+    if not passed and diagnostics.strip():
+        fence = "`" * 3
+        section_lines += [
+            "",
+            f"{fence}text",
+            _trim_verification_diagnostics(diagnostics, max_chars=4000),
+            f"{fence}",
+        ]
+    section_text = "\n".join(section_lines) + "\n"
+    try:
+        if target.is_file():
+            existing = target.read_text(encoding="utf-8", errors="replace")
+            target.write_text(existing.rstrip() + "\n" + section_text, encoding="utf-8")
+        else:
+            h1 = "#"
+            target.write_text(
+                f"{h1} Argon notes and suggestions\n" + section_text,
+                encoding="utf-8",
+            )
+        return target
+    except Exception:
+        return notes_path
+
+
+def _wait_for_followup_patch(
+    page,
+    proj_root: Path,
+    chips_before: int,
+    responses_before: int,
+    handled_delivery_hashes: set,
+    dispatch_started: float,
+    delivered_dict: dict,
+    timeout_seconds: float = 900.0,
+) -> tuple[Optional[Path], Optional[str]]:
+    """Wait in the SAME conversation for Argon's follow-up apply_changes.ps1 delivery."""
+    deadline = time.monotonic() + max(30.0, float(timeout_seconds))
+    step = 0
+    while time.monotonic() < deadline:
+        cand_dl = delivered_dict.get("path")
+        if cand_dl is None:
+            cand_dl = find_delivered_patch(
+                [proj_root / "downloads", Path.home() / "Downloads"],
+                newer_than=dispatch_started,
+            )
+        if cand_dl is not None and Path(cand_dl).is_file():
+            try:
+                dl_text = Path(cand_dl).read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                dl_text = ""
+            if (
+                not _is_leftover_delivery(dl_text, handled_delivery_hashes)
+                and _looks_like_patch(dl_text)
+                and _patch_is_complete(dl_text)
+            ):
+                handled_delivery_hashes.add(_hash_text(dl_text))
+                return Path(cand_dl), None
+
+        new_chip = _new_delivery_chip(page, chips_before, responses_before)
+        if new_chip is None:
+            new_chip = _generated_file_chip(page)
+        if new_chip is not None:
+            captured = capture_generated_file(
+                page,
+                proj_root / "downloads",
+                chip=new_chip,
+                previous_hashes=handled_delivery_hashes,
+            )
+            if captured is not None and captured.is_file():
+                try:
+                    cap_text = captured.read_text(encoding="utf-8", errors="replace")
+                    handled_delivery_hashes.add(_hash_text(cap_text))
+                except Exception:
+                    pass
+                return captured, None
+
+        try:
+            body_now = page.locator("body").inner_text(timeout=5000) or ""
+        except Exception:
+            body_now = ""
+        inline_cand = extract_powershell_patch(body_now)
+        if (
+            inline_cand
+            and not _is_leftover_delivery(inline_cand, handled_delivery_hashes)
+            and _looks_like_patch(inline_cand)
+            and _patch_is_complete(inline_cand)
+        ):
+            handled_delivery_hashes.add(_hash_text(inline_cand))
+            return None, inline_cand
+
+        wait_s = _next_wait_interval(step)
+        step += 1
+        try:
+            page.wait_for_timeout(int(wait_s * 1000))
+        except Exception:
+            time.sleep(wait_s)
+    return None, None
+
+
+def _run_verification_and_fix_loop(
+    proj_root: Path,
+    page: Any,
+    task_state: TaskState,
+    notes_path: Optional[Path],
+    handled_delivery_hashes: set,
+    delivered_dict: dict,
+    zip_path: Optional[Path] = None,
+    extra_texts: Optional[List[str]] = None,
+    max_verify_rounds: int = 3,
+    verify_timeout: int = 900,
+    verify_cmd_override: Optional[str] = None,
+    skip_verify: bool = False,
+) -> int:
+    """Verify that the patched project builds/lints, and feed failures back to Argon in the SAME chat."""
+    if skip_verify:
+        print("[+] Skipping project build verification (--skip-verify).")
+        task_state.set(proj_root, state="applied", verification_state="skipped", verification_command="")
+        return EXIT_SUCCESS
+
+    cmd = (verify_cmd_override or "").strip() or detect_project_verification_command(
+        proj_root, zip_path=zip_path, extra_texts=extra_texts
+    )
+    if not cmd:
+        print(
+            "[+] No verification command matched the project root markers "
+            "(and none specified under VERIFICATION COMMAND) - skipping build verification."
+        )
+        task_state.set(proj_root, state="applied", verification_state="skipped", verification_command="")
+        _record_verification_in_notes(notes_path, proj_root, "", 0, max_verify_rounds, True, 0)
+        return EXIT_SUCCESS
+
+    total_rounds = max(1, int(max_verify_rounds))
+    last_err_count = 0
+    last_output = ""
+    last_round = 0
+
+    for round_num in range(1, total_rounds + 1):
+        last_round = round_num
+        passed, err_count, verify_out = run_verification_command(
+            proj_root, cmd, timeout_seconds=verify_timeout
+        )
+        last_err_count = err_count
+        last_output = verify_out
+
+        if passed:
+            print(f"[+] Verify round {round_num}/{total_rounds}: {cmd} -> clean")
+            task_state.set(
+                proj_root,
+                state="applied",
+                verification_state="clean",
+                verification_command=cmd,
+                verification_rounds=round_num,
+                verification_errors=0,
+            )
+            _record_verification_in_notes(
+                notes_path, proj_root, cmd, round_num, total_rounds, True, 0, verify_out
+            )
+            return EXIT_SUCCESS
+
+        err_word = "error" if err_count == 1 else "errors"
+        print(f"[+] Verify round {round_num}/{total_rounds}: {cmd} -> {err_count} {err_word}")
+
+        if round_num >= total_rounds or page is None:
+            break
+
+        followup_prompt = build_verification_followup_prompt(
+            command=cmd,
+            diagnostics=verify_out,
+            target_directory=str(proj_root),
+            round_num=round_num,
+            max_rounds=total_rounds,
+        )
+        composer = _find_composer(page)
+        if composer is None:
+            print("[!] No composer available in conversation for verification follow-up.", file=sys.stderr)
+            break
+        if not ensure_argon_model(page):
+            print("[!] Model is not 4 Argon before verification follow-up - stopping.", file=sys.stderr)
+            break
+
+        chips_before_fix = len(_generated_file_chip_indices(page))
+        turns_before_fix = _assistant_turns(page)
+        responses_before_fix = len(turns_before_fix) if turns_before_fix is not None else 0
+        delivered_dict.pop("path", None)
+        followup_started = time.time()
+
+        try:
+            _type_and_send(page, composer, followup_prompt)
+            _take_step_screenshot(page, proj_root, f"verify-followup-{round_num}.png")
+        except Exception as exc:
+            print(f"[!] Could not send verification follow-up prompt: {exc}", file=sys.stderr)
+            break
+
+        fix_path, fix_inline = _wait_for_followup_patch(
+            page=page,
+            proj_root=proj_root,
+            chips_before=chips_before_fix,
+            responses_before=responses_before_fix,
+            handled_delivery_hashes=handled_delivery_hashes,
+            dispatch_started=followup_started,
+            delivered_dict=delivered_dict,
+        )
+        if fix_path is not None:
+            applied_ok = apply_delivered_patch(proj_root, fix_path)
+        elif fix_inline is not None:
+            applied_ok = apply_extracted_patch(proj_root, fix_inline, ps1_patch=fix_inline)
+        else:
+            print(
+                f"[!] Argon did not deliver a fix patch for verification round {round_num}/{total_rounds}.",
+                file=sys.stderr,
+            )
+            break
+
+        if not applied_ok:
+            print(
+                f"[!] Applying Argon's fix patch failed in verification round {round_num}/{total_rounds}.",
+                file=sys.stderr,
+            )
+            break
+
+    err_word = "error" if last_err_count == 1 else "errors"
+    print(
+        f"[ERROR] Build verification failed after {last_round}/{total_rounds} round(s): "
+        f"{cmd} -> {last_err_count} {err_word}",
+        file=sys.stderr,
+    )
+    if last_output.strip():
+        print(last_output.strip(), file=sys.stderr)
+    task_state.set(
+        proj_root,
+        state="verify_failed",
+        verification_state="failed",
+        verification_command=cmd,
+        verification_rounds=last_round,
+        verification_errors=last_err_count,
+    )
+    _record_verification_in_notes(
+        notes_path, proj_root, cmd, last_round, total_rounds, False, last_err_count, last_output
+    )
+    return EXIT_BUILD_FAILED
+
+
 def dispatch_to_argon(
     task: str,
     project_path: str = ".",
@@ -4021,6 +4795,10 @@ def dispatch_to_argon(
     new_session: bool = False,
     resume: bool = False,
     carry_over: bool = True,
+    max_verify_rounds: int = 3,
+    verify_timeout: int = 900,
+    verify_cmd: Optional[str] = None,
+    skip_verify: bool = False,
 ) -> int:
     proj_root = Path(project_path).resolve()
     zip_path = proj_root / output_zip if not Path(output_zip).is_absolute() else Path(output_zip)
@@ -4060,12 +4838,26 @@ def dispatch_to_argon(
                 existing_text = ""
             if _looks_like_patch(existing_text):
                 print(f"[+] Resuming from already-captured patch file: {existing_delivery}")
-                _save_notes(existing_text, proj_root)
+                saved_resume_notes = _save_notes(existing_text, proj_root)
                 if auto_apply:
                     ok = apply_delivered_patch(proj_root, existing_delivery)
-                    if ok:
-                        task_state_store.set(proj_root, state="applied", delivered=str(existing_delivery))
-                    return EXIT_SUCCESS if ok else EXIT_FAILURE
+                    if not ok:
+                        return EXIT_FAILURE
+                    task_state_store.set(proj_root, state="applied", delivered=str(existing_delivery))
+                    return _run_verification_and_fix_loop(
+                        proj_root=proj_root,
+                        page=None,
+                        task_state=task_state_store,
+                        notes_path=saved_resume_notes,
+                        handled_delivery_hashes={_hash_text(existing_text)},
+                        delivered_dict={},
+                        zip_path=zip_path,
+                        extra_texts=[existing_text],
+                        max_verify_rounds=max_verify_rounds,
+                        verify_timeout=verify_timeout,
+                        verify_cmd_override=verify_cmd,
+                        skip_verify=skip_verify,
+                    )
                 return EXIT_SUCCESS
 
     # 2. Package codebase context (skipped on --resume since no new prompt is sent)
@@ -4872,7 +5664,7 @@ def dispatch_to_argon(
                     delivered_text = delivered_path.read_text(encoding="utf-8", errors="replace")
                 except Exception:
                     delivered_text = ""
-                _save_notes_once(delivered_text, summary_text)
+                saved_notes_path = _save_notes_once(delivered_text, summary_text)
                 task_state.set(
                     proj_root,
                     state="delivered",
@@ -4881,9 +5673,26 @@ def dispatch_to_argon(
                 )
                 if auto_apply:
                     ok = apply_delivered_patch(proj_root, delivered_path)
-                    if ok:
-                        task_state.set(proj_root, state="applied", delivered=str(delivered_path))
+                    if not ok:
+                        return EXIT_FAILURE
+                    task_state.set(proj_root, state="applied", delivered=str(delivered_path))
+                    return _run_verification_and_fix_loop(
+                        proj_root=proj_root,
+                        page=page,
+                        task_state=task_state,
+                        notes_path=saved_notes_path,
+                        handled_delivery_hashes=handled_delivery_hashes,
+                        delivered_dict=delivered,
+                        zip_path=zip_path,
+                        extra_texts=[delivered_text, summary_text],
+                        max_verify_rounds=max_verify_rounds,
+                        verify_timeout=verify_timeout,
+                        verify_cmd_override=verify_cmd,
+                        skip_verify=skip_verify,
+                    )
                 else:
+                    if not refuse_invalid_patch(delivered_text, project_path=proj_root, patch_name=delivered_path.name):
+                        return EXIT_FAILURE
                     runner = SCRIPTS_DIR / "Run-ArgonPatch.ps1"
                     print("[+] Apply it with one command:")
                     print(f'    pwsh -NoProfile -ExecutionPolicy Bypass -File "{runner}" '
@@ -4892,6 +5701,8 @@ def dispatch_to_argon(
                 return EXIT_SUCCESS if ok else EXIT_FAILURE
 
             if extracted_patch:
+                if not refuse_invalid_patch(extracted_patch, project_path=proj_root, patch_name="apply_changes.ps1"):
+                    return EXIT_FAILURE
                 out_ps1 = proj_root / "apply_changes.ps1"
                 out_ps1.write_text(extracted_patch + "\n", encoding="utf-8")
                 print(f"[SUCCESS] Extracted patch script to: {out_ps1}")
@@ -4901,13 +5712,27 @@ def dispatch_to_argon(
                     chat_title=chat_title,
                     chat_url=effective_chat_url,
                 )
-                _save_notes_once(extracted_patch, summary_text)
+                saved_notes_path = _save_notes_once(extracted_patch, summary_text)
                 task_state.set(proj_root, state="delivered", delivered=str(out_ps1))
                 if auto_apply:
                     ok = apply_extracted_patch(proj_root, last_body, ps1_patch=extracted_patch)
-                    if ok:
-                        task_state.set(proj_root, state="applied", delivered=str(out_ps1))
-                    return EXIT_SUCCESS if ok else EXIT_FAILURE
+                    if not ok:
+                        return EXIT_FAILURE
+                    task_state.set(proj_root, state="applied", delivered=str(out_ps1))
+                    return _run_verification_and_fix_loop(
+                        proj_root=proj_root,
+                        page=page,
+                        task_state=task_state,
+                        notes_path=saved_notes_path,
+                        handled_delivery_hashes=handled_delivery_hashes,
+                        delivered_dict=delivered,
+                        zip_path=zip_path,
+                        extra_texts=[extracted_patch, summary_text],
+                        max_verify_rounds=max_verify_rounds,
+                        verify_timeout=verify_timeout,
+                        verify_cmd_override=verify_cmd,
+                        skip_verify=skip_verify,
+                    )
                 return EXIT_SUCCESS
             else:
                 reason = run_failed_reason or "no delivery and no patch block before the timeout"
@@ -4950,7 +5775,7 @@ def dispatch_to_argon(
                         )
                     except Exception:
                         delivered_text = ""
-                    _save_notes_once(delivered_text, summary_text)
+                    saved_notes_path = _save_notes_once(delivered_text, summary_text)
                     task_state.set(
                         proj_root,
                         state="delivered",
@@ -4959,9 +5784,26 @@ def dispatch_to_argon(
                     )
                     if auto_apply:
                         ok = apply_delivered_patch(proj_root, delivered_path)
-                        if ok:
-                            task_state.set(proj_root, state="applied", delivered=str(delivered_path))
+                        if not ok:
+                            return EXIT_FAILURE
+                        task_state.set(proj_root, state="applied", delivered=str(delivered_path))
+                        return _run_verification_and_fix_loop(
+                            proj_root=proj_root,
+                            page=page,
+                            task_state=task_state,
+                            notes_path=saved_notes_path,
+                            handled_delivery_hashes=handled_delivery_hashes,
+                            delivered_dict=delivered,
+                            zip_path=zip_path,
+                            extra_texts=[delivered_text, summary_text],
+                            max_verify_rounds=max_verify_rounds,
+                            verify_timeout=verify_timeout,
+                            verify_cmd_override=verify_cmd,
+                            skip_verify=skip_verify,
+                        )
                     else:
+                        if not refuse_invalid_patch(delivered_text, project_path=proj_root, patch_name=delivered_path.name):
+                            return EXIT_FAILURE
                         runner = SCRIPTS_DIR / "Run-ArgonPatch.ps1"
                         print("[+] Apply it with one command:")
                         print(f'    pwsh -NoProfile -ExecutionPolicy Bypass -File "{runner}" '
@@ -5053,6 +5895,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
              "that carries the previous editing context, starts a NEW session and sends "
              "the prompt there.",
     )
+    parser.add_argument(
+        "--max-verify-rounds",
+        type=int,
+        default=3,
+        help="Maximum build/lint verification rounds in the same conversation after applying "
+             "a patch (default: 3). Exits with code 8 if the project still does not build.",
+    )
+    parser.add_argument(
+        "--verify-timeout",
+        type=int,
+        default=900,
+        help="Timeout in seconds for each project verification command run (default: 900 = 15 minutes).",
+    )
+    parser.add_argument(
+        "--verify-cmd",
+        default=None,
+        help="Explicit verification command override to run in the project root after applying the patch.",
+    )
+    parser.add_argument(
+        "--skip-verify",
+        action="store_true",
+        help="Skip post-apply project build/lint verification.",
+    )
     return parser
 
 
@@ -5141,6 +6006,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             new_session=args.new_session,
             resume=True,
             carry_over=carry_over,
+            max_verify_rounds=args.max_verify_rounds,
+            verify_timeout=args.verify_timeout,
+            verify_cmd=args.verify_cmd,
+            skip_verify=args.skip_verify,
         )
 
     start_slot = args.slot
@@ -5167,6 +6036,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             new_session=args.new_session,
             resume=args.resume,
             carry_over=carry_over,
+            max_verify_rounds=args.max_verify_rounds,
+            verify_timeout=args.verify_timeout,
+            verify_cmd=args.verify_cmd,
+            skip_verify=args.skip_verify,
         )
 
     last = EXIT_FAILURE
@@ -5188,6 +6061,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             new_session=args.new_session,
             resume=args.resume,
             carry_over=carry_over,
+            max_verify_rounds=args.max_verify_rounds,
+            verify_timeout=args.verify_timeout,
+            verify_cmd=args.verify_cmd,
+            skip_verify=args.skip_verify,
         )
         if last == EXIT_QUOTA_LIMITED:
             saw_quota = True

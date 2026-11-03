@@ -151,11 +151,26 @@ it down so it survives.
    write a single line `# NOTE: no inconsistencies found in the reviewed files.` - do not invent
    findings, and do not describe work you did not do.
 4. A NOTE is advice, not a change: never edit a file just to record a NOTE about it.
-5. Do not guess missing context:
+5. The exact API of this project (do not guess missing context):
+   API_INDEX.md lists every public declaration with its file and line. Use THAT -
+   never invent a function name, a parameter or a return type. If a symbol you need
+   is not in API_INDEX.md and not in the archive, DO NOT GUESS: name the missing
+   symbol and stop.
    If something you need is not in this archive - a file, an API endpoint, a
    function, a configuration - DO NOT GUESS and DO NOT INVENT it. Say exactly
    which file or symbol is missing and stop there. A wrong guess is much worse
    than an incomplete answer.
+6. Byte-exact payload literals and escapes:
+   Inside a patch, a Rust (or any language) char or string literal for a newline is
+   the TWO characters backslash and n (\n) - never a real newline. The same applies
+   to \t, \r, \\ and to every other escape. The patch must not contain a raw
+   control character at all. A straight apostrophe ' must stay a straight
+   apostrophe - never a typographic quote. Never start a payload line with @' or '@,
+   never put $ inside a double-quoted here-string, and keep all opening and closing
+   braces balanced in every replacement block.
+7. Verification command:
+   Name the exact command that builds/lints/tests this project under VERIFICATION COMMAND
+   in your reply and in the NOTES block so the bridge can run it after applying the patch.
 
 ### 📝 SUMMARY SECTION:
 Keep the chat reply brief — it is a summary of the change, NOT the patch itself:

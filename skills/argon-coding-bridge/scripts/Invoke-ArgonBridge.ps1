@@ -45,6 +45,10 @@ param(
     [switch]$NewSession,
     [switch]$Resume,
     [int]$MaxAccounts = 0,
+    [int]$MaxVerifyRounds = 3,
+    [int]$VerifyTimeout = 900,
+    [string]$VerifyCmd = "",
+    [switch]$SkipVerify,
     [switch]$Rollback
 )
 
@@ -134,6 +138,18 @@ if ($Resume) {
 }
 if ($MaxAccounts -gt 0) {
     $argList += @("--max-accounts", "$MaxAccounts")
+}
+if ($MaxVerifyRounds -gt 0) {
+    $argList += @("--max-verify-rounds", "$MaxVerifyRounds")
+}
+if ($VerifyTimeout -gt 0) {
+    $argList += @("--verify-timeout", "$VerifyTimeout")
+}
+if (-not [string]::IsNullOrWhiteSpace($VerifyCmd)) {
+    $argList += @("--verify-cmd", $VerifyCmd)
+}
+if ($SkipVerify) {
+    $argList += "--skip-verify"
 }
 
 Write-Host "[+] Invoking Gemini 4 Argon Dispatcher ($Mode)..." -ForegroundColor Cyan

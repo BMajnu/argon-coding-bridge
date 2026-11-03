@@ -33,7 +33,10 @@ param(
     [string]$PatchFile = "",
     [string[]]$SearchPath = @(),
     [switch]$DryRun,
-    [switch]$Rollback
+    [switch]$Rollback,
+    [switch]$SkipVerify,
+    [int]$VerifyTimeoutSeconds = 900,
+    [string]$VerifyCommand = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -328,7 +331,72 @@ try {
         Write-ArgonError "The delivered patch file ends with a stray trailing line ('$lastNonEmptyLine'); expected a comment or closing brace."
         exit 3
     }
-    Write-ArgonInfo "Patch file parsed successfully."
+
+    # Pre-write payload validation (Rule 3.2): inspect every here-string block BEFORE touching any file.
+    $openSq = [string][char]64 + [string][char]39
+    $closeSq = [string][char]39 + [string][char]64
+    $openDq = [string][char]64 + [string][char]34
+    $closeDq = [string][char]34 + [string][char]64
+    $typoChars = @([char]0x2018, [char]0x2019, [char]0x201C, [char]0x201D)
+    $proseExts = @(".md", ".txt", ".rst")
+    $hsBlockRegex = [regex]("(?s)(" + [regex]::Escape($openSq) + "|" + [regex]::Escape($openDq) + ")[ \t]*\r?\n(.*?)\r?\n(" + [regex]::Escape($closeSq) + "|" + [regex]::Escape($closeDq) + ")")
+    $fileAssignRegex = [regex]'(?i)(?:\$(?:relPath|rel|relativePath|file|targetRel)\s*=\s*[''"]([^''"]+)[''"]|Join-Path\s+\$TargetRoot\s+[''"]([^''"]+)[''"]|(?:-RelPath|File\s*=)\s*[''"]([^''"]+)[''"])'
+    $payloadDefects = New-Object System.Collections.Generic.List[string]
+    $blkIndex = 0
+    foreach ($hm in $hsBlockRegex.Matches($rawPatchText)) {
+        $blkIndex++
+        $opener = $hm.Groups[1].Value
+        $blkBody = $hm.Groups[2].Value
+        $prefixText = $rawPatchText.Substring(0, $hm.Index)
+        $curFile = "<unknown>"
+        foreach ($fm in $fileAssignRegex.Matches($prefixText)) {
+            $candF = if ($fm.Groups[1].Value) { $fm.Groups[1].Value } elseif ($fm.Groups[2].Value) { $fm.Groups[2].Value } else { $fm.Groups[3].Value }
+            if ($candF -and $candF -notlike "*.argon_backup*") { $curFile = ($candF -replace '\\', '/') }
+        }
+        $tailLen = [math]::Min(400, $prefixText.Length)
+        $prefixTail = $prefixText.Substring($prefixText.Length - $tailLen)
+        $curLabel = "block #$blkIndex"
+        $vm = [regex]::Matches($prefixTail, '\$([A-Za-z_]\w*)\s*=\s*$')
+        if ($vm.Count -gt 0) { $curLabel = "$" + $vm[$vm.Count - 1].Groups[1].Value }
+
+        for ($ci = 0; $ci -lt $blkBody.Length; $ci++) {
+            $chCode = [int][char]$blkBody[$ci]
+            if ($chCode -lt 0x20 -and $chCode -ne 0x0D -and $chCode -ne 0x0A) {
+                $payloadDefects.Add(("file={0} label={1} offset={2} reason=raw control character 0x{3:X2}" -f $curFile, $curLabel, $ci, $chCode))
+                break
+            }
+        }
+        $lineOffset = 0
+        foreach ($rawLn in ($blkBody -split "`n")) {
+            $cleanLn = $rawLn.TrimEnd("`r")
+            if ($cleanLn.StartsWith($openSq) -or $cleanLn.StartsWith($closeSq)) {
+                $payloadDefects.Add(("file={0} label={1} offset={2} reason=line starts with here-string delimiter" -f $curFile, $curLabel, $lineOffset))
+                break
+            }
+            $lineOffset += $rawLn.Length + 1
+        }
+        if ($opener -eq $openDq -and $blkBody.Contains('$')) {
+            $dIdx = $blkBody.IndexOf('$')
+            $payloadDefects.Add(("file={0} label={1} offset={2} reason=double-quoted here-string contains '$'" -f $curFile, $curLabel, $dIdx))
+        }
+        $ext = if ($curFile -ne "<unknown>") { [System.IO.Path]::GetExtension($curFile).ToLowerInvariant() } else { "" }
+        if ($proseExts -notcontains $ext) {
+            for ($ci = 0; $ci -lt $blkBody.Length; $ci++) {
+                if ($typoChars -contains $blkBody[$ci]) {
+                    $payloadDefects.Add(("file={0} label={1} offset={2} reason=typographic quote U+{3:X4} where straight quote is required" -f $curFile, $curLabel, $ci, [int][char]$blkBody[$ci]))
+                    break
+                }
+            }
+        }
+    }
+    if ($payloadDefects.Count -gt 0) {
+        Write-ArgonError "Refusing to run patch - $($payloadDefects.Count) payload defect(s) detected before writing any file:"
+        foreach ($defect in $payloadDefects) {
+            Write-Host "      [REFUSED] $defect" -ForegroundColor Red
+        }
+        exit 3
+    }
+    Write-ArgonInfo "Patch file parsed and payload bytes validated successfully."
 
     # ------------------------------------------------------- dry run stops ----
 
@@ -477,6 +545,52 @@ try {
                     [System.IO.File]::Copy($snapFile, $bkFile, $true)
                 }
             }
+        }
+        # Post-write check (Rule 3.3): compare new files against old files for newly introduced raw control bytes.
+        $postFiles = @(Get-ChildItem -LiteralPath $projectRoot -Recurse -File -Force -ErrorAction SilentlyContinue)
+        $writtenCtrlErrors = New-Object System.Collections.Generic.List[string]
+        foreach ($pf in $postFiles) {
+            if ([string]::Equals($pf.FullName, $targetPatch, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+            if ($pf.Name -like "apply_changes.ps1.bak-*") { continue }
+            $relPf = $pf.FullName.Substring($projectRoot.Length).TrimStart('\', '/')
+            $skipPf = $false
+            foreach ($seg in ($relPf -split '[\\/]')) {
+                if ($snapSkipDirs -contains $seg.ToLowerInvariant()) { $skipPf = $true; break }
+            }
+            if ($skipPf -or $pf.Length -gt 15728640) { continue }
+            if ($preHashes.ContainsKey($relPf)) {
+                $curH = (Get-FileHash -LiteralPath $pf.FullName -Algorithm SHA256).Hash
+                if ($curH -eq $preHashes[$relPf]) { continue }
+            }
+            $oldBytes = [byte[]]@()
+            $snapCandidate = Join-Path $preSnapshotDir $relPf
+            if (Test-Path -LiteralPath $snapCandidate -PathType Leaf) {
+                $oldBytes = [System.IO.File]::ReadAllBytes($snapCandidate)
+            }
+            $oldCtrlCounts = @{}
+            foreach ($ob in $oldBytes) {
+                if ($ob -lt 0x20 -and $ob -ne 0x0D -and $ob -ne 0x0A) {
+                    $oldCtrlCounts[[int]$ob] = [int]$oldCtrlCounts[[int]$ob] + 1
+                }
+            }
+            $newBytes = [System.IO.File]::ReadAllBytes($pf.FullName)
+            $seenCtrlCounts = @{}
+            for ($bi = 0; $bi -lt $newBytes.Length; $bi++) {
+                $nb = [int]$newBytes[$bi]
+                if ($nb -lt 0x20 -and $nb -ne 0x0D -and $nb -ne 0x0A) {
+                    $seenCtrlCounts[$nb] = [int]$seenCtrlCounts[$nb] + 1
+                    $prevCnt = if ($oldCtrlCounts.ContainsKey($nb)) { [int]$oldCtrlCounts[$nb] } else { 0 }
+                    if ($seenCtrlCounts[$nb] -gt $prevCnt) {
+                        $writtenCtrlErrors.Add(("file={0} offset={1} byte=0x{2:X2} (raw control character not present in old file)" -f ($relPf -replace '\\', '/'), $bi, $nb))
+                    }
+                }
+            }
+        }
+        if ($writtenCtrlErrors.Count -gt 0) {
+            foreach ($wce in $writtenCtrlErrors) {
+                Write-ArgonError "Written file byte defect: $wce"
+            }
+            $patchExitCode = 3
         }
     } catch {} finally {
         if (Test-Path -LiteralPath $preSnapshotDir) {

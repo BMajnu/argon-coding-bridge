@@ -152,6 +152,7 @@ GENERATED_ARTEFACTS = {
     "argon_response.txt",
     "argon_response.md",
     "task_brief.md",
+    "api_index.md",
     "accounts_pool.json",
 }
 
@@ -196,15 +197,357 @@ def _format_size(num_bytes: int) -> str:
     return f"{num_bytes:,} bytes"
 
 
+DECLARATION_EXTENSIONS = {
+    ".rs", ".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".vue", ".svelte",
+    ".go", ".java", ".kt", ".kts", ".cs", ".swift", ".dart", ".c", ".cpp", ".h",
+    ".hpp", ".rb", ".php", ".ex", ".exs", ".ps1", ".sh",
+}
+
+EXACT_API_SECTION_TEXT = (
+    "API_INDEX.md lists every public declaration with its file and line. Use THAT -\n"
+    "never invent a function name, a parameter or a return type. If a symbol you need\n"
+    "is not in API_INDEX.md and not in the archive, DO NOT GUESS: name the missing\n"
+    "symbol and stop."
+)
+
+BYTE_EXACT_DIRECTIVE = (
+    "Inside a patch, a Rust (or any) char or string literal for a newline is the TWO\n"
+    "characters backslash and n (\\n) - never a real newline. The same applies to\n"
+    "\\t, \\r, \\\\ and to every other escape. The patch must not contain a raw\n"
+    "control character at all. A straight apostrophe ' must stay a straight\n"
+    "apostrophe - never a typographic quote. Keep opening and closing braces\n"
+    "balanced in every replacement block."
+)
+
+
+def detect_verification_command(proj_root: Path) -> str:
+    """Inspect the project root and return the verification command, or '' when nothing matches."""
+    import json as _json
+    import shutil as _shutil
+
+    proj_root = Path(proj_root).resolve()
+
+    if (proj_root / "Cargo.toml").is_file():
+        has_clippy = _shutil.which("cargo-clippy") is not None
+        if not has_clippy and _shutil.which("cargo") is not None:
+            try:
+                cp = subprocess.run(
+                    ["cargo", "clippy", "--version"],
+                    cwd=str(proj_root),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=10,
+                )
+                has_clippy = cp.returncode == 0
+            except Exception:
+                has_clippy = False
+        if has_clippy:
+            return "cargo check && cargo clippy --all-targets"
+        return "cargo check"
+
+    pkg_json = proj_root / "package.json"
+    if pkg_json.is_file():
+        scripts = {}
+        try:
+            data = _json.loads(pkg_json.read_text(encoding="utf-8", errors="ignore"))
+            if isinstance(data, dict) and isinstance(data.get("scripts"), dict):
+                scripts = data["scripts"]
+        except Exception:
+            scripts = {}
+        lint_script = str(scripts.get("lint") or "").strip()
+        cmds = ["npm run lint" if lint_script else "npx tsc --noEmit"]
+        test_script = str(scripts.get("test") or "").strip()
+        if test_script and "no test specified" not in test_script.lower():
+            cmds.append("npm test")
+        return " && ".join(cmds)
+
+    py_markers = [proj_root / m for m in ("pyproject.toml", "setup.cfg", "tox.ini") if (proj_root / m).is_file()]
+    if py_markers:
+        combined = ""
+        for pm in py_markers:
+            try:
+                combined += "\n" + pm.read_text(encoding="utf-8", errors="ignore").lower()
+            except Exception:
+                pass
+        has_ruff = (
+            "[tool.ruff" in combined
+            or "[ruff" in combined
+            or (proj_root / "ruff.toml").is_file()
+            or (proj_root / ".ruff.toml").is_file()
+        )
+        cmds = ["ruff check ." if has_ruff else "python -m compileall -q ."]
+        has_pytest = (
+            "pytest" in combined
+            or (proj_root / "pytest.ini").is_file()
+            or (proj_root / "conftest.py").is_file()
+        )
+        if has_pytest:
+            cmds.append("pytest -q")
+        return " && ".join(cmds)
+
+    if (proj_root / "go.mod").is_file():
+        return "go build ./... && go vet ./..."
+
+    if (proj_root / "pom.xml").is_file():
+        return "mvn -q -DskipTests compile"
+
+    gradle_kts = proj_root / "build.gradle.kts"
+    gradle_groovy = proj_root / "build.gradle"
+    if gradle_kts.is_file() or gradle_groovy.is_file():
+        g_text = ""
+        for gf in (gradle_kts, gradle_groovy):
+            if gf.is_file():
+                try:
+                    g_text += gf.read_text(encoding="utf-8", errors="ignore").lower()
+                except Exception:
+                    pass
+        is_kotlin = gradle_kts.is_file() or ("kotlin" in g_text) or (proj_root / "src" / "main" / "kotlin").is_dir()
+        return "./gradlew compileKotlin" if is_kotlin else "./gradlew compileJava"
+
+    if list(proj_root.glob("*.sln")) or list(proj_root.glob("*.csproj")):
+        return "dotnet build"
+
+    makefile = proj_root / "Makefile"
+    if makefile.is_file():
+        try:
+            mk_text = makefile.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            mk_text = ""
+        targets = set(re.findall(r"(?m)^([A-Za-z0-9_.-]+)\s*:(?!=)", mk_text))
+        cmds = ["make"]
+        if "test" in targets:
+            cmds.append("make test")
+        return " && ".join(cmds)
+
+    if (proj_root / "mix.exs").is_file():
+        return "mix compile --warnings-as-errors"
+
+    gemfile = proj_root / "Gemfile"
+    if gemfile.is_file():
+        try:
+            gem_text = gemfile.read_text(encoding="utf-8", errors="ignore").lower()
+        except Exception:
+            gem_text = ""
+        if "rubocop" in gem_text or (proj_root / ".rubocop.yml").is_file():
+            return "bundle exec rubocop"
+
+    return ""
+
+
+def _match_declaration_line(ext: str, raw_line: str, stripped: str) -> tuple[bool, bool]:
+    """Return (matched, join_multiline_parens) for a source line."""
+    if not stripped:
+        return False, False
+    if stripped.startswith(("//", "/*", "*", "<!--")):
+        return False, False
+    if ext in (".py", ".ps1", ".sh", ".rb", ".ex", ".exs") and stripped.startswith("#"):
+        return False, False
+
+    if ext == ".rs":
+        is_fn = bool(
+            re.match(
+                r"^(?:pub(?:\s*\([^)]*\))?\s+)?(?:(?:async|unsafe|const|default|extern(?:\s+\"[^\"]*\")?)\s+)*fn\s+[A-Za-z_]\w*",
+                stripped,
+            )
+        )
+        if is_fn:
+            return True, True
+        is_other = bool(
+            re.match(
+                r"^(?:pub(?:\s*\([^)]*\))?\s+)?(?:(?:async|unsafe|const|default)\s+)*"
+                r"(?:struct|enum|trait|type|const|static|mod|macro_rules!)\s+[A-Za-z_]\w*|"
+                r"^impl(?:\s*<[^>]*>)?\s+[A-Za-z_:<>\w\s,'&]+",
+                stripped,
+            )
+        )
+        return is_other, False
+
+    if ext in (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".vue", ".svelte"):
+        is_fn = bool(
+            re.match(
+                r"^(?:export\s+(?:default\s+)?(?:declare\s+)?(?:async\s+)?function\b|(?:async\s+)?function\s+[A-Za-z_$][\w$]*)",
+                stripped,
+            )
+        )
+        if is_fn:
+            return True, True
+        is_other = bool(
+            re.match(
+                r"^(?:export\s+(?:default\s+)?(?:declare\s+)?(?:abstract\s+)?(?:const|let|var|class|interface|type|enum)\b|"
+                r"export\s+default\b|"
+                r"class\s+[A-Za-z_$][\w$]*|"
+                r"(?:interface|type|enum)\s+[A-Za-z_$][\w$]*)",
+                stripped,
+            )
+        )
+        return is_other, False
+
+    if ext == ".py":
+        if re.match(r"^(?:async\s+def|def|class)\s+[A-Za-z_]\w*", stripped):
+            return True, True
+        if raw_line == raw_line.lstrip() and re.match(r"^[A-Z][A-Z0-9_]{2,}\s*(?::[^=\n]+)?=", stripped):
+            return True, False
+        return False, False
+
+    if ext == ".go":
+        if re.match(r"^func\s+(?:\([^)]+\)\s*)?[A-Za-z_]", stripped):
+            return True, True
+        if re.match(r"^(?:type|const|var)\s+[A-Za-z_(]", stripped):
+            return True, False
+        return False, False
+
+    if ext in (".java", ".kt", ".kts", ".cs", ".swift", ".dart", ".c", ".cpp", ".h", ".hpp", ".php", ".rb", ".ex", ".exs"):
+        m = bool(
+            re.match(
+                r"^(?:(?:public|protected|internal|private|static|final|abstract|open|suspend|override|"
+                r"data|sealed|inline|extern|virtual|async|partial|readonly)\s+)*"
+                r"(?:class|interface|enum|record|struct|object|trait|protocol|extension|fun|func|def|defp|"
+                r"defmodule|val|var|void|[A-Za-z_][\w<>,.\[\]?]*\s+[A-Za-z_]\w*\s*\()",
+                stripped,
+            )
+        )
+        return m, m
+
+    if ext == ".ps1":
+        if re.match(r"^(?:function|filter)\s+[A-Za-z_][\w-]*|^param\s*\(", stripped, re.IGNORECASE):
+            return True, True
+        return False, False
+
+    if ext == ".sh":
+        m = bool(re.match(r"^(?:function\s+[A-Za-z_]\w*|[A-Za-z_]\w*\s*\(\s*\))", stripped))
+        return m, False
+
+    return False, False
+
+
+def extract_declarations_for_file(full_path: Path, rel_path: Path) -> list[tuple[int, str]]:
+    """Extract all declarations (1-based line number, complete signature) from a source file."""
+    ext = rel_path.suffix.lower()
+    if ext not in DECLARATION_EXTENSIONS:
+        return []
+    try:
+        raw_text = full_path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return []
+
+    lines = raw_text.splitlines()
+    declarations: list[tuple[int, str]] = []
+    total_lines = len(lines)
+    for idx, raw_line in enumerate(lines):
+        stripped = raw_line.strip()
+        matched, join_parens = _match_declaration_line(ext, raw_line, stripped)
+        if not matched:
+            continue
+        sig_parts = [stripped]
+        if join_parens:
+            open_parens = stripped.count("(") - stripped.count(")")
+            lookahead = idx + 1
+            while open_parens > 0 and lookahead < min(total_lines, idx + 20):
+                nxt = lines[lookahead].strip()
+                if nxt and not nxt.startswith("#") and not nxt.startswith("//"):
+                    sig_parts.append(nxt)
+                    open_parens += nxt.count("(") - nxt.count(")")
+                lookahead += 1
+        sig = re.sub(r"\s+", " ", " ".join(sig_parts)).strip()
+        declarations.append((idx + 1, sig))
+    return declarations
+
+
+def build_api_index(proj_root: Path, selected_files: list[Path]) -> str:
+    """Build the complete API_INDEX.md content for every source file in the archive."""
+    h1 = "#"
+    h2 = "#" * 2
+    bullet = chr(45)
+    nl = chr(10)
+    per_file: list[tuple[str, list[tuple[int, str]]]] = []
+    total_decls = 0
+    scanned_files = 0
+
+    for rel in sorted(selected_files, key=lambda p: p.as_posix().lower()):
+        if rel.suffix.lower() not in DECLARATION_EXTENSIONS:
+            continue
+        scanned_files += 1
+        full = proj_root / rel
+        decls = extract_declarations_for_file(full, rel)
+        total_decls += len(decls)
+        per_file.append((rel.as_posix(), decls))
+
+    out_lines = [
+        f"{h1} API_INDEX.md - Complete Public & Source Declaration Index",
+        f"Project Root: {proj_root.name}",
+        f"Source Files Scanned: {scanned_files}",
+        f"Total Declarations: {total_decls} (complete - no truncation)",
+        "",
+        EXACT_API_SECTION_TEXT,
+        "",
+    ]
+    for rel_posix, decls in per_file:
+        out_lines.append(f"{h2} {rel_posix} ({len(decls)} declaration(s))")
+        if not decls:
+            out_lines.append(f"{bullet} (no declarations matched)")
+        else:
+            for line_no, sig in decls:
+                out_lines.append(f"{bullet} {rel_posix}:{line_no} -> {sig}")
+        out_lines.append("")
+    return nl.join(out_lines).rstrip() + nl
+
+
 def _compose_task_brief(
     proj_root: Path,
-     selected_files: list[Path],
+    selected_files: list[Path],
     excluded_files: list[tuple[str, str]],
     base_brief: str,
 ) -> str:
     h2 = "#" * 2
     h3 = "#" * 3
     bullet = chr(45)
+    nl = chr(10)
+
+    detected_cmd = detect_verification_command(proj_root)
+    py_rels = [
+        r.as_posix() for r in sorted(selected_files, key=lambda p: p.as_posix().lower())
+        if r.suffix.lower() == ".py"
+    ]
+    if detected_cmd:
+        verify_lines = [
+            f"Detected command: `{detected_cmd}`",
+            "If automatic detection is not sure, name the exact command that verifies this",
+            f"project under `{h2} VERIFICATION COMMAND` in your reply and notes so the bridge",
+            "can run it directly.",
+        ]
+    elif py_rels:
+        fallback_py = "python -m py_compile " + " ".join(py_rels)
+        verify_lines = [
+            "Detected root marker command: `(none - no root build marker matched)`",
+            f"Archive verification command: `{fallback_py}`",
+            "Argon: confirm or name the exact command that verifies this project under",
+            f"`{h2} VERIFICATION COMMAND` in your reply and notes so the bridge can read it",
+            "straight from the archive when automatic root detection is not sure.",
+        ]
+    else:
+        verify_lines = [
+            "Detected command: `(none - automatic detection did not match a project root build marker)`",
+            "Argon: name the exact command that verifies this project under",
+            f"`{h2} VERIFICATION COMMAND` in your reply and notes so the bridge can read it",
+            "straight from the archive when automatic detection is not sure.",
+        ]
+
+    top_sections = nl.join([
+        f"{h2} THE EXACT API OF THIS PROJECT",
+        "",
+        EXACT_API_SECTION_TEXT,
+        "",
+        f"{h2} VERIFICATION COMMAND",
+        "",
+        *verify_lines,
+    ])
+
+    crit_marker = f"{h2} CRITICAL INSTRUCTIONS FOR GEMINI 4 ARGON:"
+    if crit_marker in base_brief:
+        base_brief = base_brief.replace(crit_marker, top_sections + nl + nl + crit_marker, 1)
+    else:
+        base_brief = base_brief.rstrip() + nl + nl + top_sections
+
     tree_lines = [
         f"{h2} COMPLETE PACKED FILE TREE ({len(selected_files)} files - no truncation)",
         "",
@@ -235,11 +578,12 @@ def _compose_task_brief(
 
     no_guess_lines = [
         "",
-        f"{h3} 6. DO NOT GUESS MISSING CONTEXT (CRITICAL)",
+        f"{h3} 6. DO NOT GUESS MISSING CONTEXT & KEEP PAYLOADS BYTE-EXACT (CRITICAL)",
         NO_GUESSING_DIRECTIVE,
         "",
+        BYTE_EXACT_DIRECTIVE,
+        "",
     ]
-    nl = chr(10)
     sections = [
         base_brief.rstrip(),
         "",
@@ -430,6 +774,8 @@ $TargetRoot = '{proj_root}'
      `# NOTE: <file> - <what is inconsistent, why it matters, and what you would do instead>`
      `# --- END NOTES ---`
 """
+        api_index_text = build_api_index(proj_root, selected_files)
+        zf.writestr("API_INDEX.md", api_index_text)
         brief_text = _compose_task_brief(proj_root, selected_files, excluded_files, brief_text)
         zf.writestr("TASK_BRIEF.md", brief_text)
         try:
