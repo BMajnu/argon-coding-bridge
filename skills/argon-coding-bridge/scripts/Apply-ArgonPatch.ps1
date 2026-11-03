@@ -21,30 +21,43 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$absProject = (Resolve-Path $ProjectPath).Path
+# Long-form path: Resolve-Path can return the 8.3 short name while
+# Get-ChildItem reports long names, which breaks the relative-path maths.
+$absProject = (Get-Item -LiteralPath (Resolve-Path -LiteralPath $ProjectPath).Path).FullName
 $backupRootDir = Join-Path $absProject ".argon_backup"
 
 if ($Rollback) {
     Write-Host "[!] Rollback requested..." -ForegroundColor Yellow
-    if (-not (Test-Path $backupRootDir)) {
+    if (-not (Test-Path -LiteralPath $backupRootDir) -and -not $PSBoundParameters.ContainsKey('ProjectPath')) {
+        $repoCandidate = (Get-Item -LiteralPath (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..\..\..")).Path).FullName
+        $candidateBackupDir = Join-Path $repoCandidate ".argon_backup"
+        if (Test-Path -LiteralPath $candidateBackupDir) {
+            $absProject = $repoCandidate
+            $backupRootDir = $candidateBackupDir
+        }
+    }
+    if (-not (Test-Path -LiteralPath $backupRootDir)) {
         Write-Error "No backup directory found at $backupRootDir"
         exit 1
     }
 
-    $lastBackup = Get-ChildItem -Path $backupRootDir -Directory | Sort-Object CreationTime -Descending | Select-Object -First 1
+    $lastBackup = Get-ChildItem -LiteralPath $backupRootDir -Directory |
+        Where-Object { @(Get-ChildItem -LiteralPath $_.FullName -Recurse -File -ErrorAction SilentlyContinue).Count -gt 0 } |
+        Sort-Object CreationTime, Name -Descending |
+        Select-Object -First 1
     if (-not $lastBackup) {
         Write-Error "No backup sessions found in $backupRootDir"
         exit 1
     }
 
     Write-Host "[+] Restoring from backup session: $($lastBackup.FullName)" -ForegroundColor Cyan
-    $files = Get-ChildItem -Path $lastBackup.FullName -Recurse -File
+    $files = Get-ChildItem -LiteralPath $lastBackup.FullName -Recurse -File
     foreach ($f in $files) {
         $relPath = $f.FullName.Substring($lastBackup.FullName.Length).TrimStart('\', '/')
         $targetPath = Join-Path $absProject $relPath
         $parent = [System.IO.Path]::GetDirectoryName($targetPath)
-        if (-not (Test-Path $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
-        Copy-Item -Path $f.FullName -Destination $targetPath -Force
+        if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
+        Copy-Item -LiteralPath $f.FullName -Destination $targetPath -Force
         Write-Host "  -> Restored: $relPath" -ForegroundColor Green
     }
     Write-Host "[SUCCESS] Rollback complete." -ForegroundColor Green
@@ -60,7 +73,17 @@ Write-Host "==========================================" -ForegroundColor Cyan
 Write-Host "  Gemini 4 Argon Patch Applicator" -ForegroundColor Cyan
 Write-Host "==========================================" -ForegroundColor Cyan
 
-$content = Get-Content -Path $PatchFile -Raw -Encoding UTF8
+$content = Get-Content -LiteralPath $PatchFile -Raw -Encoding UTF8
+if ($PatchFile.EndsWith(".ps1", [System.StringComparison]::OrdinalIgnoreCase) -or $content -match '\$TargetRoot\s*=') {
+    $runnerScript = Join-Path $PSScriptRoot "Run-ArgonPatch.ps1"
+    if (Test-Path -LiteralPath $runnerScript) {
+        $shellExe = if (Get-Command pwsh -ErrorAction SilentlyContinue) { "pwsh" } else { "powershell" }
+        $runnerArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $runnerScript, "-ProjectPath", $absProject, "-PatchFile", (Resolve-Path -LiteralPath $PatchFile).Path)
+        if ($DryRun) { $runnerArgs += "-DryRun" }
+        & $shellExe @runnerArgs
+        exit $LASTEXITCODE
+    }
+}
 
 # Regex parsing for structured file blocks:
 # Pattern: ```[language] filepath
