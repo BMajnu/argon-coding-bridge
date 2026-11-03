@@ -1884,12 +1884,25 @@ def apply_extracted_patch(
     return False
 
 
-def get_target_url(mode: str, slot: Optional[str] = None) -> str:
+def get_target_url(
+    mode: str,
+    slot: Optional[str] = None,
+    isolated_profile: bool = False,
+) -> str:
     """
     Return the canonical workspace URL for the given mode.
 
-    The account slot (/u/N/) IS part of the URL: Gemini serves a distinct
-    session per account under /u/<n>/. Never strip it.
+    IMPORTANT - /u/N/ is an INDEX into the account list of the browser that
+    opens the URL, not a fixed account. A per-slot profile
+    (~/.gemini/argon_profiles/slot-uN/) holds exactly ONE Google account, and
+    that account always sits at index 0. Opening /u/<n>/ on such a profile
+    therefore lands on the ANONYMOUS GUEST page ("Sign in to save activity",
+    model Flash-Lite) - which looks like a session that expired and silently
+    sends the task nowhere.
+
+    So when the run drives an isolated slot profile the URL must use /u/0/.
+    The slot itself is still tracked separately (the lock file, the session map
+    and the account pool), so nothing is lost.
 
     Gemini Web is the only supported workspace. Google AI Studio was removed
     because it consistently fails on agentic work, so any other mode is
@@ -1902,8 +1915,31 @@ def get_target_url(mode: str, slot: Optional[str] = None) -> str:
             "supported - it consistently fails on agentic work. Use "
             "--mode gemini (Gemini Web)."
         )
-    slot_part = normalize_slot(slot) if slot else "/u/0/"
+    if isolated_profile:
+        slot_part = "/u/0/"
+    else:
+        slot_part = normalize_slot(slot) if slot else "/u/0/"
     return GEMINI_WEB_URL.format(slot=slot_part)
+
+
+def _profile_is_isolated_slot(profile_dir: Any) -> bool:
+    """True when the profile is a per-slot profile (one account, index 0)."""
+    try:
+        return Path(str(profile_dir)).expanduser().resolve().parent.name == "argon_profiles"
+    except Exception:
+        return False
+
+
+def _gemini_page_is_guest(page) -> bool:
+    """True when the page shows Gemini's anonymous guest experience."""
+    try:
+        body = (page.locator("body").inner_text(timeout=12000) or "").lower()
+    except Exception:
+        return False
+    return (
+        "sign in to save activity" in body
+        or "where should we start" in body
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -3692,6 +3728,36 @@ def _is_page_unauthenticated(page: Any) -> bool:
             return True
     except Exception:
         pass
+    # The ANONYMOUS GUEST page: the URL is a normal gemini.google.com one, so
+    # it slips through the checks above - but the page shows "Sign in to save
+    # activity" / "Where should we start?" and the model chip reads
+    # "Flash-Lite". A task sent there goes nowhere, so it must be refused.
+    try:
+        body = (page.locator("body").inner_text(timeout=12000) or "").lower()
+    except Exception:
+        body = ""
+    if (
+        "sign in to save activity" in body
+        or "where should we start" in body
+        or "sign in to continue" in body
+    ):
+        return True
+    # A signed-in Gemini always shows the account avatar / the chat history.
+    try:
+        if page.locator("a[aria-label*='Google Account'], button[aria-label*='Google Account']").count() > 0:
+            return False
+    except Exception:
+        pass
+    try:
+        chip = _model_chip(page)
+        if chip is not None and _model_name(chip):
+            # A model chip with a real model name means the page is the signed
+            # in workspace, not the guest page.
+            name = _model_name(chip).lower()
+            if name and "flash-lite" not in name:
+                return False
+    except Exception:
+        pass
     return False
 
 
@@ -4767,6 +4833,11 @@ def dispatch_to_argon(
 
     # 3. Session continuity: a follow-up task on the same project continues in
     #    the SAME Gemini conversation when running on the same mode and slot.
+    base_profile = pool_cfg.profile_dir
+    base_profile.mkdir(parents=True, exist_ok=True)
+    slot_profile = _profile_dir_for_slot(base_profile, active_slot)
+    print(f"[+] Slot browser profile: {slot_profile}")
+
     session = None if (new_session or resume_chat) else session_store.lookup(proj_root, mode=mode)
     if session and (session.get("mode") or "gemini") != (mode or "gemini").strip().lower():
         session = None
@@ -4789,7 +4860,7 @@ def dispatch_to_argon(
             mode=mode,
             active_slot=active_slot,
             current_url=str(resume_entry.get("chat_url") or ""),
-            fallback_url=get_target_url(mode, active_slot),
+            fallback_url=get_target_url(mode, active_slot, isolated_profile=_profile_is_isolated_slot(slot_profile)),
             task_state=task_state_store,
             session_store=session_store,
         )
@@ -4804,7 +4875,7 @@ def dispatch_to_argon(
         pool_cfg.set_active_slot(active_slot)
         active_account = pool_cfg.get_by_slot(active_slot)
         target_email = active_account.get("email") if active_account else None
-        target_url = get_target_url(mode, active_slot)
+        target_url = get_target_url(mode, active_slot, isolated_profile=_profile_is_isolated_slot(slot_profile))
 
     # 4. Build surgical prompt (carries the absolute target directory so the
     #    delivered script applies everything in one run, wherever it is run from)
@@ -4829,9 +4900,6 @@ def dispatch_to_argon(
 
     from playwright.sync_api import sync_playwright
 
-    base_profile = pool_cfg.profile_dir
-    base_profile.mkdir(parents=True, exist_ok=True)
-    slot_profile = _profile_dir_for_slot(base_profile, active_slot)
 
     # Every pool slot gets its own browser profile directory, so two runs on
     # two different slots never fight over one Chrome profile. The slot lock

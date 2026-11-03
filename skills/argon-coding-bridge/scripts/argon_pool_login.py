@@ -749,6 +749,43 @@ class GoogleLogin:
 
         return has_auth_cookie
 
+    def verify_session(self) -> bool:
+        """Check that this profile really holds a LIVE Google session.
+
+        The presence of the auth cookies is NOT enough: a copied or rotated
+        cookie jar keeps SID / SSID / __Secure-1PSID around while Google has
+        already invalidated the session. Opening Gemini then shows the
+        anonymous guest page ("Sign in to save activity", model Flash-Lite),
+        which looks like a working browser but is not signed in.
+
+        The profile holds exactly ONE account and /u/N/ is an index into the
+        account list of THIS browser, so the check opens /u/0/.
+        """
+        try:
+            page = self._active_page()
+        except Exception:
+            return False
+        try:
+            page.goto(
+                "https://gemini.google.com/u/0/app",
+                wait_until="domcontentloaded",
+                timeout=60000,
+            )
+            page.wait_for_timeout(6000)
+            body = (page.locator("body").inner_text(timeout=15000) or "").lower()
+        except Exception:
+            return False
+        if "sign in to save activity" in body or "where should we start" in body:
+            return False
+        try:
+            if page.locator(
+                "a[aria-label*='Google Account'], button[aria-label*='Google Account']"
+            ).count() > 0:
+                return True
+        except Exception:
+            pass
+        return "sign in to save activity" not in body and "where should we start" not in body
+
     def _detect_challenge(self, page: Any) -> Optional[str]:
         """
         Inspect the current page for a human verification challenge:
@@ -1116,6 +1153,16 @@ class GoogleLogin:
                             on_status=on_status,
                         )
                         res.slot = slot
+                        # The sign-in can succeed while the session is still not usable
+                        # (a stale cookie jar, a guest page). Do not report success until
+                        # the session really works.
+                        if res.status == STATUS_OK and not self.verify_session():
+                            res.status = STATUS_FAILED
+                            res.detail = (
+                                (res.detail + " | " if res.detail else "")
+                                + "the profile still shows Gemini's guest page - "
+                                  "the session is not usable"
+                            )
                 else:
                     self.start()
                     res = self.login(
@@ -1194,7 +1241,10 @@ def open_gemini(profile_dir: Optional[Union[str, Path]] = None, slot: Optional[s
         target_profile = cfg.profile_dir_for_slot(slot_part)
         if not (target_profile.is_dir() and (target_profile / "Default").is_dir()):
             seed_slot_profile(cfg.profile_dir, target_profile)
-    _launch_detached_browser(target_profile, GEMINI_WEB_URL.format(slot=slot_part))
+    # The slot profile holds exactly ONE Google account, and /u/N/ is an index
+    # into the account list of THIS browser - so it must be /u/0/. Opening
+    # /u/<n>/ here lands on the anonymous guest page.
+    _launch_detached_browser(target_profile, GEMINI_WEB_URL.format(slot="/u/0/"))
 
 
 def open_aistudio(profile_dir: Optional[Union[str, Path]] = None, slot: Optional[str] = None) -> None:
