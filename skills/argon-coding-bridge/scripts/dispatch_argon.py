@@ -3498,12 +3498,59 @@ def _argon_visible(page) -> bool:
     return False
 
 
-def select_task_mode(page) -> bool:
+def select_task_mode(page, require_verifiable: bool = False,
+                     wait_for_toggle_seconds: float = 30.0) -> bool:
     """Switch Gemini Web into Task mode. Returns True only when verifiable.
 
     On an EXISTING conversation there is no Chat/Task toggle at all: the chat
     already runs in the mode it was created with, so there is nothing to switch
     and the inherited mode is accepted.
+
+    On a BRAND-NEW chat there is NO inherited mode, so "the toggle is not
+    there" must never be accepted as "Task mode": the toggle can simply not
+    have rendered yet. MEASURED 2026-11-04: the owner kept getting prompts
+    that went to Chat mode because this function returned True without ever
+    proving the mode. With `require_verifiable=True` the toggle is WAITED for
+    (bounded) and the run FAILS LOUDLY when the mode cannot be proven.
+    """
+    waited = 0.0
+    while True:
+        state = _select_task_mode_once(page)
+        if state is True:
+            return True
+        if state is None:
+            # The toggle is not on the page at all. On a continuation the chat
+            # keeps the mode it was created with. On a NEW chat the mode must
+            # be proven, so we wait for the toggle to render.
+            if not require_verifiable:
+                print("[+] No Chat/Task toggle on this page - the conversation keeps its mode.")
+                return True
+            if waited >= max(0.0, float(wait_for_toggle_seconds)):
+                break
+            waited += 3.0
+            try:
+                page.wait_for_timeout(3000)
+            except Exception:
+                time.sleep(3.0)
+            continue
+        # The toggle IS there but Task mode could not be confirmed.
+        return False
+    if require_verifiable:
+        print(
+            "[!] The Chat/Task toggle never appeared, so Task mode could NOT be "
+            "verified on a NEW chat. Refusing to send - a prompt sent in Chat "
+            "mode cannot do the work.",
+            file=sys.stderr,
+        )
+    return False
+
+
+def _select_task_mode_once(page):
+    """One attempt at switching to Task mode. See select_task_mode().
+
+    Returns True when Task mode is PROVEN, False when the toggle is there but
+    the mode could not be confirmed, and None when the toggle is not on the
+    page at all (the chat keeps the mode it was created with).
     """
     try:
         task_btn = page.get_by_text(RE_TASK)
@@ -3521,8 +3568,7 @@ def select_task_mode(page) -> bool:
             except Exception:
                 continue
         if not toggle_found:
-            print("[+] No Chat/Task toggle on this page - the conversation keeps its mode.")
-            return True
+            return None
     except Exception:
         pass
     return False
@@ -3691,7 +3737,8 @@ def _argon_picker_is_disabled(page) -> bool:
     return bool(info.get("disabled"))
 
 
-def ensure_argon_model(page, attempts: int = 3, wait_for_chip_seconds: float = 45.0) -> bool:
+def ensure_argon_model(page, attempts: int = 3, wait_for_chip_seconds: float = 45.0,
+                       require_chip: bool = True) -> bool:
     """THE double check: the model must be 4 Argon before anything is sent.
 
     Sending a task to Flash is the single worst failure this bridge can have -
@@ -3721,6 +3768,18 @@ def ensure_argon_model(page, attempts: int = 3, wait_for_chip_seconds: float = 4
     while True:
         chip = _model_chip(page)
         if chip is None:
+            if not require_chip:
+                # MEASURED 2026-11-04: on an EXISTING conversation the model
+                # switcher is not rendered at all - the composer reads
+                # "Ask a follow-up" and there is no chip. The chat keeps the
+                # model it was created with, so a missing chip is NOT a
+                # failure; treating it as one aborted a healthy follow-up.
+                print(
+                    "[+] No model chip on this conversation - it keeps the model "
+                    "it was created with (verified when the chat was started).",
+                    file=sys.stderr,
+                )
+                return True
             # The chip has not rendered yet. Wait for it - but only for a
             # bounded time, and only when it is really absent.
             if waited >= max(0.0, float(wait_for_chip_seconds)):
@@ -3796,13 +3855,16 @@ def ensure_argon_model(page, attempts: int = 3, wait_for_chip_seconds: float = 4
     return False
 
 
-def select_argon_model(page) -> bool:
+def select_argon_model(page, require_chip: bool = True) -> bool:
     """Select the 4 Argon model. Returns True only when verifiable.
 
     The verification is delegated to `ensure_argon_model`, so the pre-flight
     and the gate right before the send use exactly the same rule.
+
+    `require_chip=False` is for a CONTINUATION: such a conversation has no
+    model switcher at all, so the model is inherited from the chat.
     """
-    return ensure_argon_model(page)
+    return ensure_argon_model(page, require_chip=require_chip)
 
 
 def _picker_open(page) -> bool:
@@ -5089,7 +5151,7 @@ def _carry_over_to_new_session(
     # The workspace must be set up again in the new session.
     try:
         if not manual_setup:
-            _retry(select_task_mode, page)
+            _retry(lambda p: select_task_mode(p, require_verifiable=True), page)
     except Exception:
         pass
     if not ensure_argon_model(page):
@@ -6036,9 +6098,19 @@ def dispatch_to_argon(
                 )
                 mode_ok = model_ok = think_ok = attached = True
             else:
-                mode_ok = True if manual_setup else _retry(select_task_mode, page)
-                preflight.append(f"mode = Task : {'OK (manual)' if manual_setup else ('OK' if mode_ok else 'FAILED')}")
-                model_ok = True if manual_setup else _retry(select_argon_model, page)
+                # A NEW chat has no inherited mode: Task mode must be PROVEN,
+                # not assumed. A continuation keeps the mode it was created with.
+                mode_ok = True if manual_setup else _retry(
+                    lambda p: select_task_mode(p, require_verifiable=not is_continuation),
+                    page,
+                )
+                preflight.append(f"mode = Task : {'OK (manual)' if manual_setup else ('OK (inherited)' if is_continuation else ('OK' if mode_ok else 'FAILED'))}")
+                # The same for the model: a continuation has no model switcher
+                # at all, so its model is inherited from the chat.
+                model_ok = True if manual_setup else _retry(
+                    lambda p: select_argon_model(p, require_chip=not is_continuation),
+                    page,
+                )
                 preflight.append(f"model = 4 Argon : {'OK (manual)' if manual_setup else ('OK' if model_ok else 'FAILED')}")
                 think_ok = True
 
@@ -6188,7 +6260,7 @@ def dispatch_to_argon(
                     else:
                         composer = _find_composer(page)
                         if composer is not None:
-                            if not ensure_argon_model(page):
+                            if not ensure_argon_model(page, require_chip=not is_continuation):
                                 shot_send_gate = _take_step_screenshot(page, proj_root, "preflight_failure.png")
                                 if _argon_picker_is_disabled(page):
                                     acct_now = _detect_signed_in_account(page, target_email, active_slot)
