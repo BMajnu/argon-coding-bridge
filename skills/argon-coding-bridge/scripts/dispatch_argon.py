@@ -2093,12 +2093,20 @@ def _normalize_gemini_chat_url(url: str, isolated_profile: bool = True) -> str:
 
 
 def _gemini_page_is_guest(page) -> bool:
-    """True when the page shows Gemini's anonymous guest experience.
+    """True when the page really shows a Google sign-in screen.
 
-    Never uses 'Where should we start?' because a signed-in Gemini home page
-    also contains that phrase. Relies only on 'Sign in to save activity',
-    'Sign in or create an account', an accounts.google.com/signin URL, or a
-    visible Sign in link.
+    NEVER decide from a phrase in the body. MEASURED 2026-11-04: the phrase
+    "Sign in to save activity" is not a hidden menu item - it appears in the
+    CONVERSATION TEXT whenever the chat talks about the guest detection (the
+    bridge's own documentation, a patch that mentions it, ...). A body
+    substring is therefore worthless as a guest marker.
+
+    And the ABSENCE of a sign-in signal proves nothing either: right after a
+    page load the sidebar has not rendered yet, so the chat list and the
+    account chip are missing while the session is perfectly alive. Treating
+    that as "guest" aborted a healthy run.
+
+    The proof is the URL, or a VISIBLE sign-in control.
     """
     try:
         url = (page.url or "").lower()
@@ -2114,41 +2122,38 @@ def _gemini_page_is_guest(page) -> bool:
         )
     ):
         return True
-    try:
-        sign_in_links = page.locator("a[href*='ServiceLogin'], a[aria-label*='Sign in']")
-        if sign_in_links.count() > 0 and sign_in_links.first.is_visible():
-            return True
-    except Exception:
-        pass
-    try:
-        body = (page.locator("body").inner_text(timeout=12000) or "").lower()
-    except Exception:
-        return False
-    if not (
-        "sign in to save activity" in body
-        or "sign in or create an account" in body
+    # A visible sign-in control with a SHORT label. A chat bubble that merely
+    # contains the word must never match.
+    for sel in (
+        "a[href*='ServiceLogin']",
+        "button[aria-label*='Sign in']",
+        "a[aria-label*='Sign in']",
+        "button[aria-label*='Log in']",
+        "a[aria-label*='Log in']",
+        "button[aria-label*='সাইন']",
+        "a[aria-label*='সাইন']",
     ):
-        return False
-    # The phrase ALONE is not proof of a guest: a SIGNED-IN Gemini page can
-    # carry it in a hidden menu item. A signed-in page always shows the chat
-    # history and the account avatar, so either of those proves the session is
-    # alive and the phrase must be ignored.
+        try:
+            loc = page.locator(sel)
+            for i in range(min(loc.count(), 4)):
+                el = loc.nth(i)
+                if not _safe_visible(el):
+                    continue
+                label = (el.get_attribute("aria-label") or "").strip()
+                if label and len(label) <= 24:
+                    return True
+        except Exception:
+            continue
     try:
-        if page.locator("a[href*='/app/']").count() > 0:
-            return False
-    except Exception:
-        pass
-    try:
-        avatar = page.locator(
-            "a[aria-label*='Google Account'], "
-            "button[aria-label*='Google Account'], "
-            "a[aria-label*='Google অ্যাকাউন্ট']"
+        sign_in_text = page.get_by_text(
+            re.compile(r"^(sign in|log in|সাইন ?ইন)$", re.IGNORECASE)
         )
-        if avatar.count() > 0 and avatar.first.is_visible():
-            return False
+        for i in range(min(sign_in_text.count(), 3)):
+            if _safe_visible(sign_in_text.nth(i)):
+                return True
     except Exception:
         pass
-    return True
+    return False
 
 
 # --------------------------------------------------------------------------- #
@@ -3686,7 +3691,7 @@ def _argon_picker_is_disabled(page) -> bool:
     return bool(info.get("disabled"))
 
 
-def ensure_argon_model(page, attempts: int = 3) -> bool:
+def ensure_argon_model(page, attempts: int = 3, wait_for_chip_seconds: float = 45.0) -> bool:
     """THE double check: the model must be 4 Argon before anything is sent.
 
     Sending a task to Flash is the single worst failure this bridge can have -
@@ -3699,21 +3704,43 @@ def ensure_argon_model(page, attempts: int = 3) -> bool:
     rotate to the next pool account) from a missing option (meaning the picker
     did not open).
 
+    MEASURED 2026-11-04: the chip is rendered by the page itself, so right
+    after a load it can simply be NOT THERE YET. That is not a failed check -
+    the run must WAIT for it (bounded by `wait_for_chip_seconds`) instead of
+    aborting a healthy account. Before this, a lane died in pre-flight with
+    "model = 4 Argon : FAILED, model chip: (not visible)" while the screenshot
+    showed a perfectly working, signed-in Gemini page.
+
     Returns True only when the chip reads Argon.
     """
     _LAST_PICKER_ARGON_STATE.pop(id(page), None)
     last_seen = ""
     last_picker_state = "missing"
-    for attempt in range(max(1, attempts)):
+    waited = 0.0
+    attempt = 0
+    while True:
         chip = _model_chip(page)
-        if chip is not None:
-            name = _model_name(chip)
-            if name:
-                last_seen = name
-            if _chip_is_argon(chip):
-                if attempt:
-                    print(f"[+] Model switched to Argon ({name!r}).")
-                return True
+        if chip is None:
+            # The chip has not rendered yet. Wait for it - but only for a
+            # bounded time, and only when it is really absent.
+            if waited >= max(0.0, float(wait_for_chip_seconds)):
+                break
+            waited += 3.0
+            try:
+                page.wait_for_timeout(3000)
+            except Exception:
+                time.sleep(3.0)
+            continue
+        if attempt >= max(1, attempts):
+            break
+        attempt += 1
+        name = _model_name(chip)
+        if name:
+            last_seen = name
+        if _chip_is_argon(chip):
+            if attempt > 1:
+                print(f"[+] Model switched to Argon ({name!r}).")
+            return True
         # Not Argon (or no chip at all): open the picker and pick it.
         if chip is not None:
             try:
