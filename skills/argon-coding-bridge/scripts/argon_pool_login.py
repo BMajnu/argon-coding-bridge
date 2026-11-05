@@ -457,9 +457,22 @@ class PoolConfig:
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        # Validate unique slots and non-empty passwords before writing
+        seen_slots = set()
+        for acc in self.data.get("accounts") or []:
+            if not isinstance(acc, dict):
+                continue
+            s_norm = normalize_slot(acc.get("slot", f"/u/{acc.get('index', 0)}/"))
+            if s_norm in seen_slots:
+                idx = self.next_index()
+                s_norm = f"/u/{idx}/"
+                acc["index"] = idx
+            acc["slot"] = s_norm
+            seen_slots.add(s_norm)
         serialized = json.dumps(self.data, indent=2, ensure_ascii=False) + "\n"
-        # UTF-8 without BOM
-        self.path.write_bytes(serialized.encode("utf-8"))
+        tmp_path = self.path.with_name(f".{self.path.name}.{os.getpid()}.tmp")
+        tmp_path.write_bytes(serialized.encode("utf-8"))
+        os.replace(str(tmp_path), str(self.path))
 
     @property
     def profile_dir(self) -> Path:
@@ -560,6 +573,330 @@ class PoolConfig:
             if normalize_slot(acc.get("slot", f"/u/{acc.get('index', 0)}/")) == norm:
                 return acc
         return None
+
+    def import_accounts_text(
+        self,
+        raw_text: str,
+        tier: str = "PRO",
+        role: str = "Pool Member",
+    ) -> Dict[str, Any]:
+        """Safely parse and import multi-line 'email:password' credentials (D7.1, D7.4).
+
+        Blank lines and '#' comment lines are ignored. Every line is validated on
+        its own so one malformed line never corrupts accounts_pool.json. Existing
+        emails have their password updated in place; new emails get a unique slot.
+        """
+        added: List[Dict[str, Any]] = []
+        updated: List[Dict[str, Any]] = []
+        failed: List[Dict[str, Any]] = []
+        accounts_to_login: List[Dict[str, Any]] = []
+
+        email_re = re.compile(r"^[^@\s:]+@[^@\s:]+\.[^@\s:]+$")
+        for line_no, raw_line in enumerate((raw_text or "").splitlines(), 1):
+            stripped = raw_line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if ":" not in stripped:
+                failed.append(
+                    {
+                        "line_no": line_no,
+                        "line": stripped[:40],
+                        "reason": "missing ':' separator (expected email:password)",
+                    }
+                )
+                continue
+            email_part, pwd_part = stripped.split(":", 1)
+            clean_email = email_part.strip()
+            clean_pwd = pwd_part.strip()
+            if not clean_email or not email_re.match(clean_email):
+                failed.append(
+                    {
+                        "line_no": line_no,
+                        "line": clean_email or "(empty email)",
+                        "reason": f"invalid email address: {clean_email!r}",
+                    }
+                )
+                continue
+            if not clean_pwd:
+                failed.append(
+                    {
+                        "line_no": line_no,
+                        "line": clean_email,
+                        "reason": f"empty password for {clean_email}",
+                    }
+                )
+                continue
+
+            existing_acc: Optional[Dict[str, Any]] = None
+            for acc in self.accounts:
+                if str(acc.get("email") or "").strip().lower() == clean_email.lower():
+                    existing_acc = acc
+                    break
+
+            if existing_acc is not None:
+                existing_acc["email"] = clean_email
+                existing_acc["password"] = clean_pwd
+                if tier:
+                    existing_acc["tier"] = tier.strip()
+                if role:
+                    existing_acc["role"] = role.strip()
+                if existing_acc.get("status") in ("not_signed_in", "failed", "quota_limited"):
+                    existing_acc["status"] = "configured"
+                updated.append(existing_acc)
+                if existing_acc not in accounts_to_login:
+                    accounts_to_login.append(existing_acc)
+            else:
+                idx = self.next_index()
+                slot = f"/u/{idx}/"
+                entry: Dict[str, Any] = {
+                    "index": idx,
+                    "slot": slot,
+                    "email": clean_email,
+                    "password": clean_pwd,
+                    "tier": (tier or "PRO").strip(),
+                    "role": (role or "Pool Member").strip(),
+                    "status": "configured",
+                }
+                self.accounts.append(entry)
+                added.append(entry)
+                accounts_to_login.append(entry)
+
+        if added or updated:
+            self.save()
+
+        return {
+            "added": added,
+            "updated": updated,
+            "failed": failed,
+            "accounts_to_login": accounts_to_login,
+        }
+
+    def import_accounts_file(
+        self,
+        file_path: Union[str, Path],
+        tier: str = "PRO",
+        role: str = "Pool Member",
+    ) -> Dict[str, Any]:
+        """Load a .txt file of email:password lines and import them into accounts_pool.json."""
+        p = Path(file_path).expanduser().resolve()
+        raw_text = p.read_text(encoding="utf-8-sig", errors="replace")
+        return self.import_accounts_text(raw_text, tier=tier, role=role)
+
+    def import_accounts_text(
+        self,
+        raw_text: str,
+        tier: str = "PRO",
+        role: str = "Pool Member",
+    ) -> Dict[str, Any]:
+        """Safely parse and import multi-line 'email:password' credentials (D7.1, D7.4).
+
+        Blank lines and '#' comment lines are ignored. Every line is validated on
+        its own so one malformed line never corrupts accounts_pool.json. Existing
+        emails have their password updated in place; new emails get a unique slot.
+        """
+        added: List[Dict[str, Any]] = []
+        updated: List[Dict[str, Any]] = []
+        failed: List[Dict[str, Any]] = []
+        accounts_to_login: List[Dict[str, Any]] = []
+
+        email_re = re.compile(r"^[^@\s:]+@[^@\s:]+\.[^@\s:]+$")
+        for line_no, raw_line in enumerate((raw_text or "").splitlines(), 1):
+            stripped = raw_line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if ":" not in stripped:
+                failed.append(
+                    {
+                        "line_no": line_no,
+                        "line": stripped[:40],
+                        "reason": "missing ':' separator (expected email:password)",
+                    }
+                )
+                continue
+            email_part, pwd_part = stripped.split(":", 1)
+            clean_email = email_part.strip()
+            clean_pwd = pwd_part.strip()
+            if not clean_email or not email_re.match(clean_email):
+                failed.append(
+                    {
+                        "line_no": line_no,
+                        "line": clean_email or "(empty email)",
+                        "reason": f"invalid email address: {clean_email!r}",
+                    }
+                )
+                continue
+            if not clean_pwd:
+                failed.append(
+                    {
+                        "line_no": line_no,
+                        "line": clean_email,
+                        "reason": f"empty password for {clean_email}",
+                    }
+                )
+                continue
+
+            existing_acc: Optional[Dict[str, Any]] = None
+            for acc in self.accounts:
+                if str(acc.get("email") or "").strip().lower() == clean_email.lower():
+                    existing_acc = acc
+                    break
+
+            if existing_acc is not None:
+                existing_acc["email"] = clean_email
+                existing_acc["password"] = clean_pwd
+                if tier:
+                    existing_acc["tier"] = tier.strip()
+                if role:
+                    existing_acc["role"] = role.strip()
+                if existing_acc.get("status") in ("not_signed_in", "failed", "quota_limited"):
+                    existing_acc["status"] = "configured"
+                updated.append(existing_acc)
+                if existing_acc not in accounts_to_login:
+                    accounts_to_login.append(existing_acc)
+            else:
+                idx = self.next_index()
+                slot = f"/u/{idx}/"
+                entry: Dict[str, Any] = {
+                    "index": idx,
+                    "slot": slot,
+                    "email": clean_email,
+                    "password": clean_pwd,
+                    "tier": (tier or "PRO").strip(),
+                    "role": (role or "Pool Member").strip(),
+                    "status": "configured",
+                }
+                self.accounts.append(entry)
+                added.append(entry)
+                accounts_to_login.append(entry)
+
+        if added or updated:
+            self.save()
+
+        return {
+            "added": added,
+            "updated": updated,
+            "failed": failed,
+            "accounts_to_login": accounts_to_login,
+        }
+
+    def import_accounts_file(
+        self,
+        file_path: Union[str, Path],
+        tier: str = "PRO",
+        role: str = "Pool Member",
+    ) -> Dict[str, Any]:
+        """Load a .txt file of email:password lines and import them into accounts_pool.json."""
+        p = Path(file_path).expanduser().resolve()
+        raw_text = p.read_text(encoding="utf-8-sig", errors="replace")
+        return self.import_accounts_text(raw_text, tier=tier, role=role)
+
+    def import_accounts_text(
+        self,
+        raw_text: str,
+        tier: str = "PRO",
+        role: str = "Pool Member",
+    ) -> Dict[str, Any]:
+        """Safely parse and import multi-line 'email:password' credentials (D7.1, D7.4).
+
+        Blank lines and '#' comment lines are ignored. Every line is validated on
+        its own so one malformed line never corrupts accounts_pool.json. Existing
+        emails have their password updated in place; new emails get a unique slot.
+        """
+        added: List[Dict[str, Any]] = []
+        updated: List[Dict[str, Any]] = []
+        failed: List[Dict[str, Any]] = []
+        accounts_to_login: List[Dict[str, Any]] = []
+
+        email_re = re.compile(r"^[^@\s:]+@[^@\s:]+\.[^@\s:]+$")
+        for line_no, raw_line in enumerate((raw_text or "").splitlines(), 1):
+            stripped = raw_line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if ":" not in stripped:
+                failed.append(
+                    {
+                        "line_no": line_no,
+                        "line": stripped[:40],
+                        "reason": "missing ':' separator (expected email:password)",
+                    }
+                )
+                continue
+            email_part, pwd_part = stripped.split(":", 1)
+            clean_email = email_part.strip()
+            clean_pwd = pwd_part.strip()
+            if not clean_email or not email_re.match(clean_email):
+                failed.append(
+                    {
+                        "line_no": line_no,
+                        "line": clean_email or "(empty email)",
+                        "reason": f"invalid email address: {clean_email!r}",
+                    }
+                )
+                continue
+            if not clean_pwd:
+                failed.append(
+                    {
+                        "line_no": line_no,
+                        "line": clean_email,
+                        "reason": f"empty password for {clean_email}",
+                    }
+                )
+                continue
+
+            existing_acc: Optional[Dict[str, Any]] = None
+            for acc in self.accounts:
+                if str(acc.get("email") or "").strip().lower() == clean_email.lower():
+                    existing_acc = acc
+                    break
+
+            if existing_acc is not None:
+                existing_acc["email"] = clean_email
+                existing_acc["password"] = clean_pwd
+                if tier:
+                    existing_acc["tier"] = tier.strip()
+                if role:
+                    existing_acc["role"] = role.strip()
+                if existing_acc.get("status") in ("not_signed_in", "failed", "quota_limited"):
+                    existing_acc["status"] = "configured"
+                updated.append(existing_acc)
+                if existing_acc not in accounts_to_login:
+                    accounts_to_login.append(existing_acc)
+            else:
+                idx = self.next_index()
+                slot = f"/u/{idx}/"
+                entry: Dict[str, Any] = {
+                    "index": idx,
+                    "slot": slot,
+                    "email": clean_email,
+                    "password": clean_pwd,
+                    "tier": (tier or "PRO").strip(),
+                    "role": (role or "Pool Member").strip(),
+                    "status": "configured",
+                }
+                self.accounts.append(entry)
+                added.append(entry)
+                accounts_to_login.append(entry)
+
+        if added or updated:
+            self.save()
+
+        return {
+            "added": added,
+            "updated": updated,
+            "failed": failed,
+            "accounts_to_login": accounts_to_login,
+        }
+
+    def import_accounts_file(
+        self,
+        file_path: Union[str, Path],
+        tier: str = "PRO",
+        role: str = "Pool Member",
+    ) -> Dict[str, Any]:
+        """Load a .txt file of email:password lines and import them into accounts_pool.json."""
+        p = Path(file_path).expanduser().resolve()
+        raw_text = p.read_text(encoding="utf-8-sig", errors="replace")
+        return self.import_accounts_text(raw_text, tier=tier, role=role)
 
 
 def notify(title: str, message: str) -> None:
@@ -1484,6 +1821,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Add a new account credential to accounts_pool.json and immediately sign it in.",
     )
     parser.add_argument(
+        "--import-file",
+        type=str,
+        default=None,
+        metavar="TXT_PATH",
+        help="Import bulk email:password lines from a .txt file into accounts_pool.json and auto-login.",
+    )
+    parser.add_argument(
+        "--import-file",
+        type=str,
+        default=None,
+        metavar="TXT_PATH",
+        help="Import bulk email:password lines from a .txt file into accounts_pool.json and auto-login.",
+    )
+    parser.add_argument(
+        "--import-file",
+        type=str,
+        default=None,
+        metavar="TXT_PATH",
+        help="Import bulk email:password lines from a .txt file into accounts_pool.json and auto-login.",
+    )
+    parser.add_argument(
         "--tier",
         type=str,
         default="PRO",
@@ -1523,6 +1881,51 @@ def main(argv: Optional[List[str]] = None) -> int:
     pool_cfg = PoolConfig(config_path=args.config, profile_dir_override=args.profile_dir)
 
     target_accounts: List[Dict[str, Any]] = []
+
+    if args.import_file:
+        rep = pool_cfg.import_accounts_file(args.import_file, tier=args.tier, role=args.role)
+        logger.info(
+            "Bulk import from %s: %d added, %d updated, %d failed",
+            args.import_file,
+            len(rep["added"]),
+            len(rep["updated"]),
+            len(rep["failed"]),
+        )
+        for fail in rep["failed"]:
+            logger.warning("  [Line %s] %s - %s", fail["line_no"], fail["line"], fail["reason"])
+        for acc in rep["accounts_to_login"]:
+            if acc not in target_accounts:
+                target_accounts.append(acc)
+
+    if args.import_file:
+        rep = pool_cfg.import_accounts_file(args.import_file, tier=args.tier, role=args.role)
+        logger.info(
+            "Bulk import from %s: %d added, %d updated, %d failed",
+            args.import_file,
+            len(rep["added"]),
+            len(rep["updated"]),
+            len(rep["failed"]),
+        )
+        for fail in rep["failed"]:
+            logger.warning("  [Line %s] %s - %s", fail["line_no"], fail["line"], fail["reason"])
+        for acc in rep["accounts_to_login"]:
+            if acc not in target_accounts:
+                target_accounts.append(acc)
+
+    if args.import_file:
+        rep = pool_cfg.import_accounts_file(args.import_file, tier=args.tier, role=args.role)
+        logger.info(
+            "Bulk import from %s: %d added, %d updated, %d failed",
+            args.import_file,
+            len(rep["added"]),
+            len(rep["updated"]),
+            len(rep["failed"]),
+        )
+        for fail in rep["failed"]:
+            logger.warning("  [Line %s] %s - %s", fail["line_no"], fail["line"], fail["reason"])
+        for acc in rep["accounts_to_login"]:
+            if acc not in target_accounts:
+                target_accounts.append(acc)
 
     if args.add:
         email, password = args.add

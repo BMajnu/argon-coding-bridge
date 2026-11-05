@@ -73,8 +73,13 @@ SESSION_STORE_PATH = Path.home() / ".gemini" / "argon_sessions.json"
 # Per-project task state: which conversation the current task is in and how far
 # it got, so a run can be resumed after the browser was closed.
 TASK_STATE_PATH = Path.home() / ".gemini" / "argon_task_state.json"
-TASK_STATE_VERSION = "1.0.0"
+TASK_REGISTRY_PATH = Path.home() / ".gemini" / "argon_tasks.json"
+DELIVERY_LEDGER_PATH = Path.home() / ".gemini" / "argon_delivery_ledger.json"
+TASK_STATE_VERSION = "1.1.0"
+TASK_REGISTRY_VERSION = "1.0.0"
+DELIVERY_LEDGER_VERSION = "1.0.0"
 SESSION_STORE_VERSION = "1.0.0"
+MAX_TASKS_PER_SLOT = 2
 
 # Exit codes:
 #   0 = success
@@ -86,6 +91,7 @@ SESSION_STORE_VERSION = "1.0.0"
 #   6 = browser launch failed
 #   7 = slot busy
 #   8 = build/lint verification failed after all verification rounds
+#   9 = task already running for this project/lane (use --resume or --force)
 EXIT_SUCCESS = 0
 EXIT_FAILURE = 1
 EXIT_NOT_SIGNED_IN = 2
@@ -96,6 +102,7 @@ EXIT_BROWSER_LAUNCH_FAILED = 6
 EXIT_SLOT_BUSY = 7
 EXIT_BUILD_FAILED = 8
 EXIT_VERIFY_FAILED = 8
+EXIT_ALREADY_RUNNING = 9
 SESSION_STORE_DESCRIPTION = (
     "Per-project Gemini session map. A follow-up task on the same project continues "
     "in the SAME conversation, so the earlier codebase understanding stays available."
@@ -787,12 +794,13 @@ def _chip_matches_patch_name(chip) -> bool:
 
 
 def _element_is_after_last_user_turn(el) -> bool:
-    """Return True when no user message appears after `el` in document order.
+    """Return True when no user message appears after `el` in document order (D1.3).
 
     In a follow-up conversation that already holds an earlier delivery, an
     earlier round's assistant turn (and its chip) precedes the newest user
     message in the DOM. Checking document position guarantees that an earlier
     round's chip is never mistaken for the newest assistant turn's delivery.
+    When evaluation fails, returns False so an older turn's chip is never opened.
     """
     try:
         return bool(
@@ -819,7 +827,25 @@ def _element_is_after_last_user_turn(el) -> bool:
             )
         )
     except Exception:
-        return True
+        return False
+
+
+def _generated_file_chip_indices_after_user(page) -> List[int]:
+    """Return indices of visible apply_changes chips that sit after the last user message."""
+    try:
+        chips = page.locator("generated-file")
+        found: List[int] = []
+        for i in range(min(chips.count(), 40)):
+            chip = chips.nth(i)
+            if not _safe_visible(chip):
+                continue
+            if not _element_is_after_last_user_turn(chip):
+                continue
+            if _chip_matches_patch_name(chip):
+                found.append(i)
+        return found
+    except Exception:
+        return []
 
 
 def _generated_file_chip_indices(page) -> List[int]:
@@ -839,11 +865,11 @@ def _generated_file_chip_indices(page) -> List[int]:
 
 
 def _generated_file_chip(page):
-    """Argon's generated-file chip for apply_changes in the NEWEST assistant turn.
+    """Argon's generated-file chip for apply_changes in the NEWEST assistant turn (D1.3).
 
-    In a conversation that already holds an earlier delivery, only the chip of
-    the newest assistant turn (after the last user message) may be opened. An
-    earlier round's chip is never returned.
+    In a conversation that already holds an earlier delivery, ONLY a chip belonging
+    to an assistant turn AFTER the last user message may be opened. When the newest
+    turn has no chip yet, returns None and waits - never falls back to an older chip.
     """
     turns = _assistant_turns(page)
     if turns:
@@ -856,6 +882,8 @@ def _generated_file_chip(page):
             for i in range(min(chips.count(), 10)):
                 chip = chips.nth(i)
                 if not _safe_visible(chip):
+                    continue
+                if not _element_is_after_last_user_turn(chip):
                     continue
                 if _chip_matches_patch_name(chip):
                     matched_in_turn.append(chip)
@@ -893,38 +921,49 @@ def _slot_number(slot: Optional[str]) -> int:
 
 
 def _chat_title(page) -> str:
-    """The name of the conversation - what the user sees in the sidebar.
+    """Return the title of the conversation the page is ACTUALLY in (D21).
 
-    This is recorded together with the link and the profile, so a session can
-    always be found again later, even when the browser is gone.
+    Never reads a generic selected sidebar entry: if the current URL has no
+    conversation id (a new chat that has not been created yet), returns '' so
+    diagnostics report that no conversation exists yet instead of naming a
+    foreign sidebar conversation.
     """
+    current_url = ""
+    try:
+        current_url = str(getattr(page, "url", "") or "")
+    except Exception:
+        current_url = ""
+    cid = ""
+    try:
+        m_cid = re.search(r"/app/([0-9a-f]{8,})|/prompts/(?!new_chat\b)([A-Za-z0-9_-]{8,})", current_url)
+        if m_cid:
+            cid = m_cid.group(1) or m_cid.group(2) or ""
+    except Exception:
+        cid = ""
+    if not cid:
+        return ""
     try:
         title = (page.title() or "").strip()
         for suffix in (" - Google Gemini", " - Gemini", " | Google Gemini"):
             if title.endswith(suffix):
                 title = title[: -len(suffix)].strip()
                 break
-        if title:
+        if title and title.lower() not in ("gemini", "google gemini"):
             return title
     except Exception:
         pass
-    for sel in (
-        "a.chat-history-item-selected",
-        ".chat-history-item.selected",
-        "[data-test-id='chat-history-item-selected']",
-        "a[aria-current='page']",
-    ):
-        try:
-            loc = page.locator(sel)
-            for i in range(min(loc.count(), 4)):
-                el = loc.nth(i)
-                if not _safe_visible(el):
-                    continue
-                t = (el.inner_text(timeout=1000) or "").strip()
-                if t:
-                    return t.splitlines()[0].strip()
-        except Exception:
-            continue
+    # Only inspect a link whose href explicitly contains THIS conversation's cid
+    try:
+        loc = page.locator(f"a[href*='{cid}']")
+        for i in range(min(loc.count(), 4)):
+            el = loc.nth(i)
+            if not _safe_visible(el):
+                continue
+            t = (el.inner_text(timeout=1000) or "").strip()
+            if t:
+                return t.splitlines()[0].strip()
+    except Exception:
+        pass
     return ""
 
 
@@ -1102,34 +1141,21 @@ RE_PRINT = re.compile(
 # Explicit download button selectors only. The blind '.drive-viewer-custom-button'
 # selector is intentionally excluded because it matches the Print toolbar button
 # that sits immediately to the left of the Download button.
+# D5.2: ONLY the Drive viewer's own toolbar button may ever be clicked.
+# Loose page-wide button[aria-label*='download'] selectors are forbidden because a
+# chat bubble or conversation control containing the word "download" must never be clicked.
 DOWNLOAD_BUTTON_SELECTORS = (
-    # The viewer's OWN toolbar comes FIRST. The loose `button[aria-label*=...]`
-    # selectors below match ANY button whose label contains the word - and a
-    # chat bubble in the conversation can carry that word in its label. The
-    # finder then clicks the bubble, the download never happens and the run
-    # fails with "the viewer's download button did not produce a .ps1 file".
     "div.drive-viewer-toolstrip-custom-panel .drive-viewer-custom-button[aria-label*='ডাউনলোড']",
     "div.drive-viewer-toolstrip-custom-panel .drive-viewer-custom-button[aria-label*='download' i]",
     "div.drive-viewer-toolstrip-custom-panel .drive-viewer-custom-button[data-tooltip*='ডাউনলোড']",
     "div.drive-viewer-toolstrip-custom-panel .drive-viewer-custom-button[data-tooltip*='download' i]",
-    "button[aria-label*='ডাউনলোড']",
-    "button[data-tooltip*='ডাউনলোড']",
-    "button[mattooltip*='ডাউনলোড']",
-    "button[title*='ডাউনলোড']",
-    "button[aria-label*='download' i]",
-    "button[data-tooltip*='download' i]",
-    "button[mattooltip*='download' i]",
-    "button[title*='download' i]",
-    "button:has(mat-icon[fonticon='download'])",
-    "button:has(mat-icon[fonticon='file_download'])",
-    "[role='button'][aria-label*='ডাউনলোড']",
-    "[role='button'][data-tooltip*='ডাউনলোড']",
-    "[role='button'][mattooltip*='ডাউনলোড']",
-    "[role='button'][title*='ডাউনলোড']",
-    "[role='button'][aria-label*='download' i]",
-    "[role='button'][data-tooltip*='download' i]",
-    "[role='button'][mattooltip*='download' i]",
-    "[role='button'][title*='download' i]",
+    "div.drive-viewer-toolstrip-custom-panel .drive-viewer-custom-button",
+    ".drive-viewer-toolstrip .drive-viewer-custom-button[aria-label*='ডাউনলোড']",
+    ".drive-viewer-toolstrip .drive-viewer-custom-button[aria-label*='download' i]",
+    ".drive-viewer-toolstrip button[aria-label*='ডাউনলোড']",
+    ".drive-viewer-toolstrip button[aria-label*='download' i]",
+    ".drive-viewer [role='button'][aria-label*='ডাউনলোড']",
+    ".drive-viewer [role='button'][aria-label*='download' i]",
 )
 
 
@@ -1211,9 +1237,36 @@ def _is_download_and_not_print(el) -> bool:
         return False
     if RE_PRINT.search(combined):
         return False
-    has_download_label = bool(RE_DOWNLOAD.search(label_text)) or (
-        "save as pdf" in label_text.lower()
-    )
+    # D5.2: Reject any element inside a conversation bubble/message or outside the Drive viewer
+    try:
+        in_chat_or_outside_viewer = bool(
+            el.evaluate(
+                """node => {
+                    let cur = node;
+                    let insideViewer = false;
+                    while (cur) {
+                        const tag = (cur.tagName || '').toLowerCase();
+                        const cls = (cur.getAttribute && (cur.getAttribute('class') || '')) || '';
+                        const tid = (cur.getAttribute && (cur.getAttribute('data-test-id') || '')) || '';
+                        if (tag === 'user-query' || tag === 'model-response' || tag === 'message-turn' ||
+                            tid === 'user-query' || tid === 'model-response' ||
+                            /\b(user-query|model-response)\b/i.test(cls)) {
+                            return true;
+                        }
+                        if (/drive-viewer/i.test(cls) || /drive-viewer/i.test(tag)) {
+                            insideViewer = true;
+                        }
+                        cur = cur.parentElement;
+                    }
+                    return !insideViewer;
+                }"""
+            )
+        )
+        if in_chat_or_outside_viewer:
+            return False
+    except Exception:
+        pass
+    has_download_label = bool(RE_DOWNLOAD.search(label_text))
     has_download_icon = bool(
         re.search(r"\b(download|file_download)\b", icon_text, re.IGNORECASE)
     ) or bool(RE_DOWNLOAD.search(icon_text))
@@ -1221,7 +1274,7 @@ def _is_download_and_not_print(el) -> bool:
 
 
 def _find_viewer_download_button(page):
-    """Return the single verified download button in the viewer, or None."""
+    """Return the single verified download button in the viewer's own toolbar (D5.2), or None."""
     for sel in DOWNLOAD_BUTTON_SELECTORS:
         try:
             loc = page.locator(sel)
@@ -1241,6 +1294,7 @@ def _viewer_is_open(page) -> bool:
     if _find_viewer_download_button(page) is not None:
         return True
     for sel in (
+        "div.drive-viewer-toolstrip-custom-panel",
         ".drive-viewer-carousel",
         ".drive-viewer",
         ".drive-viewer-default",
@@ -1257,14 +1311,14 @@ def _viewer_is_open(page) -> bool:
     return False
 
 
-def _validate_and_save_download(dl, dest_dir: Path) -> tuple[Optional[Path], str]:
-    """Verify that a Playwright download is really the .ps1 patch and not a PDF/print preview.
+MIN_PATCH_FILE_BYTES = 64
 
-    Rule 1.4:
-      1. If the download URL contains 'contribservice' or 'print', it is a print
-         preview and is discarded immediately.
-      2. If `suggested_filename` does not end in '.ps1', discard it and retry
-         (never rename a PDF or other file into `apply_changes.ps1`).
+
+def _validate_and_save_download(dl, dest_dir: Path) -> tuple[Optional[Path], str]:
+    """Verify that a Playwright download is really a non-empty .ps1 patch (D5, D18.1).
+
+    Saves to a temporary staging file first so a 0-byte or tiny/corrupt download
+    is rejected immediately and NEVER overwrites an existing good file in dest_dir.
     """
     dest_dir = Path(dest_dir)
     dl_url = ""
@@ -1303,29 +1357,44 @@ def _validate_and_save_download(dl, dest_dir: Path) -> tuple[Optional[Path], str
     dest_dir.mkdir(parents=True, exist_ok=True)
     safe_name = Path(suggested).name
     dest = dest_dir / safe_name
-    dl.save_as(str(dest))
+    staging = dest_dir / f".staging_{os.getpid()}_{int(time.time() * 1000)}_{safe_name}"
+    dl.save_as(str(staging))
 
     try:
-        head_bytes = dest.read_bytes()[:8]
+        file_size = staging.stat().st_size if staging.is_file() else 0
+    except OSError:
+        file_size = 0
+
+    if file_size < MIN_PATCH_FILE_BYTES:
+        print(
+            f"[!] Rejecting {file_size}-byte download for {safe_name} (minimum {MIN_PATCH_FILE_BYTES} bytes) - "
+            f"existing file {dest} was NOT overwritten.",
+            file=sys.stderr,
+        )
+        try:
+            staging.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return None, f"browser handed over an empty or undersized file ({file_size} bytes)"
+
+    try:
+        head_bytes = staging.read_bytes()[:8]
         if head_bytes.startswith(b"%PDF"):
             print(
-                f"[!] Discarding PDF file masquerading as .ps1: {dest}",
+                f"[!] Discarding PDF file masquerading as .ps1: {staging}",
                 file=sys.stderr,
             )
-            dest.unlink(missing_ok=True)
+            staging.unlink(missing_ok=True)
             return None, "browser handed over PDF bytes instead of a PowerShell script"
     except Exception:
         pass
 
+    os.replace(str(staging), str(dest))
     return dest, ""
 
 
 def _download_from_viewer(page, dest_dir: Path, timeout_ms: int = 12000) -> Optional[Path]:
-    """Find the viewer's verified download button, click ONLY that button, and validate the file.
-
-    Never clicks `.drive-viewer-custom-button` blindly, never clicks print
-    controls, and never clicks random menu items or links on the page.
-    """
+    """Find the viewer's verified toolbar download button, click ONLY that button, and validate the file."""
     dest_dir = Path(dest_dir)
     btn = _find_viewer_download_button(page)
     if btn is None:
@@ -1340,9 +1409,27 @@ def _download_from_viewer(page, dest_dir: Path, timeout_ms: int = 12000) -> Opti
 
 
 def _close_preview(page) -> None:
+    """Close the Drive viewer preview without ever cancelling an active Argon response (D10.1)."""
     try:
-        page.keyboard.press("Escape")
-        page.wait_for_timeout(600)
+        if not _viewer_is_open(page):
+            return
+        for close_sel in (
+            ".drive-viewer [aria-label*='Close' i]",
+            ".drive-viewer [aria-label*='বন্ধ']",
+            "div.drive-viewer-toolstrip [aria-label*='Close' i]",
+            "button[aria-label='Close preview' i]",
+        ):
+            try:
+                loc = page.locator(close_sel)
+                if loc.count() > 0 and _safe_visible(loc.first):
+                    loc.first.click(timeout=2000)
+                    page.wait_for_timeout(400)
+                    return
+            except Exception:
+                continue
+        if _viewer_is_open(page) and not _is_argon_working(page):
+            page.keyboard.press("Escape")
+            page.wait_for_timeout(500)
     except Exception:
         pass
 
@@ -1355,21 +1442,168 @@ def _hash_text(text: str) -> str:
         return ""
 
 
-def _is_leftover_delivery(text: str, previous_hashes: Optional[set]) -> bool:
-    """True when the captured delivery is one that was already handled.
+def _sha256_full(text: str) -> str:
+    """Full 64-char SHA-256 hex digest of normalized patch text."""
+    try:
+        norm = (text or "").replace("\r\n", "\n").strip()
+        return hashlib.sha256(norm.encode("utf-8", errors="replace")).hexdigest()
+    except Exception:
+        return ""
 
-    A Gemini conversation keeps every delivery in its DOM, so the same old
-    `apply_changes.ps1` can be "captured" again and again. When that happens
-    the run must keep waiting for the delivery it was actually sent for.
+
+class DeliveryLedger:
+    """Per-project delivery ledger tracking every handled patch by SHA-256, chat_id, round_id, and timestamp (D1.2)."""
+
+    def __init__(self, path: Optional[Path] = None) -> None:
+        self.path = Path(path or DELIVERY_LEDGER_PATH)
+        self.data: Dict[str, Any] = {}
+        self.load()
+
+    def load(self) -> Dict[str, Any]:
+        try:
+            if self.path.is_file():
+                parsed = json.loads(self.path.read_text(encoding="utf-8"))
+                if isinstance(parsed, dict):
+                    self.data = parsed
+        except Exception:
+            self.data = {}
+        if not isinstance(self.data, dict):
+            self.data = {}
+        self.data.setdefault("version", DELIVERY_LEDGER_VERSION)
+        if not isinstance(self.data.get("projects"), dict):
+            self.data["projects"] = {}
+        return self.data
+
+    def save(self) -> None:
+        lock = _acquire_session_store_lock(self.path)
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_name(f".{self.path.name}.{os.getpid()}.tmp")
+            tmp.write_text(json.dumps(self.data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+            os.replace(str(tmp), str(self.path))
+        except Exception:
+            pass
+        finally:
+            _release_session_store_lock(lock)
+
+    def _proj_entries(self, project_path: Any) -> List[Dict[str, Any]]:
+        self.load()
+        projects = self.data.setdefault("projects", {})
+        wanted = _normalize_project_key(project_path)
+        for k, v in projects.items():
+            if _normalize_project_key(k) == wanted and isinstance(v, list):
+                return v
+        canonical = str(Path(str(project_path)).expanduser().resolve())
+        projects[canonical] = []
+        return projects[canonical]
+
+    def lookup_digest(self, project_path: Any, text: str) -> Optional[Dict[str, Any]]:
+        """Return the ledger record if `text` was already handled for `project_path`, else None."""
+        if not text or not text.strip():
+            return None
+        short_h = _hash_text(text)
+        full_h = _sha256_full(text)
+        short_norm = _hash_text(text.replace("\r\n", "\n").strip())
+        for entry in self._proj_entries(project_path):
+            if not isinstance(entry, dict):
+                continue
+            eh_short = str(entry.get("short_hash") or "")
+            eh_full = str(entry.get("sha256") or "")
+            if (short_h and eh_short in (short_h, short_norm)) or (full_h and eh_full == full_h):
+                return entry
+        return None
+
+    def known_hashes(self, project_path: Any) -> set:
+        """Return all known short and full digests for `project_path`."""
+        out: set = set()
+        for entry in self._proj_entries(project_path):
+            if isinstance(entry, dict):
+                if entry.get("short_hash"):
+                    out.add(str(entry["short_hash"]))
+                if entry.get("sha256"):
+                    out.add(str(entry["sha256"]))
+        return out
+
+    def record(
+        self,
+        project_path: Any,
+        text: str,
+        chat_id: str = "",
+        round_id: str = "",
+        lane: str = "",
+        file_path: str = "",
+    ) -> Dict[str, Any]:
+        """Record a handled delivery in the ledger so it is never downloaded again."""
+        existing = self.lookup_digest(project_path, text)
+        if existing is not None:
+            return existing
+        entries = self._proj_entries(project_path)
+        rec = {
+            "short_hash": _hash_text(text),
+            "sha256": _sha256_full(text),
+            "chat_id": str(chat_id or ""),
+            "round_id": str(round_id or time.strftime("%Y%m%d_%H%M%S")),
+            "lane": str(lane or ""),
+            "file_path": str(file_path or ""),
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        entries.append(rec)
+        self.save()
+        try:
+            proj_mirror = Path(str(project_path)).expanduser().resolve() / ".argon_backup" / "delivery_ledger.json"
+            proj_mirror.parent.mkdir(parents=True, exist_ok=True)
+            proj_mirror.write_text(json.dumps(entries, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        except Exception:
+            pass
+        return rec
+
+
+def _infer_project_root_from_dest(dest_dir: Path) -> Optional[Path]:
+    """Infer the project root from a downloads or dual lane directory."""
+    try:
+        d = Path(dest_dir).resolve()
+        for cand in (d, d.parent, d.parent.parent, d.parent.parent.parent, d.parent.parent.parent.parent):
+            if cand.name.lower() == "downloads":
+                return cand.parent
+    except Exception:
+        pass
+    return None
+
+
+def _is_leftover_delivery(
+    text: str,
+    previous_hashes: Optional[set],
+    project_path: Optional[Path] = None,
+) -> bool:
+    """True when the captured delivery is one that was already handled (D1.1, D1.2).
+
+    Consults both `previous_hashes` and the persistent `DeliveryLedger`. When a
+    match is found, prints the round id, chat id, sha256, and timestamp it
+    belongs to and refuses the old file.
     """
-    if not previous_hashes:
+    if not text or not text.strip():
         return False
     digest = _hash_text(text)
-    if digest and digest in previous_hashes:
+    full_sha = _sha256_full(text)
+    if project_path is not None:
+        try:
+            ledger_hit = DeliveryLedger().lookup_digest(project_path, text)
+            if ledger_hit is not None:
+                print(
+                    f"[!] Refusing already-handled delivery from round {ledger_hit.get('round_id') or 'previous'} "
+                    f"(chat={ledger_hit.get('chat_id') or '?'}, sha256={str(ledger_hit.get('sha256') or digest)[:16]}, "
+                    f"captured_at={ledger_hit.get('timestamp') or '?'}). Waiting for the new delivery chip.",
+                    file=sys.stderr,
+                )
+                return True
+        except Exception:
+            pass
+    if not previous_hashes:
+        return False
+    if (digest and digest in previous_hashes) or (full_sha and full_sha in previous_hashes):
         print(
-            "[!] That chip holds a delivery that was already handled "
-            "(same content as an earlier round). Ignoring it and waiting for the "
-            "new delivery.",
+            f"[!] Refusing already-handled delivery (digest={digest} matches an earlier round in this project). "
+            "Ignoring it and waiting for the new delivery.",
             file=sys.stderr,
         )
         return True
@@ -1377,25 +1611,31 @@ def _is_leftover_delivery(text: str, previous_hashes: Optional[set]) -> bool:
 
 
 def _patch_is_complete(text: str) -> bool:
-    """True when a delivered script is COMPLETE, not a truncated capture.
-
-    The preview pane only renders what fits on screen, so a long patch read
-    from the preview can stop in the middle - and a half-written patch fails
-    the apply step with "Target block not found". The downloaded file is the
-    real bytes, so these checks are what catches a broken download.
-    """
+    """True when a delivered script is COMPLETE and structurally parseable (D18.2)."""
     if not text or not text.strip():
         return False
+    if len(text.encode("utf-8", errors="replace")) < MIN_PATCH_FILE_BYTES:
+        return False
     # The delivery contract ends the script with the success marker.
-    if "[SUCCESS]" not in text:
+    if "[SUCCESS]" not in text and "All changes applied and verified successfully" not in text:
         return False
     # A NOTES block that was started must be closed.
     if "# --- NOTES" in text and "# --- END NOTES" not in text:
         return False
     # A truncated script very often ends in the middle of a here-string.
-    if text.count("@'") != text.count("'@"):
+    open_sq = chr(64) + chr(39)
+    close_sq = chr(39) + chr(64)
+    open_dq = chr(64) + chr(34)
+    close_dq = chr(34) + chr(64)
+    if text.count(open_sq) != text.count(close_sq):
         return False
-    if text.count('@"') != text.count('"@'):
+    if text.count(open_dq) != text.count(close_dq):
+        return False
+    # D18.2: Verify the patch parses cleanly (every here-string payload extracts and has balanced delimiters)
+    payload_blocks = _extract_patch_payload_blocks(text)
+    if (open_sq in text or open_dq in text) and not payload_blocks:
+        return False
+    if validate_patch_payloads(text):
         return False
     return True
 
@@ -1425,6 +1665,7 @@ def capture_generated_file(
     previous_hashes: Optional[set] = None,
     chip=None,
     timeout_seconds: float = 90.0,
+    project_path: Optional[Path] = None,
 ) -> Optional[Path]:
     """Capture Argon's generated apply_changes.ps1 into dest_dir.
 
@@ -1434,6 +1675,21 @@ def capture_generated_file(
     for up to `timeout_seconds` (~90 s) before failing loudly.
     """
     dest_dir = Path(dest_dir)
+    proj_for_ledger = project_path or _infer_project_root_from_dest(dest_dir)
+    combined_hashes: set = set(previous_hashes or set())
+    if proj_for_ledger is not None:
+        try:
+            combined_hashes.update(DeliveryLedger().known_hashes(proj_for_ledger))
+        except Exception:
+            pass
+
+    if chip is not None and not _element_is_after_last_user_turn(chip):
+        print(
+            "[!] Refusing to open delivery chip: it belongs to an earlier turn before the last user message.",
+            file=sys.stderr,
+        )
+        return None
+
     if not _open_generated_file(page, chip_index=chip_index, chip=chip):
         return None
 
@@ -1442,8 +1698,9 @@ def capture_generated_file(
     attempt = 0
     last_downloaded: Optional[Path] = None
     saw_download_button = False
-    failure_reason = "the viewer's download button was not reachable (a print control was never clicked)"
+    failure_reason = "the viewer's toolbar download button was not reachable (a print control was never clicked)"
 
+    # D5.1: One capture, then stop. As soon as the toolbar download succeeds and validates, exit immediately.
     while True:
         attempt += 1
         _dismiss_print_preview_if_any(page)
@@ -1453,31 +1710,25 @@ def capture_generated_file(
             time.sleep(1.5)
 
         if attempt > 1 and not _viewer_is_open(page):
-            active_chip = chip if chip is not None else (
-                None if chip_index is not None else _generated_file_chip(page)
-            )
-            _open_generated_file(page, chip_index=chip_index, chip=active_chip)
-            try:
-                page.wait_for_timeout(1500)
-            except Exception:
-                time.sleep(1.5)
+            break
 
         dl_btn = _find_viewer_download_button(page)
         downloaded: Optional[Path] = None
         if dl_btn is not None:
             saw_download_button = True
             try:
-                with page.expect_download(timeout=10000) as dl_info:
+                with page.expect_download(timeout=12000) as dl_info:
                     dl_btn.click(timeout=6000)
                 downloaded, discard_reason = _validate_and_save_download(dl_info.value, dest_dir)
                 if discard_reason:
                     failure_reason = f"{discard_reason} (a print control was never clicked)"
-            except Exception:
+            except Exception as dl_exc:
+                failure_reason = f"clicking viewer toolbar download button did not trigger download ({dl_exc})"
                 downloaded = None
 
         if downloaded is None:
             cand = find_delivered_patch([dest_dir], newer_than=capture_started - 1.0)
-            if cand is not None and cand.suffix.lower() == ".ps1":
+            if cand is not None and cand.suffix.lower() == ".ps1" and cand.stat().st_size >= MIN_PATCH_FILE_BYTES:
                 downloaded = cand
 
         if downloaded is not None and downloaded.is_file():
@@ -1488,7 +1739,11 @@ def capture_generated_file(
                 raw_dl_text = ""
             dl_text = _strip_viewer_tail_artefacts(raw_dl_text)
 
-            if _is_leftover_delivery(dl_text, previous_hashes):
+            if _is_leftover_delivery(dl_text, combined_hashes, project_path=proj_for_ledger):
+                try:
+                    downloaded.unlink(missing_ok=True)
+                except OSError:
+                    pass
                 _close_preview(page)
                 return None
 
@@ -1498,8 +1753,21 @@ def capture_generated_file(
                         downloaded.write_text(dl_text + "\n", encoding="utf-8", newline="\n")
                     except Exception:
                         pass
+                if proj_for_ledger is not None:
+                    try:
+                        cid_now = _extract_chat_id(str(getattr(page, "url", "") or "")) or ""
+                        DeliveryLedger().record(
+                            proj_for_ledger,
+                            dl_text,
+                            chat_id=cid_now,
+                            file_path=str(downloaded),
+                        )
+                    except Exception:
+                        pass
                 _close_preview(page)
                 return downloaded
+            # D5.1: If the toolbar button produced an invalid/truncated file on this chip, do not re-download in a loop
+            break
             if not _looks_like_patch(dl_text):
                 failure_reason = (
                     f"the downloaded file ({downloaded.name}) is not a valid patch script "
@@ -2159,25 +2427,104 @@ def _gemini_page_is_guest(page, wait_seconds: float = 15.0) -> bool:
             time.sleep(2.0)
 
     # No signed-in signal at all, and the page offers a sign-in: that is a
-    # real guest page.
+    # real guest page. A sign-in control INSIDE a conversation turn never
+    # counts - the chat can talk about signing in.
+    short_signin_re = re.compile(
+        r"^\s*(sign\s*in|log\s*in|সাইন[\s-]*ইন(?:\s*করুন)?)\s*$",
+        re.IGNORECASE,
+    )
     for sel in (
         "a[href*='ServiceLogin']",
-        "button[aria-label*='Sign in']",
-        "a[aria-label*='Sign in']",
-        "button[aria-label*='Log in']",
-        "a[aria-label*='Log in']",
+        "a[href*='accounts.google.com/v3/signin']",
+        "a[aria-label*='Sign in' i]",
+        "button[aria-label*='Sign in' i]",
+        "a[aria-label*='সাইন ইন']",
+        "button[aria-label*='সাইন ইন']",
     ):
         try:
             loc = page.locator(sel)
-            for i in range(min(loc.count(), 3)):
+            for i in range(min(loc.count(), 6)):
                 el = loc.nth(i)
                 if not _safe_visible(el):
                     continue
-                label = (el.get_attribute("aria-label") or "").strip()
-                if label and len(label) <= 24:
+                try:
+                    in_turn = bool(
+                        el.evaluate(
+                            """node => {
+                                let cur = node;
+                                while (cur) {
+                                    const tag = (cur.tagName || '').toLowerCase();
+                                    const cls = (cur.getAttribute && (cur.getAttribute('class') || '')) || '';
+                                    if (tag === 'user-query' || tag === 'model-response' || tag === 'message-turn' ||
+                                        /\b(user-query|model-response)\b/i.test(cls)) {
+                                        return true;
+                                    }
+                                    cur = cur.parentElement;
+                                }
+                                return false;
+                            }"""
+                        )
+                    )
+                except Exception:
+                    in_turn = False
+                if in_turn:
+                    continue
+                try:
+                    vis_txt = (el.inner_text(timeout=400) or "").strip()
+                except Exception:
+                    vis_txt = ""
+                try:
+                    aria_txt = str(el.get_attribute("aria-label") or "").strip()
+                except Exception:
+                    aria_txt = ""
+                try:
+                    href_txt = str(el.get_attribute("href") or "").strip().lower()
+                except Exception:
+                    href_txt = ""
+                if len(vis_txt) > 40 or len(aria_txt) > 40:
+                    continue
+                if "servicelogin" in href_txt or "accounts.google.com" in href_txt:
+                    if not vis_txt or len(vis_txt) <= 32:
+                        return True
+                if (vis_txt and short_signin_re.match(vis_txt)) or (
+                    aria_txt and short_signin_re.match(aria_txt)
+                ):
                     return True
         except Exception:
             continue
+    # The real guest page offers the sign-in as plain TEXT, not always as a
+    # button. This is only reached when NO signed-in signal exists at all, so
+    # the account menu's own "Sign in" entry cannot cause a false positive.
+    try:
+        txt = page.get_by_text(short_signin_re)
+        for i in range(min(txt.count(), 4)):
+            el = txt.nth(i)
+            if not _safe_visible(el):
+                continue
+            try:
+                in_turn = bool(
+                    el.evaluate(
+                        """node => {
+                            let cur = node;
+                            while (cur) {
+                                const tag = (cur.tagName || '').toLowerCase();
+                                const cls = (cur.getAttribute && (cur.getAttribute('class') || '')) || '';
+                                if (tag === 'user-query' || tag === 'model-response' || tag === 'message-turn' ||
+                                    /\b(user-query|model-response)\b/i.test(cls)) {
+                                    return true;
+                                }
+                                cur = cur.parentElement;
+                            }
+                            return false;
+                        }"""
+                    )
+                )
+            except Exception:
+                in_turn = False
+            if not in_turn:
+                return True
+    except Exception:
+        pass
     return False
 
 
@@ -2680,36 +3027,362 @@ class TaskState:
                 return key
         return None
 
-    def get(self, project_path: Any) -> Optional[Dict[str, Any]]:
+    def get(self, project_path: Any, lane: Optional[str] = None) -> Optional[Dict[str, Any]]:
         self.load()
         key = self._find_key(project_path)
         if key is None:
             return None
         entry = (self.data.get("tasks") or {}).get(key)
-        return entry if isinstance(entry, dict) else None
-
-    def set(self, project_path: Any, **fields: Any) -> Dict[str, Any]:
-        self.load()
-        tasks = self.data.setdefault("tasks", {})
-        canonical = self._key(project_path)
-        existing = self._find_key(canonical)
-        entry: Dict[str, Any] = {}
-        if existing is not None and isinstance(tasks.get(existing), dict):
-            entry.update(tasks[existing])
-            if existing != canonical:
-                tasks.pop(existing, None)
-        entry.update(fields)
-        entry["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-        tasks[canonical] = entry
-        self.save()
+        if not isinstance(entry, dict):
+            return None
+        if lane:
+            lanes = entry.get("lanes")
+            if isinstance(lanes, dict) and isinstance(lanes.get(lane), dict):
+                return dict(lanes[lane])
+            return None
         return entry
 
-    def clear(self, project_path: Any) -> None:
-        self.load()
-        existing = self._find_key(project_path)
-        if existing is not None:
-            (self.data.get("tasks") or {}).pop(existing, None)
+    def get_running_lanes(self, project_path: Any) -> Dict[str, Dict[str, Any]]:
+        """Return a dict of currently running lanes ('sent' or 'waiting') for project_path (D2.1, D2.4)."""
+        entry = self.get(project_path)
+        if not isinstance(entry, dict):
+            return {}
+        running: Dict[str, Dict[str, Any]] = {}
+        lanes = entry.get("lanes")
+        if isinstance(lanes, dict):
+            for l_name, l_data in lanes.items():
+                if isinstance(l_data, dict) and str(l_data.get("state") or "").strip().lower() in ("sent", "waiting"):
+                    running[l_name] = dict(l_data)
+        if not running and str(entry.get("state") or "").strip().lower() in ("sent", "waiting"):
+            l_key = str(entry.get("lane") or "single")
+            running[l_key] = dict(entry)
+        return running
+
+    def set(self, project_path: Any, lane: Optional[str] = None, **fields: Any) -> Dict[str, Any]:
+        """Persist task state with file locking and per-lane isolation (D2.4).
+
+        Two concurrent dual lanes write to their own `entry['lanes'][lane]` slot so a
+        pre-flight failure on one lane NEVER overwrites a running or delivered state
+        on the sibling lane.
+        """
+        lock = _acquire_session_store_lock(self.path)
+        try:
+            self.load()
+            tasks = self.data.setdefault("tasks", {})
+            canonical = self._key(project_path)
+            existing = self._find_key(canonical)
+            entry: Dict[str, Any] = {}
+            if existing is not None and isinstance(tasks.get(existing), dict):
+                entry.update(tasks[existing])
+                if existing != canonical:
+                    tasks.pop(existing, None)
+
+            now_str = time.strftime("%Y-%m-%d %H:%M:%S")
+            eff_lane = str(lane or fields.get("lane") or "").strip().lower()
+            lanes = dict(entry.get("lanes") or {}) if isinstance(entry.get("lanes"), dict) else {}
+
+            if eff_lane:
+                lane_rec = dict(lanes.get(eff_lane) or {})
+                lane_rec.update(fields)
+                lane_rec["lane"] = eff_lane
+                lane_rec["updated_at"] = now_str
+                lanes[eff_lane] = lane_rec
+                entry["lanes"] = lanes
+
+                # D2.4: Do not let a failed/preflight_failed lane overwrite a sibling lane's
+                # active ('sent', 'waiting') or successful ('delivered', 'applied') top-level state.
+                new_state = str(fields.get("state") or "").strip().lower()
+                sibling_protected = False
+                for other_name, other_rec in lanes.items():
+                    if other_name == eff_lane or not isinstance(other_rec, dict):
+                        continue
+                    other_st = str(other_rec.get("state") or "").strip().lower()
+                    if other_st in ("sent", "waiting", "delivered", "applied") and new_state in (
+                        "preflight_failed",
+                        "not_signed_in",
+                        "quota_limited",
+                        "failed",
+                    ):
+                        sibling_protected = True
+                        break
+                if not sibling_protected:
+                    entry.update(fields)
+            else:
+                entry.update(fields)
+                single_rec = dict(lanes.get("single") or {})
+                single_rec.update(fields)
+                single_rec["updated_at"] = now_str
+                lanes["single"] = single_rec
+                entry["lanes"] = lanes
+
+            entry["updated_at"] = now_str
+            tasks[canonical] = entry
             self.save()
+            return entry
+        finally:
+            _release_session_store_lock(lock)
+
+    def clear(self, project_path: Any, lane: Optional[str] = None) -> None:
+        lock = _acquire_session_store_lock(self.path)
+        try:
+            self.load()
+            existing = self._find_key(project_path)
+            if existing is not None:
+                if lane:
+                    entry = (self.data.get("tasks") or {}).get(existing)
+                    if isinstance(entry, dict) and isinstance(entry.get("lanes"), dict):
+                        entry["lanes"].pop(lane, None)
+                        self.save()
+                else:
+                    (self.data.get("tasks") or {}).pop(existing, None)
+                    self.save()
+        finally:
+            _release_session_store_lock(lock)
+
+
+class TaskRegistry:
+    """Persistent agent-owned task registry (~/.gemini/argon_tasks.json) (D3, D4).
+
+    Tracks every currently running task across all projects and slots:
+      - project, slot, account, chat_id, chat_url, lane, start_time, label, screenshot_path
+    Enforces at most MAX_TASKS_PER_SLOT (2) concurrent tasks on any single account
+    and surfaces STALE tasks (with age and screenshot path) so they can be closed explicitly.
+    """
+
+    def __init__(self, path: Optional[Path] = None) -> None:
+        self.path = Path(path or TASK_REGISTRY_PATH)
+        self.data: Dict[str, Any] = {}
+        self.load()
+
+    def load(self) -> Dict[str, Any]:
+        try:
+            if self.path.is_file():
+                parsed = json.loads(self.path.read_text(encoding="utf-8"))
+                if isinstance(parsed, dict):
+                    self.data = parsed
+        except Exception:
+            self.data = {}
+        if not isinstance(self.data, dict):
+            self.data = {}
+        self.data.setdefault("version", TASK_REGISTRY_VERSION)
+        if not isinstance(self.data.get("entries"), list):
+            self.data["entries"] = []
+        self.data.setdefault("last_used_slot", "")
+        return self.data
+
+    def save(self) -> None:
+        lock = _acquire_session_store_lock(self.path)
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_name(f".{self.path.name}.{os.getpid()}.tmp")
+            tmp.write_text(json.dumps(self.data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+            os.replace(str(tmp), str(self.path))
+        except Exception:
+            pass
+        finally:
+            _release_session_store_lock(lock)
+
+    def _canonical_proj(self, project_path: Any) -> str:
+        try:
+            return str(Path(str(project_path)).expanduser().resolve())
+        except Exception:
+            return str(project_path)
+
+    def active_entries(self) -> List[Dict[str, Any]]:
+        self.load()
+        return [
+            e
+            for e in (self.data.get("entries") or [])
+            if isinstance(e, dict) and str(e.get("status") or "").strip().lower() == "running"
+        ]
+
+    def active_tasks_for_slot(self, slot: str) -> List[Dict[str, Any]]:
+        norm_s = normalize_slot(slot)
+        return [
+            e
+            for e in self.active_entries()
+            if normalize_slot(str(e.get("slot") or "/u/0/")) == norm_s
+        ]
+
+    def active_tasks_for_project(
+        self,
+        project_path: Any,
+        lane: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        wanted = _normalize_project_key(project_path)
+        out: List[Dict[str, Any]] = []
+        for e in self.active_entries():
+            if _normalize_project_key(e.get("project", "")) != wanted:
+                continue
+            if lane and str(e.get("lane") or "").strip().lower() != lane.strip().lower():
+                continue
+            out.append(e)
+        return out
+
+    def is_slot_available(self, slot: str, max_tasks: int = MAX_TASKS_PER_SLOT) -> tuple[bool, str]:
+        """Return (available, reason) based on the registry count for `slot` (D4.3, D4.4)."""
+        norm_s = normalize_slot(slot)
+        active = self.active_tasks_for_slot(norm_s)
+        count = len(active)
+        if count >= max_tasks:
+            labels = ", ".join(
+                f"{Path(str(a.get('project') or '.')).name}[{a.get('lane') or 'main'}]"
+                for a in active
+            )
+            return (
+                False,
+                f"slot {norm_s} already hosts {count}/{max_tasks} running tasks in registry ({labels})",
+            )
+        return (True, f"registry load {count}/{max_tasks}")
+
+    def stale_tasks(self, max_age_seconds: float = 3600.0) -> List[Dict[str, Any]]:
+        """Return running tasks older than `max_age_seconds` (or whose PID is no longer alive) (D4.5)."""
+        now_ep = time.time()
+        stale: List[Dict[str, Any]] = []
+        for e in self.active_entries():
+            started_ep = float(e.get("started_epoch") or 0.0)
+            age = max(0.0, now_ep - started_ep) if started_ep > 0 else 0.0
+            pid = int(e.get("pid") or 0)
+            pid_dead = bool(pid > 0 and not _pid_alive(pid) and age > 120.0)
+            if age >= max_age_seconds or pid_dead:
+                copy_e = dict(e)
+                copy_e["age_seconds"] = int(round(age))
+                copy_e["age_human"] = _format_elapsed(age)
+                stale.append(copy_e)
+        return stale
+
+    def register_start(
+        self,
+        project_path: Any,
+        slot: str,
+        account: str = "",
+        chat_id: str = "",
+        chat_url: str = "",
+        lane: str = "single",
+        label: str = "",
+        screenshot_path: str = "",
+        prompt_hash: str = "",
+    ) -> Dict[str, Any]:
+        """Mark a task as started in ~/.gemini/argon_tasks.json (D4.1, D4.2)."""
+        self.load()
+        proj_str = self._canonical_proj(project_path)
+        norm_s = normalize_slot(slot) if slot else "/u/0/"
+        lane_str = (lane or "single").strip().lower()
+        entries: List[Dict[str, Any]] = self.data.setdefault("entries", [])
+
+        now_str = time.strftime("%Y-%m-%d %H:%M:%S")
+        now_ep = time.time()
+        task_id = f"{Path(proj_str).name}:{lane_str}:{norm_s.strip('/')}:{int(now_ep)}"
+
+        # Update existing running entry for the same (project, lane) if already registered by agent
+        for existing in entries:
+            if (
+                isinstance(existing, dict)
+                and str(existing.get("status") or "") == "running"
+                and _normalize_project_key(existing.get("project", "")) == _normalize_project_key(proj_str)
+                and str(existing.get("lane") or "single").strip().lower() == lane_str
+            ):
+                existing["slot"] = norm_s
+                if account:
+                    existing["account"] = account
+                if chat_id:
+                    existing["chat_id"] = chat_id
+                if chat_url:
+                    existing["chat_url"] = chat_url
+                if label:
+                    existing["label"] = label
+                if screenshot_path:
+                    existing["screenshot_path"] = str(screenshot_path)
+                if prompt_hash:
+                    existing["prompt_hash"] = prompt_hash
+                existing["pid"] = os.getpid()
+                existing["updated_at"] = now_str
+                self.data["last_used_slot"] = norm_s
+                self.save()
+                return existing
+
+        rec: Dict[str, Any] = {
+            "task_id": task_id,
+            "project": proj_str,
+            "slot": norm_s,
+            "account": account,
+            "chat_id": chat_id,
+            "chat_url": chat_url,
+            "lane": lane_str,
+            "status": "running",
+            "started_at": now_str,
+            "started_epoch": now_ep,
+            "updated_at": now_str,
+            "pid": os.getpid(),
+            "label": (label or "").strip()[:240],
+            "screenshot_path": str(screenshot_path or ""),
+            "prompt_hash": prompt_hash,
+        }
+        entries.append(rec)
+        self.data["last_used_slot"] = norm_s
+        self.save()
+        return rec
+
+    def update_running(
+        self,
+        project_path: Any,
+        lane: Optional[str] = None,
+        **fields: Any,
+    ) -> Optional[Dict[str, Any]]:
+        self.load()
+        wanted = _normalize_project_key(project_path)
+        lane_str = (lane or "").strip().lower()
+        matched: Optional[Dict[str, Any]] = None
+        for e in reversed(self.data.get("entries") or []):
+            if not isinstance(e, dict) or str(e.get("status") or "") != "running":
+                continue
+            if _normalize_project_key(e.get("project", "")) != wanted:
+                continue
+            if lane_str and str(e.get("lane") or "single").strip().lower() != lane_str:
+                continue
+            e.update({k: v for k, v in fields.items() if v is not None})
+            e["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            if fields.get("slot"):
+                self.data["last_used_slot"] = normalize_slot(str(fields["slot"]))
+            matched = e
+            break
+        if matched is not None:
+            self.save()
+        return matched
+
+    def register_done(
+        self,
+        project_path: Any,
+        lane: Optional[str] = None,
+        slot: Optional[str] = None,
+        status: str = "completed",
+        screenshot_path: str = "",
+    ) -> int:
+        """Mark running task(s) for `project_path` (and optional `lane`/`slot`) as completed/abandoned/superseded (D4.2)."""
+        self.load()
+        wanted = _normalize_project_key(project_path)
+        lane_str = (lane or "").strip().lower()
+        norm_s = normalize_slot(slot) if slot else ""
+        count = 0
+        now_str = time.strftime("%Y-%m-%d %H:%M:%S")
+        for e in self.data.get("entries") or []:
+            if not isinstance(e, dict) or str(e.get("status") or "") != "running":
+                continue
+            if _normalize_project_key(e.get("project", "")) != wanted:
+                continue
+            if lane_str and str(e.get("lane") or "single").strip().lower() != lane_str:
+                continue
+            if norm_s and normalize_slot(str(e.get("slot") or "/u/0/")) != norm_s:
+                continue
+            e["status"] = status
+            e["completed_at"] = now_str
+            e["updated_at"] = now_str
+            if screenshot_path:
+                e["screenshot_path"] = str(screenshot_path)
+            count += 1
+        if count:
+            self.save()
+        return count
 
 
 def _acquire_session_store_lock(path: Path, timeout: float = 15.0) -> Optional[tuple]:
@@ -3304,22 +3977,32 @@ def _mode_is_task(page) -> bool:
 
 
 def _retry(fn, page, attempts: int = 3, delay: float = 2.0) -> bool:
-    """Run a pre-flight step a few times.
+    """Run a pre-flight step a few times with automatic crash recovery (D17).
 
-    The Gemini composer is re-rendered while the page settles, so a control can
-    be present but not yet clickable. One retry usually settles it.
+    If the browser or page closes during pre-flight or attach, invokes
+    `page._argon_reopen_hook` when present so the browser is restarted and
+    the step continues on the reopened conversation.
     """
+    cur_page = page
     for attempt in range(attempts):
         try:
-            if fn(page):
+            if hasattr(cur_page, "is_closed") and cur_page.is_closed():
+                raise RuntimeError("Target page, context or browser has been closed")
+            if fn(cur_page):
                 return True
-            if _argon_picker_is_disabled(page):
+            if _argon_picker_is_disabled(cur_page):
                 return False
-        except Exception:
-            pass
+        except Exception as exc:
+            if _is_target_closed_error(exc) or (hasattr(cur_page, "is_closed") and cur_page.is_closed()):
+                reopen_hook = getattr(cur_page, "_argon_reopen_hook", None)
+                if callable(reopen_hook):
+                    recovered_page = reopen_hook(exc, getattr(fn, "__name__", "preflight_step"))
+                    if recovered_page is not None:
+                        cur_page = recovered_page
+                        continue
         if attempt < attempts - 1:
             try:
-                page.wait_for_timeout(int(delay * 1000))
+                cur_page.wait_for_timeout(int(delay * 1000))
             except Exception:
                 time.sleep(delay)
     return False
@@ -3905,29 +4588,284 @@ def _picker_open(page) -> bool:
     return False
 
 
-def _attachment_present(page, zip_path: Path) -> bool:
-    """Verify the composer is actually carrying the uploaded file."""
+def _wait_for_model_chip(page, timeout: float = 45.0, interval: float = 1.0):
+    """Wait up to `timeout` seconds for the model chip to render on a half-rendered page (D8.2)."""
+    deadline = time.monotonic() + max(1.0, float(timeout))
+    while True:
+        chip = _model_chip(page)
+        if chip is not None:
+            return chip
+        if time.monotonic() >= deadline:
+            return None
+        try:
+            page.wait_for_timeout(int(interval * 1000))
+        except Exception:
+            time.sleep(interval)
+
+
+def _task_toggle_present(page) -> bool:
+    """True when the page renders a visible Chat/Task toggle."""
     try:
-        count = page.evaluate(
-            """() => {
-                const inputs = Array.from(document.querySelectorAll("input[type='file']"));
-                let n = 0;
-                for (const i of inputs) { if (i.files && i.files.length) n += i.files.length; }
-                return n;
-            }"""
-        )
-        if count:
-            return True
-    except Exception:
-        pass
-    try:
-        chip = page.get_by_text(re.compile(re.escape(zip_path.name), re.IGNORECASE))
-        for i in range(min(chip.count(), 5)):
-            if _safe_visible(chip.nth(i)):
+        task_btn = page.get_by_text(RE_TASK)
+        for i in range(min(task_btn.count(), 6)):
+            if _safe_visible(task_btn.nth(i)):
                 return True
     except Exception:
         pass
     return False
+
+
+def select_task_mode(
+    page,
+    require_verifiable: Optional[bool] = None,
+    wait_for_toggle_seconds: float = 30.0,
+) -> bool:
+    """Switch Gemini Web into Task mode: PROVEN on a new chat, INHERITED on a continuation (D11)."""
+    if require_verifiable is None:
+        is_cont = bool(getattr(page, "_argon_is_continuation", False))
+        require_verifiable = not is_cont
+
+    deadline = time.monotonic() + (max(2.0, float(wait_for_toggle_seconds)) if require_verifiable else 3.0)
+    while True:
+        try:
+            # On a NEW chat the mode must be PROVEN: the toggle has to be
+            # there AND show Task. `_mode_is_task()` alone returns True when
+            # no toggle is rendered at all, which would let a Chat-mode run
+            # through. On a continuation the inherited mode is accepted.
+            if _mode_is_task(page) and (
+                not require_verifiable or _task_toggle_present(page)
+            ):
+                return True
+            task_btn = page.get_by_text(RE_TASK)
+            toggle_found = False
+            for i in range(min(task_btn.count(), 10)):
+                el = task_btn.nth(i)
+                if not _safe_visible(el):
+                    continue
+                toggle_found = True
+                try:
+                    el.click(timeout=3000)
+                    page.wait_for_timeout(1400)
+                    if _mode_is_task(page):
+                        return True
+                except Exception:
+                    continue
+            if not toggle_found and not require_verifiable:
+                print(
+                    "[+] Mode = Task : INHERITED from existing conversation "
+                    "(no Chat/Task toggle rendered on a continuation chat)."
+                )
+                return True
+        except Exception:
+            pass
+        if time.monotonic() >= deadline:
+            break
+        try:
+            page.wait_for_timeout(1000)
+        except Exception:
+            time.sleep(1.0)
+
+    if require_verifiable:
+        print(
+            f"[!] Task mode could not be proven on this new chat after {int(wait_for_toggle_seconds)}s "
+            "(toggle not found or did not activate) - refusing to send in Chat mode.",
+            file=sys.stderr,
+        )
+        return False
+    print("[+] Mode = Task : INHERITED from existing conversation.")
+    return True
+
+
+def ensure_argon_model(
+    page,
+    attempts: int = 3,
+    require_chip: Optional[bool] = None,
+    wait_for_chip_seconds: float = 45.0,
+) -> bool:
+    """Verify 4 Argon model: waits for chip on half-rendered pages (D8.2) and inherits on continuation when chip is absent (D11)."""
+    if require_chip is None:
+        is_cont = bool(getattr(page, "_argon_is_continuation", False))
+        require_chip = not is_cont
+
+    _LAST_PICKER_ARGON_STATE.pop(id(page), None)
+    last_seen = ""
+    last_picker_state = "missing"
+
+    # D8.2: When the chip is absent right after page load, wait boundedly for it to render.
+    chip_wait = float(wait_for_chip_seconds) if require_chip else min(8.0, float(wait_for_chip_seconds))
+    initial_chip = _wait_for_model_chip(page, timeout=chip_wait)
+    if initial_chip is None and not require_chip:
+        print(
+            "[+] Model = 4 Argon : INHERITED from existing conversation "
+            "(no model switcher chip rendered on continuation chat)."
+        )
+        return True
+
+    for attempt in range(max(1, attempts)):
+        chip = _model_chip(page)
+        if chip is None and attempt == 0:
+            chip = initial_chip
+        if chip is not None:
+            name = _model_name(chip)
+            if name:
+                last_seen = name
+            if _chip_is_argon(chip):
+                if attempt:
+                    print(f"[+] Model switched to Argon ({name!r}).")
+                return True
+            try:
+                chip.click(timeout=4000)
+                page.wait_for_timeout(1200)
+            except Exception:
+                pass
+        else:
+            _open_picker(page)
+
+        picker_state = _inspect_option_in_picker(page, RE_ARGON)
+        last_picker_state = picker_state
+        try:
+            page.wait_for_timeout(1400)
+        except Exception:
+            time.sleep(1.4)
+        try:
+            if _picker_open(page):
+                page.keyboard.press("Escape")
+                page.wait_for_timeout(500)
+        except Exception:
+            pass
+        if picker_state == "disabled":
+            acct = _detect_signed_in_account(page)
+            _LAST_PICKER_ARGON_STATE[id(page)] = {
+                "disabled": True,
+                "account": acct,
+                "chip": last_seen,
+            }
+            print(
+                f"[!] The '4 Argon' option is present in the model picker but DISABLED "
+                f"(aria-disabled) on account {acct}: this account has no Argon available right now.",
+                file=sys.stderr,
+            )
+            return False
+        chip2 = _model_chip(page)
+        if chip2 is not None:
+            name2 = _model_name(chip2)
+            if name2:
+                last_seen = name2
+            if _chip_is_argon(chip2):
+                print(f"[+] Model switched to Argon ({name2!r}).")
+                return True
+
+    if not last_seen and not require_chip:
+        print("[+] Model = 4 Argon : INHERITED from existing conversation.")
+        return True
+    if last_picker_state == "missing":
+        print(
+            f"[!] The '4 Argon' option was not found in the model picker "
+            f"and the model chip reads {last_seen or '(not visible)'!r} - refusing to send.",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"[!] The model chip reads {last_seen!r} and not 4 Argon - refusing to send.",
+            file=sys.stderr,
+        )
+    return False
+
+
+def select_argon_model(
+    page,
+    require_chip: Optional[bool] = None,
+    wait_for_chip_seconds: float = 45.0,
+) -> bool:
+    """Select and verify the 4 Argon model (delegates to ensure_argon_model)."""
+    return ensure_argon_model(
+        page,
+        require_chip=require_chip,
+        wait_for_chip_seconds=wait_for_chip_seconds,
+    )
+
+
+def _inspect_zip_archive(zip_path: Path) -> tuple[bool, int, int, str]:
+    """Verify that `zip_path` exists, is non-empty, opens as a valid zip, and contains TASK_BRIEF.md (D14, D15).
+
+    Returns (ok, size_bytes, entry_count, error_reason).
+    """
+    import zipfile as _zf
+
+    zp = Path(zip_path)
+    if not zp.is_file():
+        return False, 0, 0, f"archive does not exist: {zp}"
+    try:
+        sz = zp.stat().st_size
+    except OSError as exc:
+        return False, 0, 0, f"could not stat archive {zp}: {exc}"
+    if sz <= 0:
+        return False, 0, 0, f"archive {zp.name} is 0 bytes (empty)"
+    try:
+        with _zf.ZipFile(zp, "r") as zf:
+            members = zf.namelist()
+            if not members:
+                return False, sz, 0, f"archive {zp.name} has 0 entries"
+            if "TASK_BRIEF.md" not in members:
+                return False, sz, len(members), f"archive {zp.name} is missing required member TASK_BRIEF.md"
+            bad = zf.testzip()
+            if bad is not None:
+                return False, sz, len(members), f"archive {zp.name} has corrupted entry {bad!r}"
+            return True, sz, len(members), ""
+    except Exception as exc:
+        return False, sz, 0, f"archive {zp.name} is corrupt or unreadable ({exc})"
+
+
+def _attachment_present(page, zip_path: Path) -> bool:
+    """Verify the composer carries the valid archive with matching byte size and TASK_BRIEF.md (D14)."""
+    ok_zip, disk_size, member_count, err_reason = _inspect_zip_archive(Path(zip_path))
+    if not ok_zip:
+        print(f"[ERROR] Attachment check failed on disk: {err_reason}", file=sys.stderr)
+        return False
+
+    input_matched = False
+    try:
+        attached_sizes = page.evaluate(
+            """() => {
+                const inputs = Array.from(document.querySelectorAll("input[type='file']"));
+                const sizes = [];
+                for (const i of inputs) {
+                    if (i.files && i.files.length) {
+                        for (const f of Array.from(i.files)) {
+                            sizes.push({ name: f.name || '', size: typeof f.size === 'number' ? f.size : -1 });
+                        }
+                    }
+                }
+                return sizes;
+            }"""
+        )
+        if isinstance(attached_sizes, list) and attached_sizes:
+            for item in attached_sizes:
+                if isinstance(item, dict):
+                    f_sz = int(item.get("size", -1))
+                    if f_sz > 0 and f_sz != disk_size:
+                        print(
+                            f"[ERROR] Attached file size in input ({f_sz} bytes) does not match "
+                            f"disk archive {Path(zip_path).name} ({disk_size} bytes)!",
+                            file=sys.stderr,
+                        )
+                        return False
+                    if f_sz == disk_size:
+                        input_matched = True
+    except Exception:
+        pass
+
+    chip_visible = False
+    try:
+        chip = page.get_by_text(re.compile(re.escape(Path(zip_path).name), re.IGNORECASE))
+        for i in range(min(chip.count(), 5)):
+            if _safe_visible(chip.nth(i)):
+                chip_visible = True
+                break
+    except Exception:
+        pass
+
+    return bool(input_matched or chip_visible)
 
 
 def _open_upload_menu(page) -> bool:
@@ -4014,14 +4952,23 @@ def _zip_input(page):
 
 
 def _verify_zip_has_no_credentials(zip_path: Path) -> bool:
-    """Verify that a context archive does not contain credential or secret files before uploading."""
+    """Verify that a context archive is readable, contains TASK_BRIEF.md, and has no credentials (D14, D15).
+
+    Never swallows a corrupt/truncated archive error: any unreadable or empty zip
+    is refused loudly before upload.
+    """
+    zp = Path(zip_path)
+    ok_zip, sz, entry_count, err_reason = _inspect_zip_archive(zp)
+    if not ok_zip:
+        print(
+            f"[ERROR] Refusing to upload {zp.name}: {err_reason}.",
+            file=sys.stderr,
+        )
+        return False
     try:
         import zipfile as _zf
         from package_context import is_secret
 
-        zp = Path(zip_path)
-        if not zp.is_file():
-            return True
         with _zf.ZipFile(zp, "r") as zf:
             for member in zf.namelist():
                 name = Path(member).name
@@ -4032,22 +4979,89 @@ def _verify_zip_has_no_credentials(zip_path: Path) -> bool:
                     )
                     return False
         return True
+    except Exception as exc:
+        print(
+            f"[ERROR] Refusing to upload corrupt or unreadable archive {zp.name}: {exc}",
+            file=sys.stderr,
+        )
+        return False
+
+
+def _composer_upload_in_progress(page) -> bool:
+    """Return True while the composer attachment chip still shows an upload spinner/progressbar (D16)."""
+    try:
+        scope = _composer_scope(page) or page
+        for sel in (
+            "[role='progressbar']",
+            "mat-progress-spinner",
+            ".mat-progress-spinner",
+            ".mat-mdc-progress-spinner",
+            "[class*='upload-progress']",
+            "[class*='loading-spinner']",
+            "[aria-label*='Uploading' i]",
+            "[aria-label*='আপলোড হচ্ছে']",
+        ):
+            loc = scope.locator(sel)
+            for i in range(min(loc.count(), 6)):
+                if _safe_visible(loc.nth(i)):
+                    return True
     except Exception:
-        return True
+        pass
+    return False
+
+
+def _wait_for_upload_complete(page, zip_path: Path, timeout: float = 90.0) -> bool:
+    """Wait until the attached archive's upload spinner clears before pasting/sending (D16)."""
+    start_mono = time.monotonic()
+    deadline = start_mono + max(5.0, float(timeout))
+    clear_streak = 0
+    while time.monotonic() < deadline:
+        present = _attachment_present(page, zip_path)
+        uploading = _composer_upload_in_progress(page)
+        if present and not uploading:
+            clear_streak += 1
+            if clear_streak >= 2:
+                waited = time.monotonic() - start_mono
+                sz = Path(zip_path).stat().st_size if Path(zip_path).is_file() else 0
+                print(
+                    f"[+] Upload of {Path(zip_path).name} ({sz} bytes) finished in {waited:.1f}s "
+                    "(attachment chip ready, upload spinner cleared)."
+                )
+                return True
+        else:
+            clear_streak = 0
+        try:
+            page.wait_for_timeout(900)
+        except Exception:
+            time.sleep(0.9)
+
+    waited = time.monotonic() - start_mono
+    print(
+        f"[ERROR] Upload of {Path(zip_path).name} did not finish within {waited:.1f}s "
+        "(upload spinner still active or attachment missing) - refusing to send a half-uploaded archive.",
+        file=sys.stderr,
+    )
+    return False
 
 
 def attach_zip(page, zip_path: Path) -> bool:
-    """Attach the context zip to the composer and verify it really landed."""
-    if not _verify_zip_has_no_credentials(Path(zip_path)):
+    """Attach the context zip to the composer, verify its size/members, and wait until upload finishes (D14, D15, D16)."""
+    zp = Path(zip_path)
+    if not _verify_zip_has_no_credentials(zp):
         return False
+    ok_zip, sz, entries, _ = _inspect_zip_archive(zp)
+    if not ok_zip:
+        return False
+    print(f"[+] Attaching archive {zp.name} ({sz} bytes, {entries} entries)...")
+
     # 1. Open the upload menu first - that is when the file input appears.
     _open_upload_menu(page)
     el = _zip_input(page)
     if el is not None:
         try:
-            el.set_input_files(str(zip_path))
-            page.wait_for_timeout(2000)
-            if _attachment_present(page, zip_path):
+            el.set_input_files(str(zp))
+            page.wait_for_timeout(1500)
+            if _wait_for_upload_complete(page, zp):
                 return True
         except Exception:
             pass
@@ -4057,9 +5071,9 @@ def attach_zip(page, zip_path: Path) -> bool:
         inputs = page.locator("input[type='file']")
         for i in range(min(inputs.count(), 4)):
             try:
-                inputs.nth(i).set_input_files(str(zip_path))
-                page.wait_for_timeout(1800)
-                if _attachment_present(page, zip_path):
+                inputs.nth(i).set_input_files(str(zp))
+                page.wait_for_timeout(1500)
+                if _wait_for_upload_complete(page, zp):
                     return True
             except Exception:
                 continue
@@ -4076,9 +5090,9 @@ def attach_zip(page, zip_path: Path) -> bool:
             try:
                 with page.expect_file_chooser(timeout=8000) as fc_info:
                     el2.click(timeout=3000)
-                fc_info.value.set_files(str(zip_path))
-                page.wait_for_timeout(2000)
-                if _attachment_present(page, zip_path):
+                fc_info.value.set_files(str(zp))
+                page.wait_for_timeout(1500)
+                if _wait_for_upload_complete(page, zp):
                     return True
             except Exception:
                 continue
@@ -4459,55 +5473,8 @@ def manual_setup_instructions(mode: str, screenshot: Optional[str] = None) -> st
 
 
 def _is_page_unauthenticated(page: Any) -> bool:
-    url = (page.url or "").lower()
-    if any(
-        tok in url
-        for tok in (
-            "accounts.google.com/v3/signin",
-            "accounts.google.com/signin",
-            "accounts.google.com/servicelogin",
-        )
-    ):
-        return True
-    try:
-        sign_in_links = page.locator("a[href*='ServiceLogin'], a[aria-label*='Sign in']")
-        if sign_in_links.count() > 0 and sign_in_links.first.is_visible():
-            return True
-    except Exception:
-        pass
-    # The ANONYMOUS GUEST page: the URL is a normal gemini.google.com one, so
-    # it slips through the checks above - but the page shows "Sign in to save
-    # activity" / "Where should we start?" and the model chip reads
-    # "Flash-Lite". A task sent there goes nowhere, so it must be refused.
-    try:
-        body = (page.locator("body").inner_text(timeout=12000) or "").lower()
-    except Exception:
-        body = ""
-    # "Where should we start?" is NORMAL copy on a signed-in Gemini home
-    # page, so it must NOT be used as a guest marker. The guest sidebar item
-    # "Sign in to save activity" is the reliable one.
-    if (
-        "sign in to save activity" in body
-        or "sign in or create an account" in body
-    ):
-        return True
-    # A signed-in Gemini always shows the account avatar / the chat history.
-    try:
-        if page.locator("a[aria-label*='Google Account'], button[aria-label*='Google Account']").count() > 0:
-            return False
-    except Exception:
-        pass
-    try:
-        chip = _model_chip(page)
-        if chip is not None and _model_name(chip):
-            # A model chip with a real model name means the page is the signed
-            # in workspace, not the guest page.
-            name = _model_name(chip).lower()
-            if name and "flash-lite" not in name:
-                return False
-    except Exception:
-        pass
-    return False
+    """Return True only when the page is proven to be a guest or Google sign-in page (D8.1)."""
+    return _gemini_page_is_guest(page)
 
 
 def _select_profile_account_if_needed(page: Any, target_email: Optional[str]) -> None:
@@ -4659,13 +5626,96 @@ def _is_argon_working(page) -> bool:
     return False
 
 
-def _detect_gemini_error(page) -> Optional[str]:
-    """Detect that Gemini itself gave up ("Something went wrong").
+STOPPED_RESPONSE_MARKERS = (
+    "you stopped this response",
+    "আপনি এই উত্তরটি থামিয়েছেন",
+    "আপনি এই উত্তরটি থামিয়েছেন",
+    "response was stopped",
+)
 
-    Only the LAST line of the conversation counts: an error banner from an
-    earlier round sits in the history and must not be mistaken for the end of
-    the current run.
+
+def _detect_stopped_response(page) -> Optional[str]:
+    """Detect when Gemini itself stopped the response ('You stopped this response') (D10.4)."""
+    try:
+        turns = _assistant_turns(page)
+        if turns and _element_is_after_last_user_turn(turns[-1]):
+            t_txt = (turns[-1].inner_text(timeout=3000) or "").lower()
+            for marker in STOPPED_RESPONSE_MARKERS:
+                if marker in t_txt:
+                    return "You stopped this response"
+    except Exception:
+        pass
+    try:
+        text = page.locator("body").inner_text(timeout=4000) or ""
+    except Exception:
+        return None
+    tail_lines = [ln.strip().lower() for ln in text.splitlines() if ln.strip()][-8:]
+    tail_joined = "\n".join(tail_lines)
+    for marker in STOPPED_RESPONSE_MARKERS:
+        if marker in tail_joined:
+            return "You stopped this response"
+    return None
+
+
+def _verify_argon_answer_evidence(
+    page: Any,
+    body_text: str = "",
+    delivered_path: Optional[Path] = None,
+    extracted_patch: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Inspect the answer for real agentic Argon evidence (D12.2).
+
+    After the prompt is sent, the composer's model chip reverts to the account
+    default (e.g. 'Flash'), so the real proof that Argon answered is in the
+    answer itself: a generated apply_changes.ps1 chip/file, tool-call trace,
+    root-cause notes, and structured PowerShell patch output.
     """
+    signals: List[str] = []
+    if delivered_path is not None and Path(delivered_path).is_file():
+        signals.append(f"delivered file artifact ({Path(delivered_path).name})")
+    if extracted_patch:
+        signals.append("structured PowerShell patch block")
+    try:
+        if page is not None:
+            turns = _assistant_turns(page)
+            if turns:
+                last_turn = turns[-1]
+                for trace_sel in (
+                    "generated-file",
+                    "code-execution",
+                    "thought-view",
+                    "[data-test-id*='thought']",
+                    "[class*='thought']",
+                    "mat-expansion-panel",
+                ):
+                    try:
+                        if last_turn.locator(trace_sel).count() > 0:
+                            signals.append(f"DOM trace ({trace_sel})")
+                            break
+                    except Exception:
+                        continue
+    except Exception:
+        pass
+
+    sample = (extracted_patch or body_text or "")
+    if "$TargetRoot" in sample:
+        signals.append("$TargetRoot contract")
+    if "## ROOT CAUSE" in sample:
+        signals.append("## ROOT CAUSE analysis")
+    if "[Verified]" in sample:
+        signals.append("[Verified] self-check")
+
+    verified = len(signals) > 0
+    summary = ", ".join(signals) if signals else "no agentic signals detected"
+    print(f"[+] Argon answer evidence: {'VERIFIED' if verified else 'MISSING'} ({summary})")
+    return {"verified": verified, "signals": signals, "summary": summary}
+
+
+def _detect_gemini_error(page) -> Optional[str]:
+    """Detect that Gemini itself gave up ("Something went wrong" or "You stopped this response")."""
+    stopped = _detect_stopped_response(page)
+    if stopped:
+        return stopped
     try:
         text = page.locator("body").inner_text(timeout=6000) or ""
     except Exception:
@@ -4695,7 +5745,7 @@ def _collect_diagnostic_evidence(
     ruled_out: Optional[List[str]] = None,
     next_step: str = "",
 ) -> Dict[str, Any]:
-    """Collect measured diagnostic evidence when a run fails so Argon can state the root cause."""
+    """Collect measured diagnostic evidence from the page's OWN conversation (D21)."""
     live_url = ""
     try:
         if page is not None:
@@ -4704,12 +5754,16 @@ def _collect_diagnostic_evidence(
         live_url = ""
     effective_url = (live_url or chat_url or "").strip()
     cid = _extract_chat_id(effective_url) or ""
-    title_now = chat_title
-    if not title_now and page is not None:
-        try:
-            title_now = _chat_title(page)
-        except Exception:
-            title_now = ""
+    # D21: Only report a conversation title when a conversation ID actually exists in the URL
+    if not cid:
+        title_now = "(no conversation created yet - new chat was never started)"
+    else:
+        title_now = chat_title
+        if not title_now and page is not None:
+            try:
+                title_now = _chat_title(page)
+            except Exception:
+                title_now = ""
     chip_name = ""
     if page is not None:
         try:
@@ -4886,21 +5940,32 @@ def _build_carry_over_prompt(
     return "\n".join(parts)
 
 
-def _take_step_screenshot(page, proj_root: Path, filename: str) -> Optional[Path]:
-    """Save a screenshot of the real Gemini page into .argon_backup/shots/ and print its full path.
+_STEP_SCREENSHOT_COUNTER = 0
 
-    Writes `<timestamp>_<filename>` inside `.argon_backup/shots/` and also updates
-    `<filename>` in `.argon_backup/shots/` (plus `.argon_backup/preflight_failure.png`
-    when `filename == 'preflight_failure.png'`) so both timestamped and canonical
-    paths exist on disk.
+
+def _take_step_screenshot(
+    page,
+    proj_root: Path,
+    filename: str,
+    step_label: str = "",
+    state_label: str = "",
+    lane: Optional[str] = None,
+) -> Optional[Path]:
+    """Save a numbered step screenshot `.argon_backup/shots/<NN>-<step>.png`, record it in
+    TaskState + TaskRegistry, and print `[+] <step> - <state> - Screenshot: <absolute path>` (D6.1, D6.2).
     """
+    global _STEP_SCREENSHOT_COUNTER
     try:
+        _STEP_SCREENSHOT_COUNTER += 1
+        seq = _STEP_SCREENSHOT_COUNTER
         shots_dir = Path(proj_root).resolve() / ".argon_backup" / "shots"
         shots_dir.mkdir(parents=True, exist_ok=True)
         stamp = time.strftime("%Y%m%d_%H%M%S")
         clean_name = Path(filename).name
         if not clean_name.lower().endswith(".png"):
             clean_name = clean_name + ".png"
+        stem = Path(clean_name).stem
+        numbered_path = (shots_dir / f"{seq:02d}-{stem}.png").resolve()
         ts_path = (shots_dir / f"{stamp}_{clean_name}").resolve()
         canonical_path = (shots_dir / clean_name).resolve()
         try:
@@ -4908,19 +5973,31 @@ def _take_step_screenshot(page, proj_root: Path, filename: str) -> Optional[Path
                 page.bring_to_front()
         except Exception:
             pass
-        page.screenshot(path=str(ts_path), timeout=20000)
-        try:
-            shutil.copy2(str(ts_path), str(canonical_path))
-        except Exception:
-            pass
+        page.screenshot(path=str(numbered_path), timeout=20000)
+        for mirror in (ts_path, canonical_path):
+            try:
+                shutil.copy2(str(numbered_path), str(mirror))
+            except Exception:
+                pass
         if clean_name == "preflight_failure.png":
             try:
                 legacy = (Path(proj_root).resolve() / ".argon_backup" / "preflight_failure.png").resolve()
-                shutil.copy2(str(ts_path), str(legacy))
+                shutil.copy2(str(numbered_path), str(legacy))
             except Exception:
                 pass
-        print(f"[+] Screenshot ({clean_name}): {ts_path}")
-        return ts_path
+
+        eff_step = step_label or stem
+        eff_state = state_label or ("failure captured" if "fail" in stem else "recorded")
+        print(f"[+] {eff_step} - {eff_state} - Screenshot: {numbered_path}")
+        print(f"    (Agent rule: READ this screenshot with your image reader before deciding anything.)")
+
+        try:
+            eff_lane = lane or getattr(page, "_argon_lane", None)
+            TaskState().set(proj_root, lane=eff_lane, last_screenshot=str(numbered_path))
+            TaskRegistry().update_running(proj_root, lane=eff_lane, screenshot_path=str(numbered_path))
+        except Exception:
+            pass
+        return numbered_path
     except Exception as exc:
         print(f"[!] Could not save screenshot ({filename}): {exc}", file=sys.stderr)
         return None
@@ -5090,41 +6167,220 @@ def _format_elapsed(seconds: float) -> str:
     return f"{mins} min {secs} s"
 
 
-def _start_fresh_chat(page, slot: str, isolated_profile: bool = True) -> bool:
-    """Open a NEW conversation (not the previous one).
+def _check_superseded_prompt(
+    page,
+    expected_prompt_text: str = "",
+    expected_task_text: str = "",
+    prev_state: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """Return a conflict description when a newer, DIFFERENT prompt was sent into the same chat (D22)."""
+    last_user_raw = _last_user_message_text(page)
+    if not last_user_raw:
+        return None
+    u_norm = _normalize_ws(last_user_raw)
+    u_hash = _prompt_hash(last_user_raw)
+    u_prefix = u_norm[:160]
 
-    In an isolated per-slot profile, the signed-in account sits at index 0, so
-    the URL must use `/u/0/` rather than the pool slot number.
+    prev = prev_state if isinstance(prev_state, dict) else {}
+    exp_p = (expected_prompt_text or "").strip()
+    exp_t = (expected_task_text or str(prev.get("task") or "")).strip()
+    exp_p_hash = _prompt_hash(exp_p) if exp_p else str(prev.get("prompt_hash") or "")
+    exp_t_hash = _prompt_hash(exp_t) if exp_t else str(prev.get("task_hash") or "")
+    exp_p_norm = _normalize_ws(exp_p) if exp_p else str(prev.get("prompt_prefix") or "")
+    exp_t_norm = _normalize_ws(exp_t) if exp_t else ""
+
+    if not (exp_p_hash or exp_t_hash or exp_p_norm or exp_t_norm):
+        return None
+
+    if exp_p_hash and u_hash == exp_p_hash:
+        return None
+    if exp_t_hash and u_hash == exp_t_hash:
+        return None
+    if exp_p_norm and len(exp_p_norm) >= 20 and (exp_p_norm[:120] in u_norm or u_norm[:120] in exp_p_norm):
+        return None
+    if exp_t_norm and len(exp_t_norm) >= 20 and exp_t_norm[:120] in u_norm:
+        return None
+
+    return (
+        f"chat now has a different last user prompt ({u_prefix!r}) that superseded "
+        f"the tracked task ({(exp_t_norm or exp_p_norm)[:120]!r})"
+    )
+
+
+def _known_chat_ids_for_slot(slot: Optional[str]) -> set:
+    """Return all conversation IDs previously recorded on `slot` across SessionStore, TaskState, and TaskRegistry (D19.2)."""
+    norm_s = normalize_slot(slot) if slot else "/u/0/"
+    known: set = set()
+    try:
+        s_data = SessionStore().load().get("sessions") or {}
+        for _, entry in s_data.items():
+            if not isinstance(entry, dict):
+                continue
+            if normalize_slot(str(entry.get("slot") or "/u/0/")) == norm_s and entry.get("chat_id"):
+                known.add(str(entry["chat_id"]))
+            lanes = entry.get("lanes")
+            if isinstance(lanes, dict):
+                for l_info in lanes.values():
+                    if isinstance(l_info, dict) and normalize_slot(str(l_info.get("slot") or "/u/0/")) == norm_s:
+                        if l_info.get("chat_id"):
+                            known.add(str(l_info["chat_id"]))
+    except Exception:
+        pass
+    try:
+        t_data = TaskState().data.get("tasks") or {}
+        for _, entry in t_data.items():
+            if not isinstance(entry, dict):
+                continue
+            if normalize_slot(str(entry.get("slot") or "/u/0/")) == norm_s and entry.get("chat_id"):
+                known.add(str(entry["chat_id"]))
+    except Exception:
+        pass
+    try:
+        for entry in (TaskRegistry().data.get("entries") or []):
+            if isinstance(entry, dict) and normalize_slot(str(entry.get("slot") or "/u/0/")) == norm_s:
+                if entry.get("chat_id"):
+                    known.add(str(entry["chat_id"]))
+    except Exception:
+        pass
+    return known
+
+
+def _start_fresh_chat(
+    page,
+    slot: str,
+    isolated_profile: bool = True,
+    forbidden_chat_ids: Optional[set] = None,
+) -> bool:
+    """Open and verify a GENUINELY new conversation (never reusing a restored foreign chat) (D19).
+
+     Gemini's home URL (`/u/0/app`) often auto-restores the account's previous
+    conversation. This function records the restored chat ID (and all known chat
+    IDs for `slot`), clicks the sidebar 'New chat' control (expanding the main
+    menu if needed), and verifies that the conversation in the URL is NOT any
+    previous chat ID and has no prior user messages. Fails loudly (`return False`)
+    if the page remains on an existing conversation.
     """
     slot_part = "/u/0/" if isolated_profile else (normalize_slot(slot) if slot else "/u/0/")
+    app_url = f"https://gemini.google.com{slot_part}app"
+    forbidden: set = set(forbidden_chat_ids or set())
+    forbidden.update(_known_chat_ids_for_slot(slot))
+
     try:
-        page.goto(f"https://gemini.google.com{slot_part}app", wait_until="domcontentloaded", timeout=60000)
-        page.wait_for_timeout(8000)
+        cur_cid = _extract_chat_id(str(getattr(page, "url", "") or ""))
+        if cur_cid:
+            forbidden.add(cur_cid)
+    except Exception:
+        pass
+
+    try:
+        cur_url_now = str(getattr(page, "url", "") or "")
+        if not cur_url_now or "gemini.google.com" not in cur_url_now.lower():
+            page.goto(app_url, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(3500)
+        else:
+            page.wait_for_timeout(2000)
     except Exception:
         return False
-    for sel in (
+
+    try:
+        restored_cid = _extract_chat_id(str(getattr(page, "url", "") or ""))
+        if restored_cid:
+            forbidden.add(restored_cid)
+            print(
+                f"[i] Gemini restored previous chat {restored_cid} on {slot}; "
+                "clicking 'New chat' to open a clean session."
+            )
+    except Exception:
+        pass
+
+    new_chat_selectors = (
+        "a[aria-label*='New chat' i]",
+        "button[aria-label*='New chat' i]",
+        "[data-test-id='new-chat-button']",
+        "[data-test-id*='new-chat']",
+        "a[aria-label*='নতুন চ্যাট']",
+        "button[aria-label*='নতুন চ্যাট']",
+        "button[aria-label*='নতুন']",
+        "a:has-text('New chat')",
+        "button:has-text('New chat')",
+        "a:has-text('নতুন চ্যাট')",
+        "button:has-text('নতুন চ্যাট')",
         "text=নতুন চ্যাট",
         "text=New chat",
-        "button[aria-label*='নতুন']",
-        "button[aria-label*='New chat' i]",
-        "mat-icon[fonticon='add']",
-    ):
+    )
+
+    def _is_genuinely_fresh() -> bool:
         try:
-            el = page.locator(sel).first
-            if el.count() and el.is_visible():
-                el.click(timeout=5000)
-                page.wait_for_timeout(4500)
-                print("[+] Started a NEW chat.")
-                return True
+            u_now = str(getattr(page, "url", "") or "")
         except Exception:
+            u_now = ""
+        cid_now = _extract_chat_id(u_now)
+        if cid_now and cid_now in forbidden:
+            return False
+        if _last_user_message_text(page):
+            return False
+        turns = _assistant_turns(page)
+        if turns and len(turns) > 0:
+            return False
+        return True
+
+    for attempt in range(3):
+        clicked_new = False
+        for sel in new_chat_selectors:
+            try:
+                loc = page.locator(sel)
+                for i in range(min(loc.count(), 4)):
+                    el = loc.nth(i)
+                    if _safe_visible(el):
+                        el.click(timeout=5000)
+                        page.wait_for_timeout(3000)
+                        clicked_new = True
+                        break
+                if clicked_new:
+                    break
+            except Exception:
+                continue
+
+        if not clicked_new and attempt == 0:
+            # Expand the collapsible sidebar menu if 'New chat' was hidden
+            for menu_sel in (
+                "button[aria-label*='Main menu' i]",
+                "button[aria-label*='প্রধান মেনু']",
+                "button[aria-label*='Menu' i]",
+                "[data-test-id='side-nav-menu-button']",
+            ):
+                try:
+                    m_loc = page.locator(menu_sel)
+                    if m_loc.count() > 0 and _safe_visible(m_loc.first):
+                        m_loc.first.click(timeout=3000)
+                        page.wait_for_timeout(1200)
+                        break
+                except Exception:
+                    continue
             continue
-    # The bare URL does NOT open a fresh conversation - it RESTORES the
-    # account's last one. MEASURED 2026-11-04: without the 'New chat' control
-    # the prompt would be pasted into somebody else's chat.
+
+        if _is_genuinely_fresh():
+            print(
+                f"[+] Verified brand-new chat session on {slot} "
+                f"(URL: {getattr(page, 'url', app_url)}, forbidden prior IDs: {len(forbidden)})."
+            )
+            return True
+
+        try:
+            page.goto(app_url, wait_until="domcontentloaded", timeout=45000)
+            page.wait_for_timeout(2500)
+        except Exception:
+            pass
+
+    if _is_genuinely_fresh():
+        print(f"[+] Verified clean new chat session on {slot} ({getattr(page, 'url', app_url)}).")
+        return True
+
+    lingering_cid = _extract_chat_id(str(getattr(page, "url", "") or ""))
     print(
-        "[!] Could not find the 'New chat' control - Gemini's bare app URL "
-        "RESTORES the account's last conversation, so no fresh chat was "
-        "started.",
+        f"[ERROR] Failed to start a genuinely new chat on {slot}: page remained on "
+        f"existing conversation {lingering_cid or getattr(page, 'url', '?')!r}. "
+        "Refusing to paste prompt into a foreign conversation!",
         file=sys.stderr,
     )
     return False
@@ -5267,7 +6523,15 @@ def _carry_over_to_new_session(
             pass
     _print_prompt_sent_banner(sent_hms, chat_title, chat_url)
 
-    # Wait for the delivery in the new session with geometric backoff.
+    # Wait for the delivery in the new session with geometric backoff (passing previous_hashes - D1.1).
+    co_previous_hashes: set = set()
+    try:
+        co_previous_hashes.update(DeliveryLedger().known_hashes(proj_root))
+        prev_st = task_state.get(proj_root) or {}
+        if prev_st.get("delivery_hash"):
+            co_previous_hashes.add(str(prev_st["delivery_hash"]))
+    except Exception:
+        pass
     if deadline is None:
         deadline = time.monotonic() + 900.0
     co_step = 0
@@ -5277,9 +6541,21 @@ def _carry_over_to_new_session(
             if new_chip is None:
                 new_chip = _generated_file_chip(page)
             if new_chip is not None:
-                got = capture_generated_file(page, proj_root / "downloads", chip=new_chip)
+                got = capture_generated_file(
+                    page,
+                    proj_root / "downloads",
+                    chip=new_chip,
+                    previous_hashes=co_previous_hashes,
+                    project_path=proj_root,
+                )
                 if got is not None:
-                    _take_step_screenshot(page, proj_root, "delivered.png")
+                    _take_step_screenshot(
+                        page,
+                        proj_root,
+                        "delivered.png",
+                        step_label="delivered",
+                        state_label=f"Captured carry-over patch {got.name}",
+                    )
                     print(f"[+] Captured the patch from the NEW session: {got}")
                     return got
         except Exception:
@@ -5743,6 +7019,8 @@ def dispatch_to_argon(
     delivery_dir: Optional[str] = None,
     lane: Optional[str] = None,
     skip_package: bool = False,
+    force: bool = False,
+    deadline_seconds: int = 1800,
 ) -> int:
     proj_root = Path(project_path).resolve()
     zip_path = proj_root / output_zip if not Path(output_zip).is_absolute() else Path(output_zip)
@@ -5751,15 +7029,101 @@ def dispatch_to_argon(
     )
     active_downloads_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. Load account pool configuration & session/task state stores
+    # 1. Load account pool configuration & session/task state/registry stores
     pool_cfg = PoolConfig()
     session_store = SessionStore()
     task_state_store = TaskState()
+    task_registry = TaskRegistry()
+    delivery_ledger = DeliveryLedger()
+
+    # D4.5: Surface any STALE tasks in the registry (with their age and screenshot)
+    stale_list = task_registry.stale_tasks()
+    if stale_list:
+        print("[!] STALE tasks detected in ~/.gemini/argon_tasks.json (started but never marked completed):", file=sys.stderr)
+        for st_item in stale_list:
+            print(
+                f"    - project={st_item.get('project')} lane={st_item.get('lane')} "
+                f"slot={st_item.get('slot')} chat_id={st_item.get('chat_id') or '(none)'} "
+                f"age={st_item.get('age_human')} screenshot={st_item.get('screenshot_path') or '(none)'}",
+                file=sys.stderr,
+            )
+        print(
+            f'    Close stale tasks explicitly with: python "{SCRIPTS_DIR / "dispatch_argon.py"}" '
+            f'--project-path "{proj_root}" --register-task-done',
+            file=sys.stderr,
+        )
+
+    # D2.1, D2.2, D22.1: Before starting a new run, check whether a task is already running
+    # for this project (and lane, if specified). Refuse with EXIT_ALREADY_RUNNING (9) unless
+    # --resume or --force was explicitly passed.
+    if not resume:
+        existing_lane_state = task_state_store.get(proj_root, lane=lane) if lane else None
+        running_lanes = task_state_store.get_running_lanes(proj_root)
+        blocking_entry: Optional[Dict[str, Any]] = None
+        if lane:
+            if existing_lane_state and str(existing_lane_state.get("state") or "").strip().lower() in ("sent", "waiting"):
+                blocking_entry = existing_lane_state
+        elif running_lanes:
+            first_k = next(iter(running_lanes))
+            blocking_entry = running_lanes[first_k]
+
+        if blocking_entry is None:
+            reg_active = task_registry.active_tasks_for_project(proj_root, lane=lane)
+            if reg_active and (reg_active[0].get("chat_id") or reg_active[0].get("chat_url")):
+                blocking_entry = reg_active[0]
+
+        if blocking_entry is not None:
+            b_slot = str(blocking_entry.get("slot") or "/u/0/")
+            b_cid = str(blocking_entry.get("chat_id") or "") or (_extract_chat_id(str(blocking_entry.get("chat_url") or "")) or "(pending)")
+            b_url = str(blocking_entry.get("chat_url") or "https://gemini.google.com/u/0/app")
+            b_state = str(blocking_entry.get("state") or blocking_entry.get("status") or "running")
+            b_shot = str(blocking_entry.get("last_screenshot") or blocking_entry.get("screenshot_path") or "(none)")
+            b_sent = str(blocking_entry.get("sent_at") or blocking_entry.get("started_at") or "?")
+            if not force:
+                print("\n" + "!" * 78, file=sys.stderr)
+                print(
+                    f"[ERROR] A task is ALREADY RUNNING for project {proj_root} (state={b_state!r}, sent_at={b_sent})!",
+                    file=sys.stderr,
+                )
+                print(
+                    "  Sending another prompt now would SUPERSEDE the unfinished task or block the account.",
+                    file=sys.stderr,
+                )
+                print(f"  - slot        : {b_slot} ({blocking_entry.get('email') or blocking_entry.get('account') or 'pool account'})", file=sys.stderr)
+                print(f"  - chat_id     : {b_cid}", file=sys.stderr)
+                print(f"  - link        : {b_url}", file=sys.stderr)
+                print(f"  - state       : {b_state}", file=sys.stderr)
+                print(f"  - screenshot  : {b_shot}", file=sys.stderr)
+                print("\n  Choose one of the two explicit actions:", file=sys.stderr)
+                print(
+                    f'    1. Resume waiting for the running task:\n'
+                    f'       python "{SCRIPTS_DIR / "dispatch_argon.py"}" --project-path "{proj_root}" --resume',
+                    file=sys.stderr,
+                )
+                print(
+                    f'    2. Force a new dispatch (explicitly abandoning/superseding the previous task):\n'
+                    f'       python "{SCRIPTS_DIR / "dispatch_argon.py"}" --project-path "{proj_root}" --task "..." --force',
+                    file=sys.stderr,
+                )
+                print("!" * 78 + "\n", file=sys.stderr)
+                return EXIT_ALREADY_RUNNING
+            else:
+                print(
+                    f"[!] --force specified: marking previous running task (chat={b_cid}, slot={b_slot}) "
+                    "as 'superseded' before starting new run."
+                )
+                task_state_store.set(
+                    proj_root,
+                    lane=lane,
+                    state="superseded",
+                    superseded_at=time.strftime("%Y-%m-%d %H:%M:%S"),
+                )
+                task_registry.register_done(proj_root, lane=lane, status="superseded")
 
     # RESUME: the browser was closed during an earlier run. The task state
     # remembers which conversation the task was in, so the run reopens it
     # instead of packaging and sending a second prompt.
-    resume_entry = task_state_store.get(proj_root) if resume else None
+    resume_entry = (task_state_store.get(proj_root, lane=lane) or task_state_store.get(proj_root)) if resume else None
     resume_chat = bool(
         resume_entry
         and resume_entry.get("chat_url")
@@ -5812,8 +7176,46 @@ def dispatch_to_argon(
             task_description=task,
             target_files=target_files,
         )
+    if not resume_chat and zip_path.is_file():
+        ok_z, z_bytes, z_entries, z_err = _inspect_zip_archive(zip_path)
+        if not ok_z:
+            print(f"[ERROR] Archive validation failed before upload: {z_err}", file=sys.stderr)
+            return EXIT_PREFLIGHT_FAILED
+        print(f"[+] Archive ready to upload: {zip_path} ({z_bytes} bytes, {z_entries} entries)")
 
-    active_slot = normalize_slot(slot) if slot else pool_cfg.active_slot()
+    # D3: Apply Account Policy when selecting active_slot
+    if slot:
+        active_slot = normalize_slot(slot)
+        slot_reason = f"explicitly requested slot {active_slot}"
+    else:
+        active_slot, slot_reason = select_account_slot(
+            pool_cfg=pool_cfg,
+            project_path=proj_root,
+            mode=mode,
+            requested_slot=slot,
+            new_session=new_session,
+            resume=resume_chat,
+            lane=lane,
+        )
+    print(f"[+] Chosen account slot: {active_slot} ({slot_reason})")
+
+    # D4.4: Enforce at most MAX_TASKS_PER_SLOT (2) concurrent tasks per account in TaskRegistry
+    if not resume_chat:
+        slot_ok, slot_cap_reason = task_registry.is_slot_available(active_slot, max_tasks=MAX_TASKS_PER_SLOT)
+        if not slot_ok:
+            # Allow if the running registry entry is this exact (project, lane) pre-registered by the agent
+            own_active = [
+                e
+                for e in task_registry.active_tasks_for_project(proj_root, lane=lane)
+                if normalize_slot(str(e.get("slot") or "/u/0/")) == active_slot
+            ]
+            if not own_active:
+                print(
+                    f"[!] Account at {active_slot} is at its concurrency limit ({slot_cap_reason}). "
+                    "Moving to the next account.",
+                    file=sys.stderr,
+                )
+                return EXIT_SLOT_BUSY
 
     # 3. Session continuity: a follow-up task on the same project continues in
     #    the SAME Gemini conversation when running on the same mode and slot.
@@ -6019,47 +7421,112 @@ def dispatch_to_argon(
             except Exception:
                 pass
 
-            page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(2000)
+            # D4: Register the task as running in TaskRegistry before navigation
+            task_registry.register_start(
+                proj_root,
+                slot=active_slot,
+                account=target_email or "",
+                chat_id=_extract_chat_id(target_url) or "",
+                chat_url=target_url,
+                lane=lane or "single",
+                label=task[:200] if task else "resume",
+                prompt_hash=_prompt_hash(prompt_text) if prompt_text else "",
+            )
 
-            # A NEW session must open a GENUINELY new conversation. The bare
-            # app URL restores the account's last conversation, so without this
-            # the prompt is pasted into somebody else's chat.
-            if not resume_chat and not is_continuation:
-                before_id = _extract_chat_id(page.url or "")
-                _isolated = (
-                    _profile_is_isolated_slot(profile_dir)
-                    if profile_dir is not None
-                    else True
+            # D17: Crash-recovery helper covering pre-flight, attach, paste, and send
+            preflight_recoveries = 0
+            max_preflight_recoveries = 2
+            last_step_shot: Optional[Path] = None
+
+            def _recover_preflight_or_send_browser(exc: BaseException, step_name: str = "preflight"):
+                nonlocal context, page, preflight_recoveries
+                preflight_recoveries += 1
+                print(
+                    f"\n[!] Browser or page closed during {step_name} ({exc}) - "
+                    f"recovery attempt {preflight_recoveries}/{max_preflight_recoveries}...",
+                    file=sys.stderr,
                 )
-                if not _start_fresh_chat(page, active_slot, isolated_profile=_isolated):
-                    print(
-                        "[!] No fresh chat could be started, so the prompt would "
-                        "land in the account's last conversation. Refusing to "
-                        "send.",
-                        file=sys.stderr,
-                    )
-                    _take_step_screenshot(page, proj_root, "preflight_failure.png")
-                    task_state_store.set(proj_root, state="preflight_failed")
-                    return EXIT_FAILURE
-                after_id = _extract_chat_id(page.url or "")
-                if before_id and after_id == before_id:
-                    print(
-                        "[!] The 'New chat' control did not create a new "
-                        "conversation (the chat id is unchanged), so the prompt "
-                        "would land in the previous one. Refusing to send.",
-                        file=sys.stderr,
-                    )
-                    _take_step_screenshot(page, proj_root, "preflight_failure.png")
-                    task_state_store.set(proj_root, state="preflight_failed")
-                    return EXIT_FAILURE
+                try:
+                    if context is not None:
+                        context.close()
+                except Exception:
+                    pass
+                context = None
+                while preflight_recoveries <= max_preflight_recoveries:
+                    time.sleep(2.5)
+                    if _profile_is_busy(profile_dir):
+                        continue
+                    try:
+                        context = _launch_with_fallback(p, launch_kwargs, chrome_exe, profile_dir)
+                        page = context.pages[0] if context.pages else context.new_page()
+                        try:
+                            page.on("download", _on_download)
+                        except Exception:
+                            pass
+                        setattr(page, "_argon_is_continuation", bool(is_continuation))
+                        setattr(page, "_argon_lane", lane)
+                        setattr(page, "_argon_reopen_hook", _recover_preflight_or_send_browser)
+                        reopen_target = _resolve_reopen_url(
+                            proj_root=proj_root,
+                            mode=mode,
+                            active_slot=active_slot,
+                            current_url=target_url,
+                            fallback_url=target_url,
+                            task_state=task_state_store,
+                            session_store=session_store,
+                            isolated_profile=_profile_is_isolated_slot(profile_dir),
+                        )
+                        page.goto(reopen_target, wait_until="domcontentloaded", timeout=60000)
+                        page.wait_for_timeout(2500)
+                        _wait_for_workspace(page, timeout=30.0)
+                        if not is_continuation and not resume_chat:
+                            _start_fresh_chat(
+                                page,
+                                active_slot,
+                                isolated_profile=_profile_is_isolated_slot(profile_dir),
+                                forbidden_chat_ids=forbidden_new_chat_ids,
+                            )
+                        print(f"[+] Recovered browser during {step_name} at {getattr(page, 'url', reopen_target)} - continuing step.")
+                        return page
+                    except Exception as rec_exc:
+                        print(f"[!] Recovery attempt {preflight_recoveries} failed: {rec_exc}", file=sys.stderr)
+                        preflight_recoveries += 1
+                return None
+
+            forbidden_new_chat_ids = _known_chat_ids_for_slot(active_slot)
+            setattr(page, "_argon_is_continuation", bool(is_continuation))
+            setattr(page, "_argon_lane", lane)
+            setattr(page, "_argon_reopen_hook", _recover_preflight_or_send_browser)
+
+            try:
+                page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
+                page.wait_for_timeout(2000)
+            except Exception as nav_exc:
+                if _is_target_closed_error(nav_exc):
+                    if _recover_preflight_or_send_browser(nav_exc, "navigation") is None:
+                        print(
+                            f"[ERROR] Browser closed during navigation to {target_url} and could not be recovered. "
+                            "Nothing was sent yet, so repeating this task costs zero quota.",
+                            file=sys.stderr,
+                        )
+                        task_registry.register_done(proj_root, lane=lane, slot=active_slot, status="failed")
+                        return EXIT_BROWSER_CLOSED
+                else:
+                    raise
 
             if not _wait_for_workspace(page):
                 print(
                     "[!] The Gemini workspace did not become ready in time.",
                     file=sys.stderr,
                 )
-                shot_ws = _take_step_screenshot(page, proj_root, "preflight_failure.png")
+                shot_ws = _take_step_screenshot(
+                    page,
+                    proj_root,
+                    "preflight_failure.png",
+                    step_label="preflight_failure",
+                    state_label="Workspace composer did not become ready",
+                    lane=lane,
+                )
                 ev_ws = _collect_diagnostic_evidence(
                     page=page,
                     proj_root=proj_root,
@@ -6072,7 +7539,8 @@ def dispatch_to_argon(
                     ruled_out=["Browser launched on slot profile"],
                     next_step="Run Open_Argon_Login.bat to verify the account session, then re-run this task.",
                 )
-                task_state_store.set(proj_root, state="preflight_failed", diagnostic_evidence=ev_ws)
+                task_state_store.set(proj_root, lane=lane, state="preflight_failed", diagnostic_evidence=ev_ws)
+                task_registry.register_done(proj_root, lane=lane, slot=active_slot, status="failed", screenshot_path=str(shot_ws or ""))
                 _print_run_failure_summary(ev_ws)
                 return EXIT_PREFLIGHT_FAILED
 
@@ -6096,7 +7564,14 @@ def dispatch_to_argon(
                     file=sys.stderr,
                 )
                 print("!" * 72 + "\n", file=sys.stderr)
-                shot_unauth = _take_step_screenshot(page, proj_root, "failed.png")
+                shot_unauth = _take_step_screenshot(
+                    page,
+                    proj_root,
+                    "failed.png",
+                    step_label="not_signed_in",
+                    state_label="Anonymous guest page or Google sign-in screen",
+                    lane=lane,
+                )
                 ev_unauth = _collect_diagnostic_evidence(
                     page=page,
                     proj_root=proj_root,
@@ -6109,7 +7584,8 @@ def dispatch_to_argon(
                     ruled_out=["Browser launched and page loaded"],
                     next_step="Run Open_Argon_Login.bat, then re-run this task.",
                 )
-                task_state_store.set(proj_root, state="not_signed_in", diagnostic_evidence=ev_unauth)
+                task_state_store.set(proj_root, lane=lane, state="not_signed_in", diagnostic_evidence=ev_unauth)
+                task_registry.register_done(proj_root, lane=lane, slot=active_slot, status="failed", screenshot_path=str(shot_unauth or ""))
                 _print_run_failure_summary(ev_unauth)
                 return EXIT_NOT_SIGNED_IN
 
@@ -6124,12 +7600,68 @@ def dispatch_to_argon(
                 )
                 print("    Moving on to the next account in the pool.", file=sys.stderr)
                 _mark_quota_limited(active_slot)
+                task_registry.register_done(proj_root, lane=lane, slot=active_slot, status="quota_limited")
                 return EXIT_QUOTA_LIMITED
 
-            # Rule 1.1 & 1.2: Before attaching the zip or sending, check whether
+            # D19: On a NEW session (not a continuation and not a resume), explicitly click
+            # 'New chat' and verify the conversation is genuinely fresh before pasting or attaching anything.
+            if not is_continuation and not resume_chat:
+                if not _start_fresh_chat(
+                    page,
+                    active_slot,
+                    isolated_profile=_profile_is_isolated_slot(profile_dir),
+                    forbidden_chat_ids=forbidden_new_chat_ids,
+                ):
+                    shot_fc = _take_step_screenshot(
+                        page,
+                        proj_root,
+                        "preflight_failure.png",
+                        step_label="new_chat_failed",
+                        state_label="Could not start a genuinely fresh chat",
+                        lane=lane,
+                    )
+                    ev_fc = _collect_diagnostic_evidence(
+                        page=page,
+                        proj_root=proj_root,
+                        reason="New session remained on a restored foreign conversation instead of opening a fresh chat",
+                        slot=active_slot,
+                        email=target_email,
+                        profile_dir=profile_dir,
+                        chat_url=getattr(page, "url", "") or target_url,
+                        screenshot_path=shot_fc,
+                        ruled_out=["Browser launched and Google session authenticated"],
+                        next_step="Rotating to the next pool account automatically.",
+                    )
+                    task_state_store.set(proj_root, lane=lane, state="preflight_failed", diagnostic_evidence=ev_fc)
+                    task_registry.register_done(proj_root, lane=lane, slot=active_slot, status="failed", screenshot_path=str(shot_fc or ""))
+                    _print_run_failure_summary(ev_fc)
+                    return EXIT_PREFLIGHT_FAILED
+
+            # Rule 1.1 & 1.2 + D22: Before attaching the zip or sending, check whether
             # this prompt is already the last user message in the conversation
-            # (or already recorded as an active task with the same prompt hash).
-            existing_task_entry = task_state_store.get(proj_root) or {}
+            # or whether this chat already has an unfinished running task.
+            existing_task_entry = (task_state_store.get(proj_root, lane=lane) or task_state_store.get(proj_root)) or {}
+            if not resume_chat and is_continuation and _is_argon_working(page) and not force:
+                live_working_shot = _take_step_screenshot(
+                    page,
+                    proj_root,
+                    "already_running.png",
+                    step_label="already_running",
+                    state_label="Chat already has Argon actively working",
+                    lane=lane,
+                )
+                print(
+                    f"\n[ERROR] This chat ({getattr(page, 'url', target_url)}) already has a running task "
+                    "(Argon is actively working); sending again will SUPERSEDE it!",
+                    file=sys.stderr,
+                )
+                print(
+                    f"        Screenshot: {live_working_shot}\n"
+                    f"        Use --resume to wait for the running answer, or --force to supersede it explicitly.",
+                    file=sys.stderr,
+                )
+                return EXIT_ALREADY_RUNNING
+
             dup_sent_hms = (
                 None
                 if resume_chat
@@ -6178,9 +7710,45 @@ def dispatch_to_argon(
                 preflight.append(f"model = 4 Argon : {'OK (manual)' if manual_setup else ('OK' if model_ok else 'FAILED')}")
                 think_ok = True
 
+            # D11.3: Annotate pre-flight mode & model lines with PROVEN (new chat) vs INHERITED (continuation)
+            if not resume_chat:
+                check_basis = "inherited from existing conversation" if is_continuation else "proven on new chat"
+                preflight = [
+                    (f"{ln} ({check_basis})" if ("proven" not in ln.lower() and "inherited" not in ln.lower()) else ln)
+                    for ln in preflight
+                ]
+
             attached = True if resume_chat else _retry(lambda p: attach_zip(p, zip_path), page)
             if not resume_chat:
-                preflight.append(f"attachment {zip_path.name} : {'OK' if attached else 'FAILED'}")
+                ok_z, z_sz, z_cnt, _ = _inspect_zip_archive(zip_path)
+                size_tag = f" ({z_sz} bytes, {z_cnt} entries, TASK_BRIEF.md verified)" if ok_z else " (invalid/corrupt archive)"
+                preflight.append(f"attachment {zip_path.name}{size_tag} : {'OK' if attached else 'FAILED'}")
+
+            # D17: If the browser/page closed during pre-flight or attach, recover and re-run pre-flight + attach
+            if not (mode_ok and model_ok and think_ok and attached) and (hasattr(page, "is_closed") and page.is_closed()):
+                recovered_pf_page = _recover_preflight_or_send_browser(
+                    RuntimeError("page closed during pre-flight/attach"),
+                    "preflight_and_attach",
+                )
+                if recovered_pf_page is not None:
+                    page = recovered_pf_page
+                    preflight.clear()
+                    mode_ok = True if manual_setup else _retry(
+                        lambda p: select_task_mode(p, require_verifiable=not is_continuation),
+                        page,
+                    )
+                    check_basis = "inherited from existing conversation" if is_continuation else "proven on new chat"
+                    preflight.append(f"mode = Task : {'OK' if mode_ok else 'FAILED'} ({check_basis})")
+                    model_ok = True if manual_setup else _retry(
+                        lambda p: select_argon_model(p, require_chip=not is_continuation),
+                        page,
+                    )
+                    preflight.append(f"model = 4 Argon : {'OK' if model_ok else 'FAILED'} ({check_basis})")
+                    think_ok = True
+                    attached = _retry(lambda p: attach_zip(p, zip_path), page)
+                    ok_z, z_sz, z_cnt, _ = _inspect_zip_archive(zip_path)
+                    size_tag = f" ({z_sz} bytes, {z_cnt} entries, TASK_BRIEF.md verified)" if ok_z else ""
+                    preflight.append(f"attachment {zip_path.name}{size_tag} : {'OK' if attached else 'FAILED'}")
 
             print("[i] Pre-flight:")
             for line in preflight:
@@ -6189,7 +7757,14 @@ def dispatch_to_argon(
             if not (mode_ok and model_ok and think_ok and attached):
                 if _argon_picker_is_disabled(page):
                     acct_now = _detect_signed_in_account(page, target_email, active_slot)
-                    shot_dis = _take_step_screenshot(page, proj_root, "preflight_failure.png")
+                    shot_dis = _take_step_screenshot(
+                        page,
+                        proj_root,
+                        "preflight_failure.png",
+                        step_label="preflight_failure",
+                        state_label="4 Argon option disabled in picker",
+                        lane=lane,
+                    )
                     print(
                         f"\n[!] Account {acct_now} (slot {active_slot}): this account has no Argon available "
                         f"('4 Argon' option is disabled in the model picker).",
@@ -6219,7 +7794,8 @@ def dispatch_to_argon(
                             "exhausted, run Open_Argon_Login.bat to add or sign in another account, then re-run this task."
                         ),
                     )
-                    task_state_store.set(proj_root, state="quota_limited", diagnostic_evidence=ev_dis)
+                    task_state_store.set(proj_root, lane=lane, state="quota_limited", diagnostic_evidence=ev_dis)
+                    task_registry.register_done(proj_root, lane=lane, slot=active_slot, status="quota_limited", screenshot_path=str(shot_dis or ""))
                     _print_run_failure_summary(ev_dis)
                     return EXIT_QUOTA_LIMITED
                 preflight_quota = _detect_quota_limit(page)
@@ -6231,8 +7807,16 @@ def dispatch_to_argon(
                     )
                     print("    Moving on to the next account in the pool.", file=sys.stderr)
                     _mark_quota_limited(active_slot)
+                    task_registry.register_done(proj_root, lane=lane, slot=active_slot, status="quota_limited")
                     return EXIT_QUOTA_LIMITED
-                shot_saved = _take_step_screenshot(page, proj_root, "preflight_failure.png")
+                shot_saved = _take_step_screenshot(
+                    page,
+                    proj_root,
+                    "preflight_failure.png",
+                    step_label="preflight_failure",
+                    state_label="Pre-flight workspace check failed",
+                    lane=lane,
+                )
                 print(
                     manual_setup_instructions(mode, str(shot_saved) if shot_saved else None),
                     file=sys.stderr,
@@ -6260,9 +7844,21 @@ def dispatch_to_argon(
                         "if the session expired, then re-run this task."
                     ),
                 )
-                task_state_store.set(proj_root, state="preflight_failed", diagnostic_evidence=ev_pf)
+                task_state_store.set(proj_root, lane=lane, state="preflight_failed", diagnostic_evidence=ev_pf)
+                task_registry.register_done(proj_root, lane=lane, slot=active_slot, status="failed", screenshot_path=str(shot_saved or ""))
                 _print_run_failure_summary(ev_pf)
                 return EXIT_PREFLIGHT_FAILED
+
+            # D6.1: Take step screenshot right after pre-flight and upload completion
+            if not resume_chat:
+                last_step_shot = _take_step_screenshot(
+                    page,
+                    proj_root,
+                    "preflight.png",
+                    step_label="preflight",
+                    state_label=f"Task mode, 4 Argon, and {zip_path.name} verified",
+                    lane=lane,
+                )
 
             # ------------------------------------------------------------- send --
             dispatch_started = (
@@ -6284,20 +7880,25 @@ def dispatch_to_argon(
             else:
                 responses_before = len(turns_before) if turns_before is not None else 0
 
+            # D1.1 & D1.2: Load all already-handled digests for this project from DeliveryLedger + TaskState + disk
             handled_delivery_hashes = set()
             try:
-                prev_state = task_state.get(proj_root) or {}
+                handled_delivery_hashes.update(delivery_ledger.known_hashes(proj_root))
+            except Exception:
+                pass
+            try:
+                prev_state = (task_state.get(proj_root, lane=lane) or task_state.get(proj_root)) or {}
                 prev_hash = str(prev_state.get("delivery_hash") or "")
                 if prev_hash:
                     handled_delivery_hashes.add(prev_hash)
             except Exception:
                 prev_state = {}
-            for stale in (active_downloads_dir / "apply_changes.ps1",):
+            for stale in (active_downloads_dir / "apply_changes.ps1", proj_root / "downloads" / "apply_changes.ps1"):
                 try:
                     if stale.is_file():
-                        handled_delivery_hashes.add(
-                            _hash_text(stale.read_text(encoding="utf-8", errors="replace"))
-                        )
+                        st_txt = stale.read_text(encoding="utf-8", errors="replace")
+                        handled_delivery_hashes.add(_hash_text(st_txt))
+                        handled_delivery_hashes.add(_sha256_full(st_txt))
                 except Exception:
                     pass
 
@@ -6307,7 +7908,7 @@ def dispatch_to_argon(
                 if resume_chat:
                     if dup_sent_hms is None:
                         print("[+] The prompt was already sent - checking the conversation and waiting for the answer.")
-                    task_state.set(proj_root, state="waiting", chat_url=page.url, slot=active_slot)
+                    task_state.set(proj_root, lane=lane, state="waiting", chat_url=page.url, slot=active_slot)
                 else:
                     # Double-check duplicate prompt right before sending as well.
                     late_dup_hms = _check_duplicate_prompt(
@@ -6320,7 +7921,7 @@ def dispatch_to_argon(
                     if late_dup_hms is not None:
                         _print_duplicate_prompt_notice(late_dup_hms)
                         resume_chat = True
-                        task_state.set(proj_root, state="waiting", chat_url=page.url, slot=active_slot)
+                        task_state.set(proj_root, lane=lane, state="waiting", chat_url=page.url, slot=active_slot)
                     else:
                         composer = _find_composer(page)
                         if composer is not None:
@@ -6379,14 +7980,23 @@ def dispatch_to_argon(
                             _type_and_send(page, composer, prompt_text)
                             sent_hms = time.strftime("%H:%M:%S")
                             just_sent_prompt = True
-                            _take_step_screenshot(page, proj_root, "sent.png")
+                            sent_shot = _take_step_screenshot(
+                                page,
+                                proj_root,
+                                "sent.png",
+                                step_label="sent",
+                                state_label=f"Prompt submitted at {sent_hms}",
+                                lane=lane,
+                            )
+                            # D12.1: After the message is sent, the composer chip reverts to the
+                            # ACCOUNT DEFAULT (e.g. 'Flash') even though 4 Argon answered this turn.
                             chip_after = _model_chip(page)
                             name_after = _model_name(chip_after)
-                            if name_after and not RE_ARGON.search(name_after):
+                            if name_after:
                                 print(
-                                    f"[!] WARNING: the model chip reads {name_after!r} right "
-                                    "after the prompt was sent.",
-                                    file=sys.stderr,
+                                    f"[i] Post-send model chip reads {name_after!r}: the chip after send shows "
+                                    "the account default for future turns, not the model answering this turn "
+                                    "(4 Argon was verified before send; real proof is verified in the answer)."
                                 )
                             print("[+] Prompt submitted in a verified Task/Argon workspace with the zip attached.")
                             try:
@@ -6395,6 +8005,7 @@ def dispatch_to_argon(
                                 profile_dir_str = ""
                             task_state.set(
                                 proj_root,
+                                lane=lane,
                                 chat_url=page.url,
                                 chat_title=_chat_title(page),
                                 slot=active_slot,
@@ -6410,22 +8021,109 @@ def dispatch_to_argon(
                                 sent_at=sent_hms,
                                 started_epoch=dispatch_started,
                                 started_at=time.strftime("%Y-%m-%d %H:%M:%S"),
+                                last_screenshot=str(sent_shot or ""),
+                            )
+                            task_registry.update_running(
+                                proj_root,
+                                lane=lane,
+                                slot=active_slot,
+                                chat_url=page.url,
+                                screenshot_path=str(sent_shot or ""),
+                                prompt_hash=_prompt_hash(prompt_text),
                             )
                             print(f"[+] Task state saved: {task_state.path}")
                             print(f"    account / profile : {active_slot}  ({profile_dir_str})")
                         else:
                             print("[!] Composer not visible - the prompt was not sent.", file=sys.stderr)
-                            _take_step_screenshot(page, proj_root, "preflight_failure.png")
+                            _take_step_screenshot(
+                                page,
+                                proj_root,
+                                "preflight_failure.png",
+                                step_label="composer_missing",
+                                state_label="Composer not visible before send",
+                                lane=lane,
+                            )
+                            task_registry.register_done(proj_root, lane=lane, slot=active_slot, status="failed")
                             return EXIT_PREFLIGHT_FAILED
             except Exception as exc:
                 if _is_target_closed_error(exc):
-                    return EXIT_BROWSER_CLOSED
-                print(f"[!] Prompt submission failed: {exc}", file=sys.stderr)
-                _take_step_screenshot(page, proj_root, "failed.png")
-                return EXIT_PREFLIGHT_FAILED
+                    # D17: Recover browser when a crash occurs during paste or send!
+                    rec_page = _recover_preflight_or_send_browser(exc, "paste_and_send")
+                    if rec_page is not None:
+                        page = rec_page
+                        dup_after_crash = _check_duplicate_prompt(
+                            page,
+                            prompt_text=prompt_text,
+                            task_text=task,
+                            prev_state=prev_state,
+                            new_session=False,
+                        )
+                        if dup_after_crash is not None:
+                            print("[+] Prompt had already landed before browser crash - continuing to wait for answer.")
+                            resume_chat = True
+                            just_sent_prompt = True
+                        else:
+                            print("[+] Re-applying Task/Argon + zip attachment after crash recovery before sending...")
+                            if not manual_setup:
+                                _retry(lambda p: select_task_mode(p, require_verifiable=not is_continuation), page)
+                                _retry(lambda p: select_argon_model(p, require_chip=not is_continuation), page)
+                            if _retry(lambda p: attach_zip(p, zip_path), page):
+                                comp_rec = _find_composer(page)
+                                if comp_rec is not None:
+                                    _type_and_send(page, comp_rec, prompt_text)
+                                    sent_hms = time.strftime("%H:%M:%S")
+                                    just_sent_prompt = True
+                                    _take_step_screenshot(
+                                        page,
+                                        proj_root,
+                                        "sent.png",
+                                        step_label="sent_after_recovery",
+                                        state_label=f"Prompt submitted at {sent_hms} after crash recovery",
+                                        lane=lane,
+                                    )
+                    if not just_sent_prompt and not resume_chat:
+                        print(
+                            f"[ERROR] Browser closed during paste/send step and could not complete send.\n"
+                            f"        Lost step       : paste_and_send (before prompt was sent)\n"
+                            f"        Last screenshot : {last_step_shot or '(none)'}\n"
+                            f"        Nothing was sent, so repeating this task costs zero quota.",
+                            file=sys.stderr,
+                        )
+                        task_registry.register_done(proj_root, lane=lane, slot=active_slot, status="failed")
+                        return EXIT_BROWSER_CLOSED
+                else:
+                    print(f"[!] Prompt submission failed: {exc}", file=sys.stderr)
+                    shot_pf_err = _take_step_screenshot(
+                        page,
+                        proj_root,
+                        "failed.png",
+                        step_label="send_failed",
+                        state_label=f"Prompt submission failed: {exc}",
+                        lane=lane,
+                    )
+                    task_registry.register_done(proj_root, lane=lane, slot=active_slot, status="failed", screenshot_path=str(shot_pf_err or ""))
+                    return EXIT_PREFLIGHT_FAILED
 
             # ------------------------------------------------- remember session --
             chat_id = _wait_for_chat_id(page)
+            # D19.2: On a new session, compare chat_id against forbidden_new_chat_ids
+            if not is_continuation and not resume_chat and chat_id and chat_id in forbidden_new_chat_ids:
+                shot_foreign = _take_step_screenshot(
+                    page,
+                    proj_root,
+                    "failed.png",
+                    step_label="foreign_chat_detected",
+                    state_label=f"New session reused existing chat_id {chat_id}",
+                    lane=lane,
+                )
+                print(
+                    f"[ERROR] New session chat_id ({chat_id}) matches a previous conversation on {active_slot}! "
+                    f"The new chat was NOT started. Screenshot: {shot_foreign}",
+                    file=sys.stderr,
+                )
+                task_registry.register_done(proj_root, lane=lane, slot=active_slot, status="failed", screenshot_path=str(shot_foreign or ""))
+                return EXIT_PREFLIGHT_FAILED
+
             chat_title = _chat_title(page)
             try:
                 profile_dir_str = str(profile_dir)
@@ -6441,6 +8139,7 @@ def dispatch_to_argon(
                 effective_chat_url = chat_url or effective_chat_url
                 task_state.set(
                     proj_root,
+                    lane=lane,
                     chat_id=chat_id,
                     chat_url=effective_chat_url,
                     chat_title=chat_title,
@@ -6450,6 +8149,13 @@ def dispatch_to_argon(
                     email=target_email,
                     mode=mode,
                     state="waiting",
+                )
+                task_registry.update_running(
+                    proj_root,
+                    lane=lane,
+                    slot=active_slot,
+                    chat_id=chat_id,
+                    chat_url=effective_chat_url,
                 )
                 print(f"[+] Remembered the session for this project: {effective_chat_url}")
                 if chat_title:
@@ -6464,8 +8170,9 @@ def dispatch_to_argon(
             if just_sent_prompt:
                 _print_prompt_sent_banner(sent_hms, chat_title, effective_chat_url)
 
-            print("[+] Waiting for Gemini 4 Argon response...")
-            deadline = time.monotonic() + 1200.0
+            eff_deadline_secs = max(60, int(deadline_seconds or 1800))
+            print(f"[+] Waiting for Gemini 4 Argon response (deadline: {_format_elapsed(eff_deadline_secs)})...")
+            deadline = time.monotonic() + float(eff_deadline_secs)
             extracted_patch: Optional[str] = None
             delivered_path: Optional[Path] = delivered.get("path")
             last_body = ""
@@ -6629,18 +8336,66 @@ def dispatch_to_argon(
                         return EXIT_QUOTA_LIMITED
 
                     now_mono = time.monotonic()
-                    if now_mono - last_heartbeat_mono >= HEARTBEAT_SECONDS:
-                        last_heartbeat_mono = now_mono
-                        print(
-                            f"[+] Still waiting for Argon ({_format_elapsed(now_mono - wait_started_mono)}) ..."
-                        )
+                    rem_secs = max(0.0, deadline - now_mono)
                     if (
                         waiting_shot_count < MAX_WAITING_SHOTS
                         and now_mono - last_waiting_shot_mono >= WAITING_SHOT_SECONDS
                     ):
                         last_waiting_shot_mono = now_mono
                         waiting_shot_count += 1
-                        _take_step_screenshot(page, proj_root, f"waiting-{waiting_shot_count}.png")
+                        _take_step_screenshot(
+                            page,
+                            proj_root,
+                            f"waiting-{waiting_shot_count}.png",
+                            step_label=f"waiting-{waiting_shot_count}",
+                            state_label=f"Waiting for Argon (elapsed {_format_elapsed(now_mono - wait_started_mono)}, remaining {_format_elapsed(rem_secs)})",
+                            lane=lane,
+                        )
+                    if now_mono - last_heartbeat_mono >= HEARTBEAT_SECONDS:
+                        last_heartbeat_mono = now_mono
+                        print(
+                            f"[+] Still waiting for Argon (elapsed: {_format_elapsed(now_mono - wait_started_mono)}, "
+                            f"remaining: {_format_elapsed(rem_secs)}) ..."
+                        )
+
+                    # D22.2 & D22.3: Check whether a newer, different prompt superseded this task in the same chat
+                    superseded_reason = _check_superseded_prompt(
+                        page,
+                        expected_prompt_text=prompt_text,
+                        expected_task_text=task,
+                        prev_state=task_state.get(proj_root, lane=lane) or prev_state,
+                    )
+                    if superseded_reason:
+                        sup_shot = _take_step_screenshot(
+                            page,
+                            proj_root,
+                            "superseded.png",
+                            step_label="superseded",
+                            state_label="Task superseded by a newer prompt in the same chat",
+                            lane=lane,
+                        )
+                        run_failed_reason = f"Task superseded: {superseded_reason}"
+                        print(
+                            f"\n[ERROR] {run_failed_reason}\n"
+                            f"        Marking this task as 'superseded' so future runs do not wait for a dropped prompt.\n"
+                            f"        Screenshot: {sup_shot}",
+                            file=sys.stderr,
+                        )
+                        task_state.set(
+                            proj_root,
+                            lane=lane,
+                            state="superseded",
+                            superseded_at=time.strftime("%Y-%m-%d %H:%M:%S"),
+                            last_screenshot=str(sup_shot or ""),
+                        )
+                        task_registry.register_done(
+                            proj_root,
+                            lane=lane,
+                            slot=active_slot,
+                            status="superseded",
+                            screenshot_path=str(sup_shot or ""),
+                        )
+                        break
 
                     if time.time() - last_state_write > 15:
                         last_state_write = time.time()
@@ -6648,18 +8403,23 @@ def dispatch_to_argon(
                         if live_cid:
                             session_store.remember(
                                 proj_root, mode, active_slot, live_cid,
-                                # The stored chat URL must match the profile the
-                                # run actually used: a per-slot profile stores
-                                # /u/0/, the shared master profile stores /u/<slot>/.
                                 profile_dir=str(profile_dir),
                                 lane=lane,
                             )
                         task_state.set(
                             proj_root,
+                            lane=lane,
                             state="waiting",
                             chat_id=live_cid or "",
                             chat_url=last_known_url,
                             slot=active_slot,
+                        )
+                        task_registry.update_running(
+                            proj_root,
+                            lane=lane,
+                            slot=active_slot,
+                            chat_id=live_cid or "",
+                            chat_url=last_known_url,
                         )
 
                     # Check for a delivery first so we react immediately.
@@ -6682,8 +8442,19 @@ def dispatch_to_argon(
                             )
                         except Exception:
                             delivered_text = ""
-                        if _looks_like_patch(delivered_text) and _patch_is_complete(delivered_text):
-                            _take_step_screenshot(page, proj_root, "delivered.png")
+                        if (
+                            not _is_leftover_delivery(delivered_text, handled_delivery_hashes, project_path=proj_root)
+                            and _looks_like_patch(delivered_text)
+                            and _patch_is_complete(delivered_text)
+                        ):
+                            _take_step_screenshot(
+                                page,
+                                proj_root,
+                                "delivered.png",
+                                step_label="delivered",
+                                state_label=f"Validated patch delivery {delivered_path.name}",
+                                lane=lane,
+                            )
                             break
                         delivered_path = None
 
@@ -6691,25 +8462,44 @@ def dispatch_to_argon(
                     if new_chip is None:
                         new_chip = _generated_file_chip(page)
                     if new_chip is not None:
+                        _take_step_screenshot(
+                            page,
+                            proj_root,
+                            "chip_detected.png",
+                            step_label="chip_detected",
+                            state_label="Delivery chip appeared in newest assistant turn",
+                            lane=lane,
+                        )
                         captured = capture_generated_file(
                             page,
                             active_downloads_dir,
                             chip=new_chip,
                             previous_hashes=handled_delivery_hashes,
+                            project_path=proj_root,
                         )
                         if captured is not None:
                             try:
-                                handled_delivery_hashes.add(
-                                    _hash_text(
-                                        captured.read_text(
-                                            encoding="utf-8", errors="replace"
-                                        )
-                                    )
+                                cap_txt = captured.read_text(encoding="utf-8", errors="replace")
+                                handled_delivery_hashes.add(_hash_text(cap_txt))
+                                handled_delivery_hashes.add(_sha256_full(cap_txt))
+                                delivery_ledger.record(
+                                    proj_root,
+                                    cap_txt,
+                                    chat_id=chat_id or _extract_chat_id(last_known_url) or "",
+                                    lane=lane or "",
+                                    file_path=str(captured),
                                 )
                             except Exception:
                                 pass
                             delivered_path = captured
-                            _take_step_screenshot(page, proj_root, "delivered.png")
+                            _take_step_screenshot(
+                                page,
+                                proj_root,
+                                "delivered.png",
+                                step_label="delivered",
+                                state_label=f"Captured patch file {captured.name}",
+                                lane=lane,
+                            )
                             print(f"[+] Captured the generated patch file: {captured}")
                             break
 
@@ -6719,10 +8509,34 @@ def dispatch_to_argon(
                     except Exception:
                         body_now = last_body
                     last_body = body_now
+
+                    # D10.4: Immediately recognize 'You stopped this response' when not working
+                    if not working:
+                        stopped_msg = _detect_stopped_response(page)
+                        if stopped_msg:
+                            run_failed_reason = "Gemini reported: 'You stopped this response' (response generation was stopped before delivery)"
+                            print(
+                                f"\n[!] {run_failed_reason}",
+                                file=sys.stderr,
+                            )
+                            break
+
                     candidate = extract_powershell_patch(last_body)
-                    if candidate and _looks_like_patch(candidate) and _patch_is_complete(candidate):
+                    if (
+                        candidate
+                        and not _is_leftover_delivery(candidate, handled_delivery_hashes, project_path=proj_root)
+                        and _looks_like_patch(candidate)
+                        and _patch_is_complete(candidate)
+                    ):
                         extracted_patch = candidate
-                        _take_step_screenshot(page, proj_root, "delivered.png")
+                        _take_step_screenshot(
+                            page,
+                            proj_root,
+                            "delivered.png",
+                            step_label="delivered",
+                            state_label="Extracted complete patch block from response",
+                            lane=lane,
+                        )
                         break
 
                     signature = (len(body_now), body_now[-300:])
@@ -6732,13 +8546,18 @@ def dispatch_to_argon(
                     if working:
                         quiet_since = time.monotonic()
 
-                    # Rule 5.1, 5.2, 5.3: Stall detection and browser refresh.
+                    # Rule 5.1, 5.2, 5.3 + D10.1: Stall detection and browser refresh ONLY when NOT working.
                     if not working and (time.monotonic() - quiet_since >= STALL_SECONDS):
                         gem_error = _detect_gemini_error(page)
                         if stall_count < MAX_STALL_REFRESHES and not gem_error:
                             stall_count += 1
                             stall_shot = _take_step_screenshot(
-                                page, proj_root, f"stall-{stall_count}.png"
+                                page,
+                                proj_root,
+                                f"stall-{stall_count}.png",
+                                step_label=f"stall-{stall_count}",
+                                state_label="No progress for 3 min; refreshing page",
+                                lane=lane,
                             )
                             print(
                                 f"[!] No progress for 3 min - the page looks stalled. Screenshot: {stall_shot}\n"
@@ -6757,9 +8576,13 @@ def dispatch_to_argon(
                             wait_step = 0
                             continue
                         run_failed_reason = (
-                            f"Gemini error: {gem_error}"
-                            if gem_error
-                            else "the answer finished without a delivery"
+                            f"Gemini reported: '{gem_error}'"
+                            if gem_error == "You stopped this response"
+                            else (
+                                f"Gemini error: {gem_error}"
+                                if gem_error
+                                else "the answer finished without a delivery"
+                            )
                         )
                         print(
                             f"\n[!] The conversation has been quiet for "
@@ -6854,18 +8677,37 @@ def dispatch_to_argon(
                     delivered_text = delivered_path.read_text(encoding="utf-8", errors="replace")
                 except Exception:
                     delivered_text = ""
+                _verify_argon_answer_evidence(
+                    page,
+                    body_text=delivered_text or last_body,
+                    delivered_path=delivered_path,
+                )
+                delivery_ledger.record(
+                    proj_root,
+                    delivered_text,
+                    chat_id=chat_id or _extract_chat_id(effective_chat_url) or "",
+                    lane=lane or "",
+                    file_path=str(delivered_path),
+                )
                 saved_notes_path = _save_notes_once(delivered_text, summary_text)
                 task_state.set(
                     proj_root,
+                    lane=lane,
                     state="delivered",
                     delivered=str(delivered_path),
                     delivery_hash=_hash_text(delivered_text),
+                )
+                task_registry.register_done(
+                    proj_root,
+                    lane=lane,
+                    slot=active_slot,
+                    status="completed",
                 )
                 if auto_apply:
                     ok = apply_delivered_patch(proj_root, delivered_path)
                     if not ok:
                         return EXIT_FAILURE
-                    task_state.set(proj_root, state="applied", delivered=str(delivered_path))
+                    task_state.set(proj_root, lane=lane, state="applied", delivered=str(delivered_path))
                     return _verify_project_locally(
                         proj_root=proj_root,
                         task_state=task_state,
@@ -6904,13 +8746,26 @@ def dispatch_to_argon(
                     chat_title=chat_title,
                     chat_url=effective_chat_url,
                 )
+                _verify_argon_answer_evidence(
+                    page,
+                    body_text=extracted_patch,
+                    extracted_patch=extracted_patch,
+                )
+                delivery_ledger.record(
+                    proj_root,
+                    extracted_patch,
+                    chat_id=chat_id or _extract_chat_id(effective_chat_url) or "",
+                    lane=lane or "",
+                    file_path=str(out_ps1),
+                )
                 saved_notes_path = _save_notes_once(extracted_patch, summary_text)
-                task_state.set(proj_root, state="delivered", delivered=str(out_ps1))
+                task_state.set(proj_root, lane=lane, state="delivered", delivered=str(out_ps1), delivery_hash=_hash_text(extracted_patch))
+                task_registry.register_done(proj_root, lane=lane, slot=active_slot, status="completed")
                 if auto_apply:
                     ok = apply_extracted_patch(proj_root, last_body, ps1_patch=extracted_patch)
                     if not ok:
                         return EXIT_FAILURE
-                    task_state.set(proj_root, state="applied", delivered=str(out_ps1))
+                    task_state.set(proj_root, lane=lane, state="applied", delivered=str(out_ps1))
                     return _verify_project_locally(
                         proj_root=proj_root,
                         task_state=task_state,
@@ -6923,6 +8778,68 @@ def dispatch_to_argon(
                     )
                 return EXIT_SUCCESS
             else:
+                still_working_at_deadline = False
+                try:
+                    still_working_at_deadline = _is_argon_working(page)
+                except Exception:
+                    still_working_at_deadline = False
+
+                # D10.3: When the deadline is reached while the chat is STILL working,
+                # do NOT throw the work away or navigate away for carry-over: save state='waiting'
+                # so --resume can pick it up, and explain that closing the browser may end the response.
+                if still_working_at_deadline and not run_failed_reason:
+                    live_title = _chat_title(page) or chat_title
+                    live_url = getattr(page, "url", "") or last_known_url or effective_chat_url
+                    deadline_shot = _take_step_screenshot(
+                        page,
+                        proj_root,
+                        "deadline_still_working.png",
+                        step_label="deadline_reached",
+                        state_label="Argon is still actively working at deadline",
+                        lane=lane,
+                    )
+                    task_state.set(
+                        proj_root,
+                        lane=lane,
+                        state="waiting",
+                        chat_id=chat_id or _extract_chat_id(live_url) or "",
+                        chat_title=live_title,
+                        chat_url=live_url,
+                        slot=active_slot,
+                        profile_dir=str(profile_dir),
+                        last_screenshot=str(deadline_shot or ""),
+                    )
+                    task_registry.update_running(
+                        proj_root,
+                        lane=lane,
+                        slot=active_slot,
+                        chat_url=live_url,
+                        screenshot_path=str(deadline_shot or ""),
+                    )
+                    print("\n" + "=" * 78, file=sys.stderr)
+                    print("  [!] DEADLINE REACHED WHILE ARGON IS STILL WORKING - WORK IS NOT LOST", file=sys.stderr)
+                    print("=" * 78, file=sys.stderr)
+                    print(f"  conversation title : {live_title or '(active conversation)'}", file=sys.stderr)
+                    print(f"  conversation link  : {live_url}", file=sys.stderr)
+                    print(f"  slot / account     : {active_slot} ({target_email or 'pool account'})", file=sys.stderr)
+                    print(f"  screenshot         : {deadline_shot}", file=sys.stderr)
+                    print(
+                        "  NOTE: The response is still being generated on Gemini's server. "
+                        "Closing the browser while a response is streaming may interrupt it.",
+                        file=sys.stderr,
+                    )
+                    print(
+                        f'  Resume waiting at any time with:\n'
+                        f'    python "{SCRIPTS_DIR / "dispatch_argon.py"}" --project-path "{proj_root}" --resume',
+                        file=sys.stderr,
+                    )
+                    print("=" * 78 + "\n", file=sys.stderr)
+                    return EXIT_FAILURE
+
+                stopped_now = _detect_stopped_response(page)
+                if stopped_now and not run_failed_reason:
+                    run_failed_reason = "Gemini reported: 'You stopped this response' (generation stopped before delivery)"
+
                 reason = run_failed_reason or "no delivery and no patch block before the timeout"
                 previous_body = last_body
                 if not previous_body:
@@ -6930,7 +8847,14 @@ def dispatch_to_argon(
                         previous_body = page.locator("body").inner_text(timeout=8000) or ""
                     except Exception:
                         previous_body = ""
-                failed_shot = _take_step_screenshot(page, proj_root, "failed.png")
+                failed_shot = _take_step_screenshot(
+                    page,
+                    proj_root,
+                    "failed.png",
+                    step_label="failed",
+                    state_label=reason,
+                    lane=lane,
+                )
                 live_title = _chat_title(page) or chat_title
                 live_url = getattr(page, "url", "") or last_known_url or effective_chat_url
                 diag_ev = _collect_diagnostic_evidence(
@@ -6955,17 +8879,27 @@ def dispatch_to_argon(
                         f"if Argon finished late and run Open_Argon_Apply.bat, or re-run with --resume."
                     ),
                 )
+                final_state_name = "superseded" if "superseded" in reason.lower() else "failed"
                 task_state.set(
                     proj_root,
-                    state="failed",
+                    lane=lane,
+                    state=final_state_name,
                     chat_title=live_title,
                     chat_url=live_url,
                     slot=active_slot,
                     profile_dir=str(profile_dir),
                     diagnostic_evidence=diag_ev,
+                    last_screenshot=str(failed_shot or ""),
+                )
+                task_registry.register_done(
+                    proj_root,
+                    lane=lane,
+                    slot=active_slot,
+                    status=final_state_name,
+                    screenshot_path=str(failed_shot or ""),
                 )
                 carried = None
-                if carry_over:
+                if carry_over and final_state_name != "superseded":
                     carried = _carry_over_to_new_session(
                         page=page,
                         prompt_text=prompt_text,
@@ -7183,6 +9117,39 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Open comparison.html in the default browser when --dual finishes.",
     )
     parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Explicitly override an already-running task for this project/lane (marking the earlier run as superseded).",
+    )
+    parser.add_argument(
+        "--deadline-seconds",
+        type=int,
+        default=1800,
+        help="Maximum seconds to wait for Argon's response before saving state for --resume (default: 1800 = 30 min).",
+    )
+    parser.add_argument(
+        "--register-task-start",
+        action="store_true",
+        help="Agent action: explicitly mark a task as started in ~/.gemini/argon_tasks.json before dispatching.",
+    )
+    parser.add_argument(
+        "--register-task-done",
+        "--complete-task",
+        dest="register_task_done",
+        action="store_true",
+        help="Agent action: explicitly mark the running task for --project-path (and optional --lane/--slot) as completed in ~/.gemini/argon_tasks.json.",
+    )
+    parser.add_argument(
+        "--task-label",
+        default="",
+        help="Free-text label stored in ~/.gemini/argon_tasks.json when using --register-task-start.",
+    )
+    parser.add_argument(
+        "--list-tasks",
+        action="store_true",
+        help="List all currently running and stale tasks in ~/.gemini/argon_tasks.json with per-slot load counts.",
+    )
+    parser.add_argument(
         "--max-verify-rounds",
         type=int,
         default=1,
@@ -7191,12 +9158,129 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _pool_slots_in_order(pool_cfg, start_slot: Optional[str]) -> list:
-    """Pool slots to try, starting at `start_slot` and wrapping around.
+def select_account_slot(
+    pool_cfg: Optional[PoolConfig],
+    project_path: Any,
+    mode: str = "gemini",
+    requested_slot: Optional[str] = None,
+    new_session: bool = False,
+    resume: bool = False,
+    is_carry_over: bool = False,
+    lane: Optional[str] = None,
+    exclude_slots: Optional[set] = None,
+) -> tuple[str, str]:
+    """Select the pool slot according to the D3 Account Policy and D4 TaskRegistry.
 
-    Any slot marked `quota_limited` (including slots whose '4 Argon' option was
-    disabled in the model picker) is skipped so the run immediately advances to
-    a healthy account in wrap-around order.
+    Policy:
+      - FOLLOW-UP: the account that holds the chat (the recorded winner's slot,
+        never rotated, because the conversation lives in that profile).
+      - CARRY-OVER: the account that held the failed run, because the context lives there.
+      - NEW TASK: always a DIFFERENT account than the one that just ran - the next
+        free account in pool order, skipping every slot at its registry limit, a
+        quota_limited slot, and the account that ran the previous round.
+    """
+    excluded = {normalize_slot(s) for s in (exclude_slots or set()) if s}
+    reg = TaskRegistry()
+    sess_store = SessionStore()
+    task_store = TaskState()
+
+    if requested_slot:
+        norm_req = normalize_slot(requested_slot)
+        return norm_req, f"explicitly requested slot {norm_req}"
+
+    if resume:
+        r_entry = task_store.get(project_path, lane=lane) or task_store.get(project_path) or {}
+        if r_entry.get("slot"):
+            r_slot = normalize_slot(str(r_entry["slot"]))
+            return r_slot, f"RESUMING running task on its original slot {r_slot}"
+
+    if is_carry_over:
+        c_entry = task_store.get(project_path, lane=lane) or task_store.get(project_path) or {}
+        if c_entry.get("slot"):
+            c_slot = normalize_slot(str(c_entry["slot"]))
+            return c_slot, f"CARRY-OVER policy: staying on {c_slot} where the failed run's context lives"
+
+    # Check if this is a FOLLOW-UP (existing session history and not --new-session)
+    existing_session = None if new_session else sess_store.lookup(project_path, mode=mode)
+    if existing_session and existing_session.get("chat_url") and existing_session.get("slot"):
+        f_slot = normalize_slot(str(existing_session["slot"]))
+        f_cid = str(existing_session.get("chat_id") or "")
+        return (
+            f_slot,
+            f"FOLLOW-UP policy: continuing conversation {f_cid or '(stored)'} on the account that holds it ({f_slot})",
+        )
+
+    # Otherwise this is a NEW TASK: must pick a DIFFERENT account than the one that just ran!
+    last_ran_slots: set = set(excluded)
+    if existing_session and existing_session.get("slot"):
+        last_ran_slots.add(normalize_slot(str(existing_session["slot"])))
+    t_entry = task_store.get(project_path) or {}
+    if t_entry.get("slot"):
+        last_ran_slots.add(normalize_slot(str(t_entry["slot"])))
+    reg_last = str(reg.load().get("last_used_slot") or "").strip()
+    if reg_last:
+        last_ran_slots.add(normalize_slot(reg_last))
+    if pool_cfg is not None and pool_cfg.data.get("active_slot"):
+        last_ran_slots.add(normalize_slot(str(pool_cfg.data["active_slot"])))
+
+    anchor_slot = (
+        normalize_slot(str(existing_session["slot"]))
+        if (existing_session and existing_session.get("slot"))
+        else (normalize_slot(reg_last) if reg_last else (pool_cfg.active_slot() if pool_cfg else "/u/0/"))
+    )
+    ordered_pool = _pool_slots_in_order(pool_cfg, anchor_slot, skip_start_slot=True)
+    if not ordered_pool:
+        ordered_pool = [f"/u/{i}/" for i in range(8)]
+
+    base_prof = pool_cfg.profile_dir if pool_cfg is not None else (Path.home() / ".gemini" / "argon_browser_profile")
+
+    # Pass 1: Prefer a completely idle slot (0 tasks in registry, profile not busy) different from last_ran_slots
+    for cand in ordered_pool:
+        norm_c = normalize_slot(cand)
+        if norm_c in last_ran_slots:
+            continue
+        active_on_slot = reg.active_tasks_for_slot(norm_c)
+        if len(active_on_slot) == 0 and not _profile_is_busy(_profile_dir_for_slot(base_prof, norm_c)):
+            return (
+                norm_c,
+                f"NEW-TASK policy: rotated to next free account {norm_c} (skipped previous {sorted(last_ran_slots)}, registry load 0/{MAX_TASKS_PER_SLOT})",
+            )
+
+    # Pass 2: Any slot under MAX_TASKS_PER_SLOT (2) different from last_ran_slots
+    for cand in ordered_pool:
+        norm_c = normalize_slot(cand)
+        if norm_c in last_ran_slots:
+            continue
+        ok_s, cap_reason = reg.is_slot_available(norm_c, max_tasks=MAX_TASKS_PER_SLOT)
+        if ok_s and not _profile_is_busy(_profile_dir_for_slot(base_prof, norm_c)):
+            return (
+                norm_c,
+                f"NEW-TASK policy: rotated to available account {norm_c} (skipped previous {sorted(last_ran_slots)}, {cap_reason})",
+            )
+
+    # Pass 3: Fallback to any slot in ordered_pool under MAX_TASKS_PER_SLOT not in excluded
+    for cand in ordered_pool:
+        norm_c = normalize_slot(cand)
+        if norm_c in excluded:
+            continue
+        ok_s, cap_reason = reg.is_slot_available(norm_c, max_tasks=MAX_TASKS_PER_SLOT)
+        if ok_s:
+            return norm_c, f"NEW-TASK fallback: selected {norm_c} ({cap_reason})"
+
+    fallback_s = ordered_pool[0] if ordered_pool else "/u/0/"
+    return fallback_s, f"fallback slot {fallback_s}"
+
+
+def _pool_slots_in_order(
+    pool_cfg,
+    start_slot: Optional[str],
+    skip_start_slot: bool = False,
+) -> list:
+    """Pool slots to try in wrap-around order.
+
+    When `skip_start_slot=True` (used for NEW tasks under D3), starts at the slot
+    IMMEDIATELY AFTER `start_slot` so a new task never reuses the account that
+    just ran unless every other account is unavailable.
     """
     if pool_cfg is None:
         return []
@@ -7217,6 +9301,8 @@ def _pool_slots_in_order(pool_cfg, start_slot: Optional[str]) -> list:
         if normalize_slot(acc.get("slot", "")) == target_start:
             start_idx = idx
             break
+    if skip_start_slot and len(ordered) > 1:
+        start_idx = (start_idx + 1) % len(ordered)
     rotated = ordered[start_idx:] + ordered[:start_idx]
 
     skip_statuses = {"quota_limited", "argon_disabled", "no_argon"}
@@ -7238,6 +9324,34 @@ def _mark_quota_limited(slot: str) -> None:
         print(f"[!] Could not record the quota limit for {slot}: {exc}", file=sys.stderr)
 
 
+def list_registered_tasks_cli() -> int:
+    """Print all active and stale tasks in ~/.gemini/argon_tasks.json (D4)."""
+    reg = TaskRegistry()
+    active = reg.active_entries()
+    stale = reg.stale_tasks()
+    stale_ids = {s.get("task_id") for s in stale}
+    print("=" * 78)
+    print(f"  ARGON TASK REGISTRY ({reg.path})")
+    print("=" * 78)
+    if not active:
+        print("  No active running tasks in the registry.")
+    else:
+        for e in active:
+            tid = e.get("task_id", "?")
+            tag = " [STALE]" if tid in stale_ids else ""
+            print(
+                f"  - {tid}{tag}\n"
+                f"      project    : {e.get('project')}\n"
+                f"      slot/lane  : {e.get('slot')} (lane={e.get('lane')}, account={e.get('account') or '?'})\n"
+                f"      chat       : {e.get('chat_id') or '(pending)'} ({e.get('chat_url') or ''})\n"
+                f"      started_at : {e.get('started_at')}\n"
+                f"      label      : {e.get('label') or ''}\n"
+                f"      screenshot : {e.get('screenshot_path') or '(none)'}"
+            )
+    print("=" * 78)
+    return EXIT_SUCCESS
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
@@ -7245,11 +9359,58 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.list_sessions:
         return list_sessions()
 
+    if getattr(args, "list_tasks", False):
+        return list_registered_tasks_cli()
+
     if args.forget_session is not None:
         return forget_sessions(args.forget_session)
 
     if args.record_winner is not None:
         return record_winner_cli(args.project_path, args.record_winner, mode=args.mode)
+
+    if getattr(args, "register_task_done", False):
+        reg = TaskRegistry()
+        closed = reg.register_done(
+            args.project_path,
+            lane=args.lane,
+            slot=args.slot,
+            status="completed",
+        )
+        print(
+            f"[+] Marked {closed} running task(s) as completed in {reg.path} "
+            f"for project {Path(args.project_path).resolve()}."
+        )
+        return EXIT_SUCCESS
+
+    if getattr(args, "register_task_start", False):
+        try:
+            pool_cfg_init = PoolConfig()
+        except Exception:
+            pool_cfg_init = None
+        chosen_slot, reason = select_account_slot(
+            pool_cfg=pool_cfg_init,
+            project_path=args.project_path,
+            mode=args.mode,
+            requested_slot=args.slot,
+            new_session=args.new_session,
+            lane=args.lane,
+        )
+        reg = TaskRegistry()
+        ok_s, cap_msg = reg.is_slot_available(chosen_slot, max_tasks=MAX_TASKS_PER_SLOT)
+        if not ok_s:
+            print(f"[ERROR] Cannot register task on {chosen_slot}: {cap_msg}", file=sys.stderr)
+            return EXIT_SLOT_BUSY
+        rec = reg.register_start(
+            args.project_path,
+            slot=chosen_slot,
+            lane=args.lane or "single",
+            label=args.task_label or args.task or "agent-registered task",
+        )
+        print(
+            f"[+] Registered task start in {reg.path}: task_id={rec['task_id']} "
+            f"slot={chosen_slot} ({reason})"
+        )
+        return EXIT_SUCCESS
 
     if not args.resume and not (args.task or "").strip():
         parser.error("the following arguments are required: --task (unless --resume is used)")
@@ -7285,7 +9446,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         pool_cfg = None
 
     if args.resume:
-        resume_entry = TaskState().get(args.project_path)
+        resume_entry = TaskState().get(args.project_path, lane=args.lane) or TaskState().get(args.project_path)
         resume_slot = args.slot or (resume_entry.get("slot") if resume_entry else None)
         return dispatch_to_argon(
             task=args.task,
@@ -7303,24 +9464,40 @@ def main(argv: Optional[List[str]] = None) -> int:
             verify_timeout=args.verify_timeout,
             verify_cmd=args.verify_cmd,
             skip_verify=args.skip_verify,
+            lane=args.lane,
+            force=args.force,
+            deadline_seconds=args.deadline_seconds,
         )
 
-    start_slot = args.slot
-    if start_slot is None and not args.new_session:
-        existing_session = SessionStore().lookup(args.project_path, mode=args.mode)
-        if existing_session and existing_session.get("slot"):
-            start_slot = normalize_slot(existing_session["slot"])
+    existing_session = None if args.new_session else SessionStore().lookup(args.project_path, mode=args.mode)
+    is_followup_bound = bool(existing_session and existing_session.get("chat_url") and not args.new_session)
 
-    slots = _pool_slots_in_order(pool_cfg, start_slot)
-    if args.max_accounts and args.max_accounts > 0 and slots:
-        slots = slots[: args.max_accounts]
+    chosen_slot, slot_reason = select_account_slot(
+        pool_cfg=pool_cfg,
+        project_path=args.project_path,
+        mode=args.mode,
+        requested_slot=args.slot,
+        new_session=args.new_session,
+        lane=args.lane,
+    )
+    print(f"[+] Account policy selected start slot {chosen_slot}: {slot_reason}")
+
+    if is_followup_bound:
+        # D3: A FOLLOW-UP stays on the account that holds the chat (never rotated to another slot)
+        slots = [chosen_slot]
+    else:
+        slots = _pool_slots_in_order(pool_cfg, chosen_slot, skip_start_slot=False)
+        if chosen_slot not in slots:
+            slots.insert(0, chosen_slot)
+        if args.max_accounts and args.max_accounts > 0 and slots:
+            slots = slots[: args.max_accounts]
 
     if not slots:
         return dispatch_to_argon(
             task=args.task,
             project_path=args.project_path,
             mode=args.mode,
-            slot=args.slot,
+            slot=chosen_slot,
             headless=args.headless,
             auto_apply=args.auto_apply,
             manual_setup=args.manual_setup,
@@ -7336,14 +9513,34 @@ def main(argv: Optional[List[str]] = None) -> int:
             delivery_dir=args.delivery_dir,
             lane=args.lane,
             skip_package=args.skip_package,
+            force=args.force,
+            deadline_seconds=args.deadline_seconds,
         )
 
+    # D20: Continue rotating across pool accounts on ANY pre-flight / sign-in / launch / busy / quota failure
+    # of a new task (only marking the account quota_limited when the reason is quota / Argon disabled).
     last = EXIT_FAILURE
     saw_quota = False
     saw_busy = False
+    skipped_accounts: List[tuple[str, str]] = []
+    rotatable_codes = {
+        EXIT_QUOTA_LIMITED,
+        EXIT_SLOT_BUSY,
+        EXIT_PREFLIGHT_FAILED,
+        EXIT_NOT_SIGNED_IN,
+        EXIT_BROWSER_LAUNCH_FAILED,
+    }
+    code_labels = {
+        EXIT_QUOTA_LIMITED: "quota_limited / 4 Argon disabled",
+        EXIT_SLOT_BUSY: "slot busy or at 2-task registry limit",
+        EXIT_PREFLIGHT_FAILED: "pre-flight check failed",
+        EXIT_NOT_SIGNED_IN: "profile not signed in",
+        EXIT_BROWSER_LAUNCH_FAILED: "browser launch failed",
+    }
+
     for index, slot in enumerate(slots):
         if index:
-            print(f"\n[+] Trying the next pool account: {slot}")
+            print(f"\n[+] Rotating to next pool account ({index + 1}/{len(slots)}): {slot}")
         last = dispatch_to_argon(
             task=args.task,
             project_path=args.project_path,
@@ -7364,17 +9561,33 @@ def main(argv: Optional[List[str]] = None) -> int:
             delivery_dir=args.delivery_dir,
             lane=args.lane,
             skip_package=args.skip_package,
+            force=args.force,
+            deadline_seconds=args.deadline_seconds,
         )
-        if last == EXIT_QUOTA_LIMITED:
-            saw_quota = True
-            _mark_quota_limited(slot)
-            continue
-        if last == EXIT_SLOT_BUSY:
-            saw_busy = True
-            print(f"[+] Slot {slot} is in use by another run - moving on to the next pool slot.")
+        if last == EXIT_SUCCESS or last == EXIT_ALREADY_RUNNING:
+            if skipped_accounts:
+                print(f"[+] Account rotation summary: tried {index + 1} account(s); succeeded on {slot}.")
+                for sk_slot, sk_reason in skipped_accounts:
+                    print(f"    - skipped {sk_slot}: {sk_reason}")
+            return last
+        if not is_followup_bound and last in rotatable_codes and len(slots) > 1:
+            reason_label = code_labels.get(last, f"exit code {last}")
+            skipped_accounts.append((slot, reason_label))
+            if last == EXIT_QUOTA_LIMITED:
+                saw_quota = True
+                _mark_quota_limited(slot)
+            elif last == EXIT_SLOT_BUSY:
+                saw_busy = True
+            print(
+                f"[+] Account {slot} failed ({reason_label}) - continuing rotation across remaining pool accounts."
+            )
             continue
         return last
 
+    if skipped_accounts:
+        print(f"\n[!] Pool rotation exhausted after trying {len(skipped_accounts)} account(s):", file=sys.stderr)
+        for sk_slot, sk_reason in skipped_accounts:
+            print(f"    - {sk_slot}: {sk_reason}", file=sys.stderr)
     if saw_busy and not saw_quota:
         print("\n[!] Every account slot in the pool is currently busy.", file=sys.stderr)
         return EXIT_SLOT_BUSY

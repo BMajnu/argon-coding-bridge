@@ -17,11 +17,21 @@ Features:
 """
 from __future__ import annotations
 
+import argparse
 import subprocess
+import sys
 import threading
-import tkinter as tk
-from tkinter import messagebox, ttk
+from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+try:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, ttk
+except ImportError:
+    tk = None  # type: ignore
+    filedialog = None  # type: ignore
+    messagebox = None  # type: ignore
+    ttk = None  # type: ignore
 
 from argon_pool_login import (
     CHROME_LAUNCH_ARGS,
@@ -293,10 +303,10 @@ class PoolLoginAssistantApp:
         self._worker_running = False
         self._active_challenge_modal: Optional[ChallengeModalAlert] = None
 
-        self.root.title("Gemini 4 Argon — Multi-Account Pool Login Assistant")
-        self.root.geometry("650x540")
+        self.root.title("Gemini 4 Argon - Multi-Account Pool Login Assistant")
+        self.root.geometry("680x760")
         self.root.configure(bg="#0f172a")
-        self.root.resizable(False, False)
+        self.root.resizable(True, True)
 
         self._build_ui()
         self._refresh_account_card()
@@ -521,18 +531,99 @@ class PoolLoginAssistantApp:
 
         self.auto_login_all_btn = tk.Button(
             nav_frame,
-            text="⚡ Auto Login All",
+            text="Auto Login All",
             command=self.start_auto_login_all,
             font=("Segoe UI", 9, "bold"),
             bg="#16a34a",
             fg="#ffffff",
             activebackground="#15803d",
             relief="flat",
-            padx=16,
+            padx=14,
             pady=6,
             cursor="hand2",
         )
         self.auto_login_all_btn.pack(side="right", padx=(0, 8))
+
+        self.login_this_btn = tk.Button(
+            nav_frame,
+            text="Login This Account",
+            command=self.start_login_this_account,
+            font=("Segoe UI", 9, "bold"),
+            bg="#0d9488",
+            fg="#ffffff",
+            activebackground="#0f766e",
+            relief="flat",
+            padx=12,
+            pady=6,
+            cursor="hand2",
+        )
+        self.login_this_btn.pack(side="right", padx=(0, 8))
+
+        import_frame = tk.Frame(
+            self.root,
+            bg="#1e293b",
+            padx=16,
+            pady=12,
+            highlightbackground="#334155",
+            highlightthickness=1,
+        )
+        import_frame.pack(fill="both", expand=True, padx=22, pady=(2, 8))
+
+        import_hdr = tk.Frame(import_frame, bg="#1e293b")
+        import_hdr.pack(fill="x", pady=(0, 6))
+
+        tk.Label(
+            import_hdr,
+            text="Bulk Import Pool Accounts (one email:password per line; blank lines & # comments ignored):",
+            font=("Segoe UI", 9, "bold"),
+            fg="#cbd5e1",
+            bg="#1e293b",
+        ).pack(side="left")
+
+        self.import_text = tk.Text(
+            import_frame,
+            height=5,
+            font=("Consolas", 9),
+            bg="#0f172a",
+            fg="#f8fafc",
+            insertbackground="#f8fafc",
+            relief="flat",
+            wrap="none",
+        )
+        self.import_text.pack(fill="both", expand=True, pady=(0, 8))
+
+        import_btn_row = tk.Frame(import_frame, bg="#1e293b")
+        import_btn_row.pack(fill="x")
+
+        self.load_txt_btn = tk.Button(
+            import_btn_row,
+            text="Load from .txt",
+            command=self.load_accounts_from_txt,
+            font=("Segoe UI", 9, "bold"),
+            bg="#334155",
+            fg="#f8fafc",
+            activebackground="#475569",
+            relief="flat",
+            padx=12,
+            pady=5,
+            cursor="hand2",
+        )
+        self.load_txt_btn.pack(side="left")
+
+        self.import_login_btn = tk.Button(
+            import_btn_row,
+            text="Import & Auto Login",
+            command=self.import_and_auto_login,
+            font=("Segoe UI", 9, "bold"),
+            bg="#16a34a",
+            fg="#ffffff",
+            activebackground="#15803d",
+            relief="flat",
+            padx=14,
+            pady=5,
+            cursor="hand2",
+        )
+        self.import_login_btn.pack(side="right")
 
         launch_frame = tk.Frame(self.root, bg="#0f172a", padx=22)
         launch_frame.pack(fill="x", pady=(4, 8))
@@ -792,6 +883,270 @@ class PoolLoginAssistantApp:
 
         self._run_accounts_login_in_background(accounts, label="Auto Login All")
 
+    def start_login_this_account(self) -> None:
+        """Sign in ONLY the currently selected account card (D7.3)."""
+        if self._worker_running:
+            self.set_status("An automatic sign-in task is already running...", "#fbbf24")
+            return
+        acc = self._current_account()
+        if not acc:
+            self.set_status("No account selected to sign in.", "#f87171")
+            return
+        slot = acc.get("slot", f"/u/{self.current_index}/")
+        self._run_accounts_login_in_background([acc], label=f"Login {slot} ({acc.get('email', '')})")
+
+    def load_accounts_from_txt(self) -> None:
+        """Open a file picker and populate the bulk import text box from a .txt file (D7.2)."""
+        if self._worker_running:
+            self.set_status("Please wait for the current login task to finish first.", "#fbbf24")
+            return
+        chosen = filedialog.askopenfilename(
+            parent=self.root,
+            title="Select Accounts .txt File (email:password per line)",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+        )
+        if not chosen:
+            return
+        try:
+            content = Path(chosen).read_text(encoding="utf-8-sig", errors="replace")
+            self.import_text.delete("1.0", "end")
+            self.import_text.insert("1.0", content)
+            non_empty = [
+                ln.strip()
+                for ln in content.splitlines()
+                if ln.strip() and not ln.strip().startswith("#")
+            ]
+            self.set_status(
+                f"Loaded {len(non_empty)} credential line(s) from {Path(chosen).name}. Click 'Import & Auto Login'.",
+                "#34d399",
+            )
+        except Exception as exc:
+            messagebox.showerror("Load Failed", f"Could not read {chosen}:\n{exc}", parent=self.root)
+
+    def import_and_auto_login(self) -> None:
+        """Validate and import email:password lines from the import box and auto-login (D7.1, D7.4)."""
+        if self._worker_running:
+            self.set_status("An automatic sign-in task is already running...", "#fbbf24")
+            return
+        raw_text = self.import_text.get("1.0", "end")
+        if not (raw_text or "").strip():
+            messagebox.showwarning(
+                "Empty Import Box",
+                "Paste one or more 'email:password' lines (or click 'Load from .txt') first.",
+                parent=self.root,
+            )
+            return
+
+        report = self.pool_config.import_accounts_text(raw_text)
+        added = report["added"]
+        updated = report["updated"]
+        failed = report["failed"]
+        to_login = report["accounts_to_login"]
+
+        self._refresh_account_card()
+
+        summary_lines = [
+            f"Added new accounts   : {len(added)}",
+            f"Updated existing     : {len(updated)}",
+            f"Failed / skipped     : {len(failed)}",
+        ]
+        if failed:
+            summary_lines.append("")
+            summary_lines.append("Lines that failed validation:")
+            for item in failed[:15]:
+                summary_lines.append(f"  - Line {item['line_no']} ({item['line']}): {item['reason']}")
+        if failed:
+            messagebox.showwarning("Bulk Import Report", "\n".join(summary_lines), parent=self.root)
+
+        if not to_login:
+            self.set_status(
+                f"Import finished: 0 valid accounts to sign in ({len(failed)} failed).",
+                "#f87171",
+            )
+            return
+
+        self.set_status(
+            f"Imported {len(added)} new and {len(updated)} updated account(s). Starting automatic sign-in...",
+            "#34d399",
+        )
+        self._run_accounts_login_in_background(to_login, label="Import & Auto Login")
+
+    def start_login_this_account(self) -> None:
+        """Sign in ONLY the currently selected account card (D7.3)."""
+        if self._worker_running:
+            self.set_status("An automatic sign-in task is already running...", "#fbbf24")
+            return
+        acc = self._current_account()
+        if not acc:
+            self.set_status("No account selected to sign in.", "#f87171")
+            return
+        slot = acc.get("slot", f"/u/{self.current_index}/")
+        self._run_accounts_login_in_background([acc], label=f"Login {slot} ({acc.get('email', '')})")
+
+    def load_accounts_from_txt(self) -> None:
+        """Open a file picker and populate the bulk import text box from a .txt file (D7.2)."""
+        if self._worker_running:
+            self.set_status("Please wait for the current login task to finish first.", "#fbbf24")
+            return
+        chosen = filedialog.askopenfilename(
+            parent=self.root,
+            title="Select Accounts .txt File (email:password per line)",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+        )
+        if not chosen:
+            return
+        try:
+            content = Path(chosen).read_text(encoding="utf-8-sig", errors="replace")
+            self.import_text.delete("1.0", "end")
+            self.import_text.insert("1.0", content)
+            non_empty = [
+                ln.strip()
+                for ln in content.splitlines()
+                if ln.strip() and not ln.strip().startswith("#")
+            ]
+            self.set_status(
+                f"Loaded {len(non_empty)} credential line(s) from {Path(chosen).name}. Click 'Import & Auto Login'.",
+                "#34d399",
+            )
+        except Exception as exc:
+            messagebox.showerror("Load Failed", f"Could not read {chosen}:\n{exc}", parent=self.root)
+
+    def import_and_auto_login(self) -> None:
+        """Validate and import email:password lines from the import box and auto-login (D7.1, D7.4)."""
+        if self._worker_running:
+            self.set_status("An automatic sign-in task is already running...", "#fbbf24")
+            return
+        raw_text = self.import_text.get("1.0", "end")
+        if not (raw_text or "").strip():
+            messagebox.showwarning(
+                "Empty Import Box",
+                "Paste one or more 'email:password' lines (or click 'Load from .txt') first.",
+                parent=self.root,
+            )
+            return
+
+        report = self.pool_config.import_accounts_text(raw_text)
+        added = report["added"]
+        updated = report["updated"]
+        failed = report["failed"]
+        to_login = report["accounts_to_login"]
+
+        self._refresh_account_card()
+
+        summary_lines = [
+            f"Added new accounts   : {len(added)}",
+            f"Updated existing     : {len(updated)}",
+            f"Failed / skipped     : {len(failed)}",
+        ]
+        if failed:
+            summary_lines.append("")
+            summary_lines.append("Lines that failed validation:")
+            for item in failed[:15]:
+                summary_lines.append(f"  - Line {item['line_no']} ({item['line']}): {item['reason']}")
+        if failed:
+            messagebox.showwarning("Bulk Import Report", "\n".join(summary_lines), parent=self.root)
+
+        if not to_login:
+            self.set_status(
+                f"Import finished: 0 valid accounts to sign in ({len(failed)} failed).",
+                "#f87171",
+            )
+            return
+
+        self.set_status(
+            f"Imported {len(added)} new and {len(updated)} updated account(s). Starting automatic sign-in...",
+            "#34d399",
+        )
+        self._run_accounts_login_in_background(to_login, label="Import & Auto Login")
+
+    def start_login_this_account(self) -> None:
+        """Sign in ONLY the currently selected account card (D7.3)."""
+        if self._worker_running:
+            self.set_status("An automatic sign-in task is already running...", "#fbbf24")
+            return
+        acc = self._current_account()
+        if not acc:
+            self.set_status("No account selected to sign in.", "#f87171")
+            return
+        slot = acc.get("slot", f"/u/{self.current_index}/")
+        self._run_accounts_login_in_background([acc], label=f"Login {slot} ({acc.get('email', '')})")
+
+    def load_accounts_from_txt(self) -> None:
+        """Open a file picker and populate the bulk import text box from a .txt file (D7.2)."""
+        if self._worker_running:
+            self.set_status("Please wait for the current login task to finish first.", "#fbbf24")
+            return
+        chosen = filedialog.askopenfilename(
+            parent=self.root,
+            title="Select Accounts .txt File (email:password per line)",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+        )
+        if not chosen:
+            return
+        try:
+            content = Path(chosen).read_text(encoding="utf-8-sig", errors="replace")
+            self.import_text.delete("1.0", "end")
+            self.import_text.insert("1.0", content)
+            non_empty = [
+                ln.strip()
+                for ln in content.splitlines()
+                if ln.strip() and not ln.strip().startswith("#")
+            ]
+            self.set_status(
+                f"Loaded {len(non_empty)} credential line(s) from {Path(chosen).name}. Click 'Import & Auto Login'.",
+                "#34d399",
+            )
+        except Exception as exc:
+            messagebox.showerror("Load Failed", f"Could not read {chosen}:\n{exc}", parent=self.root)
+
+    def import_and_auto_login(self) -> None:
+        """Validate and import email:password lines from the import box and auto-login (D7.1, D7.4)."""
+        if self._worker_running:
+            self.set_status("An automatic sign-in task is already running...", "#fbbf24")
+            return
+        raw_text = self.import_text.get("1.0", "end")
+        if not (raw_text or "").strip():
+            messagebox.showwarning(
+                "Empty Import Box",
+                "Paste one or more 'email:password' lines (or click 'Load from .txt') first.",
+                parent=self.root,
+            )
+            return
+
+        report = self.pool_config.import_accounts_text(raw_text)
+        added = report["added"]
+        updated = report["updated"]
+        failed = report["failed"]
+        to_login = report["accounts_to_login"]
+
+        self._refresh_account_card()
+
+        summary_lines = [
+            f"Added new accounts   : {len(added)}",
+            f"Updated existing     : {len(updated)}",
+            f"Failed / skipped     : {len(failed)}",
+        ]
+        if failed:
+            summary_lines.append("")
+            summary_lines.append("Lines that failed validation:")
+            for item in failed[:15]:
+                summary_lines.append(f"  - Line {item['line_no']} ({item['line']}): {item['reason']}")
+        if failed:
+            messagebox.showwarning("Bulk Import Report", "\n".join(summary_lines), parent=self.root)
+
+        if not to_login:
+            self.set_status(
+                f"Import finished: 0 valid accounts to sign in ({len(failed)} failed).",
+                "#f87171",
+            )
+            return
+
+        self.set_status(
+            f"Imported {len(added)} new and {len(updated)} updated account(s). Starting automatic sign-in...",
+            "#34d399",
+        )
+        self._run_accounts_login_in_background(to_login, label="Import & Auto Login")
+
     def open_add_account_dialog(self) -> None:
         """Show the Add Account dialog, append to pool config, and auto-login the new account."""
         if self._worker_running:
@@ -819,6 +1174,12 @@ class PoolLoginAssistantApp:
         self._worker_running = True
         self.auto_login_all_btn.configure(state="disabled")
         self.add_account_btn.configure(state="disabled")
+        if hasattr(self, "login_this_btn"):
+            self.login_this_btn.configure(state="disabled")
+        if hasattr(self, "import_login_btn"):
+            self.import_login_btn.configure(state="disabled")
+        if hasattr(self, "load_txt_btn"):
+            self.load_txt_btn.configure(state="disabled")
         self.progress_var.set(0.0)
 
         def on_progress(
@@ -893,6 +1254,12 @@ class PoolLoginAssistantApp:
                     self._worker_running = False
                     self.auto_login_all_btn.configure(state="normal")
                     self.add_account_btn.configure(state="normal")
+                    if hasattr(self, "login_this_btn"):
+                        self.login_this_btn.configure(state="normal")
+                    if hasattr(self, "import_login_btn"):
+                        self.import_login_btn.configure(state="normal")
+                    if hasattr(self, "load_txt_btn"):
+                        self.load_txt_btn.configure(state="normal")
                     self._refresh_account_card()
                     if results:
                         ok_count = sum(1 for r in results if r.status == STATUS_OK)
@@ -907,11 +1274,61 @@ class PoolLoginAssistantApp:
         threading.Thread(target=worker, daemon=True).start()
 
 
-def main() -> None:
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Gemini 4 Argon Account Pool Login Assistant (GUI & CLI). "
+            "Supports: Login This Account, Auto Login All, Add Account, "
+            "Bulk Import Box (email:password per line), Load from .txt, and Import & Auto Login."
+        )
+    )
+    parser.add_argument("--config", default=None, help="Optional path to accounts_pool.json")
+    parser.add_argument(
+        "--import-file",
+        default=None,
+        metavar="TXT_PATH",
+        help="Import email:password lines from a .txt file into accounts_pool.json (and auto-login with --auto-login)",
+    )
+    parser.add_argument(
+        "--auto-login",
+        action="store_true",
+        help="When used with --import-file or --slot, run automatic headless/headed sign-in without opening the GUI",
+    )
+    parser.add_argument(
+        "--slot",
+        default=None,
+        help="Select or sign in a specific account slot (e.g. /u/0/)",
+    )
+    return parser
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+
+    if args.import_file and args.auto_login:
+        from argon_pool_login import main as cli_login_main
+
+        cli_args = ["--import-file", args.import_file]
+        if args.config:
+            cli_args.extend(["--config", args.config])
+        if args.slot:
+            cli_args.extend(["--slot", args.slot])
+        return cli_login_main(cli_args)
+
     root = tk.Tk()
-    PoolLoginAssistantApp(root)
+    app = PoolLoginAssistantApp(root, config_path=args.config)
+    if args.import_file:
+        try:
+            txt = Path(args.import_file).expanduser().resolve().read_text(encoding="utf-8-sig", errors="replace")
+            app.import_text.delete("1.0", "end")
+            app.import_text.insert("1.0", txt)
+            app.set_status(f"Loaded {args.import_file}. Click 'Import & Auto Login' to proceed.", "#34d399")
+        except Exception as exc:
+            app.set_status(f"Could not load {args.import_file}: {exc}", "#f87171")
     root.mainloop()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

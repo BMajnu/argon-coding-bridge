@@ -57,7 +57,13 @@ param(
     [string]$FollowupPatch = "",
     [string]$NewPatch = "",
     [string]$ConflictChoices = "",
-    [string]$SecondSlot = ""
+    [string]$SecondSlot = "",
+    [switch]$Force,
+    [int]$DeadlineSeconds = 1800,
+    [switch]$RegisterTaskStart,
+    [switch]$RegisterTaskDone,
+    [string]$TaskLabel = "",
+    [switch]$ListTasks
 )
 
 $ErrorActionPreference = "Stop"
@@ -68,6 +74,37 @@ $dispatchScript = Join-Path $scriptsDir "dispatch_argon.py"
 $dualScript = Join-Path $scriptsDir "dual_dispatch.py"
 $compareScript = Join-Path $scriptsDir "compare_argon_patches.py"
 $applyRunner = Join-Path $scriptsDir "Run-ArgonPatch.ps1"
+
+if ($ListTasks) {
+    & python $dispatchScript --list-tasks
+    exit $LASTEXITCODE
+}
+
+if ($RegisterTaskDone) {
+    $doneArgs = @($dispatchScript, "--project-path", $ProjectPath, "--register-task-done")
+    if (-not [string]::IsNullOrWhiteSpace($Slot)) {
+        $doneArgs += @("--slot", $Slot)
+    }
+    & python @doneArgs
+    exit $LASTEXITCODE
+}
+
+if ($RegisterTaskStart) {
+    $startArgs = @($dispatchScript, "--project-path", $ProjectPath, "--register-task-start")
+    if (-not [string]::IsNullOrWhiteSpace($Slot)) {
+        $startArgs += @("--slot", $Slot)
+    }
+    if (-not [string]::IsNullOrWhiteSpace($TaskLabel)) {
+        $startArgs += @("--task-label", $TaskLabel)
+    } elseif (-not [string]::IsNullOrWhiteSpace($Task)) {
+        $startArgs += @("--task-label", $Task)
+    }
+    if ($NewSession) {
+        $startArgs += "--new-session"
+    }
+    & python @startArgs
+    exit $LASTEXITCODE
+}
 
 if (-not [string]::IsNullOrWhiteSpace($RecordWinner)) {
     Write-Host "[+] Recording winning lane '$RecordWinner' for: $ProjectPath" -ForegroundColor Cyan
@@ -201,6 +238,12 @@ if (-not [string]::IsNullOrWhiteSpace($SecondSlot)) {
 }
 if ($OpenComparison) {
     $argList += "--open-comparison"
+}
+if ($Force) {
+    $argList += "--force"
+}
+if ($DeadlineSeconds -gt 0) {
+    $argList += @("--deadline-seconds", "$DeadlineSeconds")
 }
 
 Write-Host "[+] Invoking Gemini 4 Argon Dispatcher ($Mode)..." -ForegroundColor Cyan

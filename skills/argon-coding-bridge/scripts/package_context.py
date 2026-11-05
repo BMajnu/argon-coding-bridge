@@ -723,10 +723,18 @@ def package_context(
                 selected_files.append(rel)
 
     out_zip_path = Path(output_zip).resolve()
+    out_zip_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_zip_path = out_zip_path.with_name(f".{out_zip_path.name}.{os.getpid()}.tmp")
     print(f"[+] Total eligible codebase files: {len(selected_files)} (excluded: {len(excluded_files)})")
-    print(f"[+] Creating clean zip archive: {out_zip_path}")
+    print(f"[+] Creating clean zip archive atomically via temp file: {out_zip_path}")
 
-    with zipfile.ZipFile(out_zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+    try:
+        if tmp_zip_path.exists():
+            tmp_zip_path.unlink()
+    except OSError:
+        pass
+
+    with zipfile.ZipFile(tmp_zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         for rel in selected_files:
             full = proj_root / rel
             zf.write(full, arcname=str(rel))
@@ -802,15 +810,30 @@ $TargetRoot = '{proj_root}'
         zf.writestr("API_INDEX.md", api_index_text)
         brief_text = _compose_task_brief(proj_root, selected_files, excluded_files, brief_text)
         zf.writestr("TASK_BRIEF.md", brief_text)
-        try:
-            local_brief = proj_root / "TASK_BRIEF.md"
-            if local_brief.is_file():
-                local_brief.write_text(brief_text, encoding="utf-8")
-        except Exception:
-            pass
 
-    size_kb = round(out_zip_path.stat().st_size / 1024, 2)
-    print(f"[SUCCESS] Packaged {len(selected_files)} clean files ({size_kb} KB) to {out_zip_path}")
+    # D13.2: Write TASK_BRIEF.md atomically via a temporary file + os.replace
+    try:
+        local_brief = proj_root / "TASK_BRIEF.md"
+        tmp_brief = local_brief.with_name(f".TASK_BRIEF.md.{os.getpid()}.tmp")
+        tmp_brief.write_text(brief_text, encoding="utf-8")
+        os.replace(str(tmp_brief), str(local_brief))
+    except Exception:
+        pass
+
+    # D13.1: Verify temporary zip archive and move into place atomically (os.replace)
+    with zipfile.ZipFile(tmp_zip_path, "r") as verify_zf:
+        archive_members = verify_zf.namelist()
+        if "TASK_BRIEF.md" not in archive_members:
+            raise RuntimeError("Packaged archive is missing TASK_BRIEF.md")
+    os.replace(str(tmp_zip_path), str(out_zip_path))
+
+    size_bytes = out_zip_path.stat().st_size
+    size_kb = round(size_bytes / 1024, 2)
+    total_entries = len(archive_members)
+    print(
+        f"[SUCCESS] Packaged {len(selected_files)} clean files "
+        f"({total_entries} total entries, {size_bytes} bytes / {size_kb} KB) to {out_zip_path}"
+    )
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Package codebase context for Gemini 4 Argon")

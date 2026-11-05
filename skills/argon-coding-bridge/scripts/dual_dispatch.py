@@ -35,12 +35,16 @@ from typing import Any, Dict, List, Optional, Union
 from argon_pool_login import PoolConfig, normalize_slot
 from compare_argon_patches import compare_patches, render_comparison_html
 from dispatch_argon import (
+    EXIT_ALREADY_RUNNING,
     EXIT_FAILURE,
     EXIT_SLOT_BUSY,
     EXIT_SUCCESS,
+    MAX_TASKS_PER_SLOT,
     SCRIPTS_DIR,
     SessionStore,
     SlotLock,
+    TaskRegistry,
+    _inspect_zip_archive,
     _pool_slots_in_order,
     _profile_dir_for_slot,
     _profile_is_busy,
@@ -74,8 +78,16 @@ def has_session_history(session_entry: Optional[Dict[str, Any]]) -> bool:
     return False
 
 
-def _is_slot_free(base_profile: Path, slot: str) -> bool:
+def _is_slot_free(base_profile: Path, slot: str, require_zero_tasks: bool = False) -> bool:
+    """Consult TaskRegistry (D4), profile busy state, and SlotLock to decide if `slot` is free."""
     norm = normalize_slot(slot)
+    reg = TaskRegistry()
+    active_on_slot = reg.active_tasks_for_slot(norm)
+    if require_zero_tasks and len(active_on_slot) > 0:
+        return False
+    ok_reg, _ = reg.is_slot_available(norm, max_tasks=MAX_TASKS_PER_SLOT)
+    if not ok_reg:
+        return False
     slot_prof = _profile_dir_for_slot(base_profile, norm)
     if _profile_is_busy(slot_prof):
         return False
@@ -91,9 +103,11 @@ def pick_new_session_slot(
     followup_slot: str,
     preferred_slot: Optional[str] = None,
 ) -> Optional[str]:
-    """Pick a free pool slot for the NEW-SESSION lane that differs from `followup_slot`."""
+    """Pick a free pool slot for the NEW-SESSION lane using TaskRegistry & D3 Account Policy."""
     norm_followup = normalize_slot(followup_slot)
     base_profile = pool_cfg.profile_dir if pool_cfg is not None else (Path.home() / ".gemini" / "argon_browser_profile")
+    reg = TaskRegistry()
+    last_used = normalize_slot(str(reg.load().get("last_used_slot") or "")) if reg.load().get("last_used_slot") else ""
 
     if preferred_slot:
         norm_pref = normalize_slot(preferred_slot)
@@ -105,7 +119,7 @@ def pick_new_session_slot(
 
     candidates: List[str] = []
     if pool_cfg is not None:
-        for s in _pool_slots_in_order(pool_cfg, norm_followup):
+        for s in _pool_slots_in_order(pool_cfg, norm_followup, skip_start_slot=True):
             ns = normalize_slot(s)
             if ns != norm_followup and ns not in candidates:
                 candidates.append(ns)
@@ -120,8 +134,17 @@ def pick_new_session_slot(
         fallback_slots = ["/u/0/", "/u/1/", "/u/2/", "/u/3/", "/u/4/", "/u/5/", "/u/6/", "/u/7/"]
         candidates = [s for s in fallback_slots if s != norm_followup]
 
+    # Pass 1: Prefer a slot with 0 active registry tasks that also differs from last_used
     for cand in candidates:
-        if _is_slot_free(base_profile, cand):
+        if cand != last_used and _is_slot_free(base_profile, cand, require_zero_tasks=True):
+            return cand
+    # Pass 2: Any slot with 0 active registry tasks
+    for cand in candidates:
+        if _is_slot_free(base_profile, cand, require_zero_tasks=True):
+            return cand
+    # Pass 3: Any slot under MAX_TASKS_PER_SLOT (2)
+    for cand in candidates:
+        if _is_slot_free(base_profile, cand, require_zero_tasks=False):
             return cand
     return None
 
