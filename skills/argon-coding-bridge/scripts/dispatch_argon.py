@@ -2092,21 +2092,45 @@ def _normalize_gemini_chat_url(url: str, isolated_profile: bool = True) -> str:
     return raw
 
 
-def _gemini_page_is_guest(page) -> bool:
+def _has_signed_in_evidence(page) -> bool:
+    """True when the page itself PROVES that a Google account is signed in.
+
+    The account chip in the sidebar and the list of the account's own chats are
+    both proof. Nothing else is: the account MENU always contains a "Sign in"
+    entry (to add another account) and that entry is in the DOM of a perfectly
+    signed-in page - MEASURED 2026-11-05.
+    """
+    try:
+        avatars = page.locator(
+            "a[aria-label*='Google Account'], button[aria-label*='Google Account'], "
+            "a[aria-label*='Google অ্যাকাউন্ট'], button[aria-label*='Google অ্যাকাউন্ট']"
+        )
+        for i in range(min(avatars.count(), 4)):
+            if _safe_visible(avatars.nth(i)):
+                return True
+    except Exception:
+        pass
+    try:
+        if page.locator("a[href*='/app/']").count() > 0:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _gemini_page_is_guest(page, wait_seconds: float = 15.0) -> bool:
     """True when the page really shows a Google sign-in screen.
 
     NEVER decide from a phrase in the body. MEASURED 2026-11-04: the phrase
-    "Sign in to save activity" is not a hidden menu item - it appears in the
-    CONVERSATION TEXT whenever the chat talks about the guest detection (the
-    bridge's own documentation, a patch that mentions it, ...). A body
-    substring is therefore worthless as a guest marker.
+    "Sign in to save activity" appears in the CONVERSATION TEXT whenever the
+    chat talks about the guest detection, so it proves nothing.
 
-    And the ABSENCE of a sign-in signal proves nothing either: right after a
-    page load the sidebar has not rendered yet, so the chat list and the
-    account chip are missing while the session is perfectly alive. Treating
-    that as "guest" aborted a healthy run.
+    And a "Sign in" CONTROL proves nothing either - MEASURED 2026-11-05: the
+    Google account menu of a signed-in page contains exactly such an entry.
 
-    The proof is the URL, or a VISIBLE sign-in control.
+    The proof is the URL, or the ABSENCE of every signed-in signal on a page
+    that really offers a sign-in. Because the sidebar needs a moment to
+    render, the absence is confirmed over a short window before it counts.
     """
     try:
         url = (page.url or "").lower()
@@ -2122,20 +2146,30 @@ def _gemini_page_is_guest(page) -> bool:
         )
     ):
         return True
-    # A visible sign-in control with a SHORT label. A chat bubble that merely
-    # contains the word must never match.
+
+    deadline = time.monotonic() + max(0.0, float(wait_seconds))
+    while True:
+        if _has_signed_in_evidence(page):
+            return False
+        if time.monotonic() >= deadline:
+            break
+        try:
+            page.wait_for_timeout(2000)
+        except Exception:
+            time.sleep(2.0)
+
+    # No signed-in signal at all, and the page offers a sign-in: that is a
+    # real guest page.
     for sel in (
         "a[href*='ServiceLogin']",
         "button[aria-label*='Sign in']",
         "a[aria-label*='Sign in']",
         "button[aria-label*='Log in']",
         "a[aria-label*='Log in']",
-        "button[aria-label*='সাইন']",
-        "a[aria-label*='সাইন']",
     ):
         try:
             loc = page.locator(sel)
-            for i in range(min(loc.count(), 4)):
+            for i in range(min(loc.count(), 3)):
                 el = loc.nth(i)
                 if not _safe_visible(el):
                     continue
@@ -2144,15 +2178,6 @@ def _gemini_page_is_guest(page) -> bool:
                     return True
         except Exception:
             continue
-    try:
-        sign_in_text = page.get_by_text(
-            re.compile(r"^(sign in|log in|সাইন ?ইন)$", re.IGNORECASE)
-        )
-        for i in range(min(sign_in_text.count(), 3)):
-            if _safe_visible(sign_in_text.nth(i)):
-                return True
-    except Exception:
-        pass
     return False
 
 
