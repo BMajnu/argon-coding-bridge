@@ -5093,9 +5093,16 @@ def _start_fresh_chat(page, slot: str, isolated_profile: bool = True) -> bool:
                 return True
         except Exception:
             continue
-    # The bare URL already opens a fresh conversation.
-    print("[+] Started a NEW chat.")
-    return True
+    # The bare URL does NOT open a fresh conversation - it RESTORES the
+    # account's last one. MEASURED 2026-11-04: without the 'New chat' control
+    # the prompt would be pasted into somebody else's chat.
+    print(
+        "[!] Could not find the 'New chat' control - Gemini's bare app URL "
+        "RESTORES the account's last conversation, so no fresh chat was "
+        "started.",
+        file=sys.stderr,
+    )
+    return False
 
 
 def _carry_over_to_new_session(
@@ -5989,6 +5996,38 @@ def dispatch_to_argon(
 
             page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
             page.wait_for_timeout(2000)
+
+            # A NEW session must open a GENUINELY new conversation. The bare
+            # app URL restores the account's last conversation, so without this
+            # the prompt is pasted into somebody else's chat.
+            if not resume_chat and not is_continuation:
+                before_id = _extract_chat_id(page.url or "")
+                _isolated = (
+                    _profile_is_isolated_slot(profile_dir)
+                    if profile_dir is not None
+                    else True
+                )
+                if not _start_fresh_chat(page, active_slot, isolated_profile=_isolated):
+                    print(
+                        "[!] No fresh chat could be started, so the prompt would "
+                        "land in the account's last conversation. Refusing to "
+                        "send.",
+                        file=sys.stderr,
+                    )
+                    _take_step_screenshot(page, proj_root, "preflight_failure.png")
+                    task_state_store.set(proj_root, state="preflight_failed")
+                    return EXIT_FAILURE
+                after_id = _extract_chat_id(page.url or "")
+                if before_id and after_id == before_id:
+                    print(
+                        "[!] The 'New chat' control did not create a new "
+                        "conversation (the chat id is unchanged), so the prompt "
+                        "would land in the previous one. Refusing to send.",
+                        file=sys.stderr,
+                    )
+                    _take_step_screenshot(page, proj_root, "preflight_failure.png")
+                    task_state_store.set(proj_root, state="preflight_failed")
+                    return EXIT_FAILURE
 
             if not _wait_for_workspace(page):
                 print(
