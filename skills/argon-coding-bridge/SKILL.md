@@ -69,163 +69,79 @@ out which one is better and which good parts of the two can be combined.
 
 ## The production workflow
 
-Every production run follows these numbered steps in order. The agent owns the
-task registry (`~/.gemini/argon_tasks.json`) and must execute the registry mark
-steps explicitly rather than relying on terminal text or process exit codes.
+Work through these steps ONE AT A TIME. Do not fire a batch of commands.
 
-### Step 1: Check the Task Registry and mark the task STARTED (`--register-task-start`)
+### Step 1 - Mark the task started
+Command:  `python "./skills/argon-coding-bridge/scripts/dispatch_argon.py" --project-path . --register-task-start --label "<one line: what you are about to ask for>"`
+Why:  the registry is what tells you (and the next run) which account is
+      already busy. It is the ONLY source of truth for "is this slot free".
 
-- **What the bridge does**: Reads `~/.gemini/argon_tasks.json` (`TaskRegistry`)
-  and `~/.gemini/argon_task_state.json` (`TaskState`), surfaces any `STALE`
-  tasks (with their age and screenshot path), enforces the per-account limit of
-  at most **two concurrent tasks per slot** (`MAX_TASKS_PER_SLOT = 2`), selects
-  the slot using the Account Policy (a NEW task always picks a different free
-  account than the one that just ran; a FOLLOW-UP stays on the account that
-  holds the winning conversation), and records the new task entry as `running`.
-- **What the AGENT must do**:
-  1. Run `--list-tasks` (or `--register-task-start`) **before** starting the
-     first dispatch so the task is registered in `~/.gemini/argon_tasks.json`:
-     ```powershell
-     python "./skills/argon-coding-bridge/scripts/dispatch_argon.py" --project-path "<ABSOLUTE_PROJECT_PATH>" --register-task-start --task-label "<short label>"
-     ```
-  2. If any stale or already-running task is reported for this project (`exit code 9`,
-     `EXIT_ALREADY_RUNNING`), **read the reported step screenshot with your image
-     reader** to inspect the live conversation state before choosing `--resume`
-     or `--force`.
-- **What to do when it fails**:
-  - If `EXIT_ALREADY_RUNNING (9)` is returned because a task is already `sent`
-    or `waiting`, run with `--resume` to wait for the in-flight answer, or pass
-    `--force` only after confirming the previous task should be abandoned/superseded.
-  - If a slot has reached `2/2` running tasks, allow the bridge to pick the next
-    free pool account or close finished/stale tasks with `--register-task-done`.
+### Step 2 - Send the FOLLOW-UP first
+Command:  `python "./skills/argon-coding-bridge/scripts/dispatch_argon.py" --project-path . --task "<task>" --slot "<the account that holds the chat>" --lane followup`
+Why:  the follow-up runs in the conversation that already knows this codebase.
+      Send this one FIRST and let it finish.
 
-### Step 2: Atomic archive packaging (`package_context.py`)
+### Step 3 - CHECK the follow-up before you go on
+Read the screenshot of the run (the path is printed) and check three things:
+  a. the conversation was in TASK mode (not Chat),
+  b. the model chip said 4 Argon,
+  c. Argon produced a real answer, not a chat-style reply.
+If anything is wrong, FIX IT FIRST and send the follow-up again.
+Only when the follow-up is confirmed good do you continue to Step 4.
 
-- **What the bridge does**: Scans the related codebase, writes `TASK_BRIEF.md`
-  and `argon_context.zip` to temporary files (`.tmp`) first, verifies that the
-  archive opens cleanly and contains `TASK_BRIEF.md` with zero credential files,
-  atomically moves the finished files into place via `os.replace`, and prints
-  both the entry count and exact byte size.
-- **What the AGENT must do**: Verify that the whole related codebase was
-  packaged (never a narrow subset) and confirm the printed byte size and entry
-  count are non-zero.
-- **What to do when it fails**: Fix the path or remove any accidentally staged
-  secret file reported by `_verify_zip_has_no_credentials`, then re-run.
+### Step 4 - Then run the NEW task
+Command:  `python "./skills/argon-coding-bridge/scripts/dispatch_argon.py" --project-path . --task "<task>" --new-session --slot "<another account>"`
+Why:  a new task belongs in a new conversation, on a different account, so the
+      two runs never collide.
 
-### Step 3: Workspace launch, new-chat verification, and pre-flight gate
+### Step 5 - Compare and apply
+Command:  `python "./skills/argon-coding-bridge/scripts/compare_argon_patches.py" --followup-patch "downloads/followup/apply_changes.ps1" --new-patch "downloads/new/apply_changes.ps1" --merge --pick new --apply`
+Why:  compares the follow-up delivery and the new-session delivery side by side,
+      combines their non-conflicting blocks (using `--pick new` or `--choices`
+      when conflicts exist), applies the resulting single-run patch, and runs
+      the local build verification once. Record the winning lane afterwards with:
+      `python "./skills/argon-coding-bridge/scripts/dispatch_argon.py" --project-path . --record-winner followup|new`
 
-- **What the bridge does**:
-  1. Launches Chrome on the isolated slot profile (`~/.gemini/argon_profiles/slot-uN`
-     at `/u/0/app`).
-  2. Checks guest status strictly via the URL (`accounts.google.com/signin`) or
-     a visible short-label sign-in button (never via body text substrings).
-  3. On a **NEW session**, clicks the sidebar's **New chat** control and verifies
-     that the conversation ID in the URL is NOT the restored previous chat of
-     that account.
-  4. On a **NEW chat**, **proves** Task mode and waits up to 45 s for the
-     `4 Argon` model chip to render and be selected; on a **CONTINUATION**,
-     **inherits** the conversation's mode and model when the switcher is absent
-     and prints which rule applied.
-  5. Attaches `argon_context.zip`, verifies the attached byte size and
-     `TASK_BRIEF.md` member against disk, waits until the upload spinner clears,
-     and saves `.argon_backup/shots/<NN>-preflight.png`.
-- **What the AGENT must do**: **Read `.argon_backup/shots/<NN>-preflight.png`
-  with its image reader** to confirm the page is signed in, in the expected
-  conversation, with `argon_context.zip` attached and upload finished.
-- **What to do when it fails**:
-  - On a new session, the dispatcher automatically rotates across all remaining
-    free pool accounts on any pre-flight, sign-in, busy, or quota failure and
-    prints why each skipped account was skipped.
-  - If all accounts fail pre-flight, read `.argon_backup/shots/<NN>-preflight_failure.png`
-    with your image reader and run `Open_Argon_Login.bat` if sessions expired.
+### Step 6 - Mark the task completed
+Command:  `python "./skills/argon-coding-bridge/scripts/dispatch_argon.py" --project-path . --register-task-done --label "<same label>"`
+Why:  releases the task in `~/.gemini/argon_tasks.json` so the next round sees
+      accurate slot load counts.
 
-### Step 4: Prompt submission and post-send verification
+### The rules that belong in this workflow
 
-- **What the bridge does**: Checks that the conversation does not already have
-  an unfinished running task (preventing silent superseding), pastes and sends
-  the prompt, saves `.argon_backup/shots/<NN>-sent.png`, records the prompt hash
-  and chat ID in `TaskState` (`lane`-scoped) and `TaskRegistry`, and notes that
-  the post-send model chip reverts to the account default. If the browser closes
-  during pre-flight, attach, paste, or send, it restarts the browser, reopens
-  the same conversation, and continues from the interrupted step.
-- **What the AGENT must do**: **Read `.argon_backup/shots/<NN>-sent.png` with
-  its image reader** to verify the prompt and attachment landed in the
-  conversation. Once sent, do **not** do extra coding work locally while waiting.
-- **What to do when it fails**: If the browser crashed before send and could not
-  recover, repeat the run (nothing was sent, so zero quota was used). If the
-  prompt was already sent, run with `--resume`.
-
-### Step 5: Waiting, single-capture toolbar download, and answer verification
-
-- **What the bridge does**:
-  1. Polls until `--deadline-seconds` (default 1800 s), printing both elapsed
-     and remaining time and saving periodic `.argon_backup/shots/<NN>-waiting-K.png`
-     screenshots. Never presses `Escape`, clicks Stop, or navigates away while
-     Argon is working.
-  2. Checks on every poll that no newer prompt superseded the task in the same
-     chat and checks whether Gemini stopped the response (`"You stopped this response"`).
-  3. Only inspects a delivery chip in an assistant turn **after the last user
-     message**, checks its SHA-256 against `DeliveryLedger`
-     (`~/.gemini/argon_delivery_ledger.json`), clicks **only** the Drive
-     viewer's own toolbar download button
-     (`div.drive-viewer-toolstrip-custom-panel .drive-viewer-custom-button`),
-     rejects 0-byte or unparseable files without overwriting any existing patch,
-     saves `.argon_backup/shots/<NN>-delivered.png`, closes the viewer, and
-     exits the capture loop immediately (**one capture, then stop**).
-  4. Verifies Argon answer evidence (delivery artifact, tool-call trace,
-     `$TargetRoot`, `## ROOT CAUSE`, `[Verified]`).
-- **What the AGENT must do**: **Read `.argon_backup/shots/<NN>-delivered.png`
-  (or the latest waiting/failure screenshot) with its image reader** before
-  deciding how to proceed.
-- **What to do when it fails**:
-  - If the deadline is reached while Argon is **still working**, the bridge
-    keeps `state="waiting"` and prints the `--resume` command. Run `--resume`
-    to continue waiting without losing work.
-  - If Gemini reported `"You stopped this response"`, re-run or send a follow-up
-    asking Argon to deliver `apply_changes.ps1`.
-
-### Step 6: Side-by-side comparison, surgical merge, and local verification
-
-- **What the bridge does**: On a dual run (`--dual`), writes both patches to
-  `downloads/dual/<round-id>/followup/apply_changes.ps1` and
-  `downloads/dual/<round-id>/new/apply_changes.ps1` and generates
-  `comparison.html` and `merged_apply_changes.ps1` via `compare_argon_patches.py`.
-  Applies the chosen or merged patch via `Run-ArgonPatch.ps1` and runs the
-  local build/lint verification command once.
-- **What the AGENT must do**: Compare fast, apply the merged good parts (or the
-  winner alone if the other side carries errors), record the winning lane with
-  `--record-winner followup|new`, and fix small post-apply errors locally (or
-  send a follow-up to Argon if the number of errors is large).
-- **What to do when it fails**: Roll back with `Apply-ArgonPatch.ps1 -Rollback`
-  if needed, or dispatch a follow-up with the measured diagnostics.
-
-### Step 7: Mark the task COMPLETED in the Task Registry (`--register-task-done`)
-
-- **What the bridge does**: Updates `TaskRegistry` (`~/.gemini/argon_tasks.json`)
-  and `TaskState` (`~/.gemini/argon_task_state.json`).
-- **What the AGENT must do**: Explicitly mark the task completed in
-  `~/.gemini/argon_tasks.json` when the round's work is done so the slot is
-  released cleanly:
-  ```powershell
-  python "./skills/argon-coding-bridge/scripts/dispatch_argon.py" --project-path "<ABSOLUTE_PROJECT_PATH>" --register-task-done
-  ```
-- **What to do when it fails**: Run `--list-tasks` to inspect any remaining
-  `running` or `[STALE]` entries and close them with `--register-task-done`.
+1. **The follow-up always goes to the account that holds the chat** - never
+   rotated. Even when that account is already busy with two tasks, that chat
+   lives there, so USE it and say so in one line. Do not refuse, do not block:
+   the work needs that conversation.
+2. **A new task prefers an account that is not busy.** When several accounts
+   are free, pick one of those. When the only free slot is busy, or when no
+   account is free, the run continues on the least loaded account and PRINTS
+   the reason. **Never refuse to work because an account is busy.**
+3. **At most two concurrent tasks per account** - that is the limit, not a
+   wall. A third task on the same account should be avoided, not blocked.
+4. **Never send a prompt in Chat mode.** If the mode cannot be proven, the
+   agent opens a NEW chat, switches it to Task, and checks the chip before it
+   sends.
+5. **Read the step screenshot before every decision.** The terminal line is a
+   summary; the screenshot is the evidence.
 
 ### Troubleshooting Table (Symptom -> Root Cause -> Action)
 
 | Symptom | Root Cause | Action |
 |---|---|---|
-| **Old delivery downloaded again** | A previous round's `apply_changes.ps1` chip remains in the conversation DOM and a capture path did not check `DeliveryLedger` or opened a chip before the last user message. | `DeliveryLedger` (`~/.gemini/argon_delivery_ledger.json`) and `_element_is_after_last_user_turn` now refuse known SHA-256 digests and chips prior to the last user turn; keep waiting with `--resume` until the new turn's chip appears. |
+| **The answer is a chat-style reply instead of work** | The prompt went out in Chat mode. | Open a new chat (`--new-session`), switch it to Task mode, check the `4 Argon` chip in `.argon_backup/shots/<NN>-preflight.png`, and resend. |
+| **Gemini says the archive is unreadable / binary data** | Binary files (fonts, images, media, or non-UTF-8 data) were included in the archive. | The packager must exclude every binary file by extension and 8 KB NUL/UTF-8 content check and enforce the archive cap; re-run `package_context.py` to rebuild `argon_context.zip`. |
+| **The prompt landed in an old conversation** | The new chat was not verified empty after loading. | The run must verify after the conversation loads that there are zero user messages and zero assistant turns and report the `chat_id` it used; re-run with `--new-session`. |
+| **Old delivery downloaded again** | A previous round's `apply_changes.ps1` chip remains in the conversation DOM and a capture path did not check `DeliveryLedger` or opened a chip before the last user message. | `DeliveryLedger` (`~/.gemini/argon_delivery_ledger.json`) and `_element_is_after_last_user_turn` refuse known SHA-256 digests and chips prior to the last user turn; keep waiting with `--resume` until the new turn's chip appears. |
 | **No download after the task finished** | Argon finished answering inline or the viewer toolbar button did not trigger before timeout. | Read `.argon_backup/shots/<NN>-delivered.png` or `failed.png`; if a chip is visible in the newest turn, run `--resume` to capture it or download `apply_changes.ps1` from the viewer toolbar and run `Open_Argon_Apply.bat`. |
-| **Browser opens again and again** | A retry loop re-opened the preview or re-dispatched without checking `TaskState` / `DeliveryLedger`. | Single-capture mode exits immediately after one valid toolbar download, and `EXIT_ALREADY_RUNNING (9)` blocks duplicate dispatches. Use `--list-tasks` to inspect active runs. |
-| **A task is already running on this account (`EXIT_ALREADY_RUNNING = 9`)** | `TaskState` or `TaskRegistry` shows an in-flight `sent` or `waiting` task for this project/lane. | Read the printed screenshot path with your image reader; run `--resume` to wait for the running task, or pass `--force` to explicitly mark the old task `superseded` and start fresh. |
+| **Browser opens again and again** | A retry loop re-opened the preview or re-dispatched without checking `TaskState` / `DeliveryLedger`. | Single-capture mode exits immediately after one valid toolbar download. Use `--list-tasks` to inspect active runs. |
+| **A task is already running on this account (`EXIT_ALREADY_RUNNING = 9`)** | `TaskState` or `TaskRegistry` shows an in-flight `sent` or `waiting` task for this exact project/lane. | Read the printed screenshot path with your image reader; run `--resume` to wait for the running task, or pass `--force` to explicitly mark the old task `superseded` and start fresh. |
 | **Account is quota-limited (`EXIT_QUOTA_LIMITED = 5`)** | The account hit its Gemini 4 Argon usage limit or `'4 Argon'` is `aria-disabled` in the model picker. | The bridge automatically marks the slot `quota_limited` in `accounts_pool.json` and rotates to the next free pool account. Add more accounts via `Open_Argon_Login.bat` (Import Box / Load from `.txt`) if all slots are exhausted. |
 | **Model chip says something else than Argon** | Before send: the picker did not switch to `4 Argon`. After send: the chip naturally reverts to the account default (e.g. `Flash`). | Before send, pre-flight waits up to 45 s for the chip and refuses to send if it is not `4 Argon`. After send, check the answer evidence (`_verify_argon_answer_evidence`), not the post-send chip. |
-| **Slot is busy (`EXIT_SLOT_BUSY = 7`)** | Either Chrome is open on that slot profile (`SingletonLock` / `slot-uN.lock`) or `TaskRegistry` (`~/.gemini/argon_tasks.json`) shows `2/2` active tasks on that slot. | Allow the dispatcher to rotate to the next pool slot, or run `--list-tasks` and `--register-task-done` to clear finished/stale tasks. |
+| **Account is busy with running tasks** | Another task is already active on that slot in `TaskRegistry` or Chrome is open on the slot profile. | Never block: a follow-up uses the account that holds the chat and says so in one line; a new task picks a free account or falls back to the least-loaded account and prints the reason. |
 | **Delivery is truncated or 0 bytes** | The browser handed over a 0-byte download or an incomplete script missing `[SUCCESS]` / balanced `@'...'@` blocks. | `_validate_and_save_download` stages downloads and rejects `< 64`-byte files without overwriting good patches, and `_patch_is_complete` verifies payload parsing. Re-run with `--resume` to re-capture from the viewer toolbar. |
 | **Second prompt superseded an unfinished task** | Another prompt was sent into the same conversation while the earlier task was still `sent` or `waiting`. | `_check_superseded_prompt` detects the newer user message in the DOM, marks the earlier task `superseded` in `TaskState` and `TaskRegistry`, and stops waiting immediately. |
-| **New session opened a foreign conversation** | Navigating to `/u/0/app` restored the account's previous chat from another project. | `_start_fresh_chat` now clicks the sidebar **New chat** button and verifies the URL chat ID is not in `_known_chat_ids_for_slot` before attaching or pasting anything. |
+| **New session opened a foreign conversation** | Navigating to `/u/0/app` restored the account's previous chat from another project. | `_start_fresh_chat` waits for the conversation to finish loading, clicks the sidebar **New chat** button, verifies zero user/assistant turns and that the URL chat ID is not in `_known_chat_ids_for_slot`, and reports the chat ID if it cannot prove the chat is empty. |
 
 ---
 

@@ -70,11 +70,86 @@ SOURCE_EXTENSIONS = {
 }
 
 DEFAULT_EXCLUDED_EXTS = {
-    ".zip", ".tar", ".gz", ".7z", ".rar", ".exe", ".dll", ".so", ".dylib",
-    ".pdf", ".mp4", ".mkv", ".mov", ".avi", ".mp3", ".wav",
-    ".iso", ".bin", ".pyc", ".class", ".apk", ".aab", ".ipa",
-    ".sqlite", ".sqlite3", ".db", ".o", ".obj", ".pdb", ".lib", ".a"
+    # Archives & packages
+    ".zip", ".tar", ".gz", ".7z", ".rar", ".bz2", ".xz", ".zst", ".tgz", ".tbz2",
+    ".whl", ".egg", ".jar", ".war", ".ear", ".apk", ".aab", ".ipa", ".msi", ".dmg",
+    ".pkg", ".deb", ".rpm",
+    # Binaries, executables, libraries & compiled objects
+    ".exe", ".dll", ".so", ".dylib", ".iso", ".bin", ".pyc", ".pyo", ".pyd",
+    ".class", ".o", ".obj", ".pdb", ".lib", ".a", ".wasm", ".node", ".rlib",
+    ".rmeta", ".dill", ".dex", ".ko", ".elf",
+    # Fonts (E1: 90 .ttf fonts poisoned the BM Typer archive)
+    ".ttf", ".otf", ".woff", ".woff2", ".eot", ".fon", ".fnt",
+    # Images, icons & design binaries (E1: 65 .png images poisoned the BM Typer archive)
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico", ".icns", ".tiff",
+    ".tif", ".avif", ".heic", ".heif", ".psd", ".ai", ".eps", ".raw", ".cr2", ".nef",
+    # Audio & video media
+    ".mp4", ".mkv", ".mov", ".avi", ".webm", ".flv", ".wmv", ".m4v", ".3gp",
+    ".mpg", ".mpeg", ".ogv", ".mp3", ".wav", ".ogg", ".oga", ".flac", ".aac",
+    ".m4a", ".wma", ".opus",
+    # Databases, binary data, office docs & ML weights
+    ".pdf", ".sqlite", ".sqlite3", ".db", ".doc", ".docx", ".xls", ".xlsx",
+    ".ppt", ".pptx", ".onnx", ".pt", ".pth", ".pb", ".tflite", ".h5",
+    ".safetensors", ".gguf", ".parquet", ".feather", ".arrow", ".npy", ".npz",
+    ".pkl", ".pickle", ".dat", ".pak", ".idx", ".pack",
 }
+
+BINARY_CHECK_BYTES = 8192
+DEFAULT_MAX_ARCHIVE_MB = 20
+DEFAULT_MAX_ARCHIVE_ENTRIES = 400
+
+
+def is_binary_file(path: Path, sample_bytes: int = BINARY_CHECK_BYTES) -> tuple[bool, str]:
+    """Return (True, reason) when `path` is binary by extension or content (E1).
+
+    A file whose extension is in DEFAULT_EXCLUDED_EXTS, whose first 8 KB contain
+    a NUL byte (0x00), or whose content is not valid UTF-8 is treated as binary
+    and excluded so Gemini never ingests raw binary bytes inside the zip.
+    """
+    ext = path.suffix.lower()
+    if ext in DEFAULT_EXCLUDED_EXTS:
+        return True, f"binary/media extension: {ext}"
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(sample_bytes)
+            if b"\x00" in head:
+                return True, "binary content: NUL byte in first 8 KB"
+            import codecs as _codecs
+
+            dec = _codecs.getincrementaldecoder("utf-8")("strict")
+            dec.decode(head, final=len(head) < sample_bytes)
+            while True:
+                chunk = fh.read(65536)
+                if not chunk:
+                    dec.decode(b"", final=True)
+                    break
+                if b"\x00" in chunk:
+                    return True, "binary content: NUL byte in file"
+                dec.decode(chunk, final=False)
+    except UnicodeDecodeError:
+        return True, "binary content: not valid UTF-8"
+    except OSError as exc:
+        return True, f"unreadable file: {exc}"
+    return False, ""
+
+
+def _score_candidate_for_cap(rel: Path, full_path: Path, size_bytes: int, task_tokens: set[str]) -> tuple:
+    """Rank candidate files so the archive cap keeps the largest, most relevant source files (E1.2)."""
+    rel_posix = rel.as_posix().lower()
+    ext = rel.suffix.lower()
+    is_decl_src = 1 if ext in DECLARATION_EXTENSIONS else 0
+    is_src = 1 if is_source_file(full_path) else 0
+    task_hits = sum(1 for tok in task_tokens if tok in rel_posix)
+    parts_low = {p.lower() for p in rel.parts[:-1]}
+    in_low_priority = 1 if (parts_low & {"test", "tests", "__tests__", "examples", "example", "docs", "fixtures", "benchmarks"}) else 0
+    return (
+        is_decl_src,
+        is_src,
+        task_hits,
+        -in_low_priority,
+        size_bytes,
+        -len(rel.parts),
+    )
 
 NO_GUESSING_DIRECTIVE = (
     "If something you need is not in this archive - a file, an API endpoint, a\n"
@@ -513,6 +588,10 @@ def _compose_task_brief(
     selected_files: list[Path],
     excluded_files: list[tuple[str, str]],
     base_brief: str,
+    cap_excluded_files: list[tuple[str, str]] | None = None,
+    binary_skipped_count: int = 0,
+    max_archive_mb: int = DEFAULT_MAX_ARCHIVE_MB,
+    max_entries: int = DEFAULT_MAX_ARCHIVE_ENTRIES,
 ) -> str:
     h2 = "#" * 2
     h3 = "#" * 3
@@ -590,6 +669,18 @@ def _compose_task_brief(
         "them, say so - do not guess.",
         "",
     ]
+    if cap_excluded_files:
+        excl_lines.extend([
+            f"{h3} ARCHIVE CAP REACHED ({len(cap_excluded_files)} file(s) omitted by {max_entries}-entry / {max_archive_mb} MB cap)",
+            "",
+            "The archive reached its hard cap, so the packager kept the largest, most relevant",
+            "source files and left out the following files (if you need any of them, name it",
+            "explicitly and do not guess):",
+            "",
+        ])
+        for rel_str, reason in cap_excluded_files:
+            excl_lines.append(f"{bullet} {rel_str:<32} ({reason})")
+        excl_lines.append("")
     if excluded_files:
         for rel_str, reason in excluded_files:
             excl_lines.append(f"{bullet} {rel_str:<32} ({reason})")
@@ -619,7 +710,9 @@ def package_context(
     output_zip: str,
     task_description: str = "",
     target_files=None,
-    max_size_mb: int = 50,
+    max_size_mb: int = 20,
+    max_archive_mb: int = DEFAULT_MAX_ARCHIVE_MB,
+    max_entries: int = DEFAULT_MAX_ARCHIVE_ENTRIES,
 ):
     proj_root = Path(project_path).resolve()
     if not proj_root.exists():
@@ -627,14 +720,25 @@ def package_context(
         sys.exit(1)
 
     max_bytes = max_size_mb * 1024 * 1024
-    selected_files: list[Path] = []
+    max_archive_bytes = max(1, int(max_archive_mb)) * 1024 * 1024
+    max_archive_entries = max(1, int(max_entries))
+    candidate_files: list[tuple[Path, int]] = []
     seen_rel: set[str] = set()
     excluded_files: list[tuple[str, str]] = []
+    cap_excluded_files: list[tuple[str, str]] = []
+    binary_skipped_count = 0
+    cap_skipped_count = 0
 
-    def _record_excluded(rel: Path, reason: str) -> None:
+    def _record_excluded(rel: Path, reason: str, is_binary: bool = False, is_cap: bool = False) -> None:
+        nonlocal binary_skipped_count, cap_skipped_count
         rel_posix = rel.as_posix()
         print(f"  [-] Excluded: {rel_posix:<36} ({reason})")
         excluded_files.append((rel_posix, reason))
+        if is_binary:
+            binary_skipped_count += 1
+        if is_cap:
+            cap_skipped_count += 1
+            cap_excluded_files.append((rel_posix, reason))
 
     if target_files:
         print("[+] Packaging targeted files...")
@@ -652,8 +756,9 @@ def package_context(
                 if is_generated_artefact(rel):
                     _record_excluded(rel, "Argon workflow artefact")
                     continue
-                if p.suffix.lower() in DEFAULT_EXCLUDED_EXTS:
-                    _record_excluded(rel, f"binary/archive extension: {p.suffix.lower()}")
+                is_bin, bin_reason = is_binary_file(p)
+                if is_bin:
+                    _record_excluded(rel, bin_reason, is_binary=True)
                     continue
                 sz = p.stat().st_size
                 if sz > max_bytes:
@@ -661,7 +766,7 @@ def package_context(
                     _record_excluded(rel, f"oversized: {mb} MB")
                     continue
                 seen_rel.add(rel_key)
-                selected_files.append(rel)
+                candidate_files.append((rel, sz))
     else:
         print("[+] Scanning project tree (preserving all source files and reporting exclusions)...")
         git_files = get_git_files(str(proj_root))
@@ -697,7 +802,7 @@ def package_context(
                     _record_excluded(rel, "Argon workflow artefact")
                     continue
                 if p.suffix.lower() in DEFAULT_EXCLUDED_EXTS:
-                    _record_excluded(rel, f"binary/archive extension: {p.suffix.lower()}")
+                    _record_excluded(rel, f"binary/media extension: {p.suffix.lower()}", is_binary=True)
                     continue
                 if is_in_ambiguous_dir(rel) and not is_source_file(p):
                     _record_excluded(rel, f"non-source file in ambiguous dir ({p.suffix.lower() or 'no ext'})")
@@ -719,8 +824,49 @@ def package_context(
                     mb = max(1, int(round(sz / (1024 * 1024))))
                     _record_excluded(rel, f"oversized: {mb} MB")
                     continue
+                is_bin, bin_reason = is_binary_file(p)
+                if is_bin:
+                    _record_excluded(rel, bin_reason, is_binary=True)
+                    continue
                 seen_rel.add(rel_key)
-                selected_files.append(rel)
+                candidate_files.append((rel, sz))
+
+    # E1.2: Enforce hard archive cap on entry count (max_entries) and total bytes (max_archive_bytes).
+    # Reserve 2 entries for TASK_BRIEF.md and API_INDEX.md so they are ALWAYS present.
+    max_source_entries = max(1, max_archive_entries - 2)
+    total_candidate_bytes = sum(sz for _, sz in candidate_files)
+    if len(candidate_files) > max_source_entries or total_candidate_bytes > max_archive_bytes:
+        task_tokens = {
+            tok.lower()
+            for tok in re.findall(r"[A-Za-z0-9_./-]{3,}", task_description or "")
+        }
+        ranked_candidates = sorted(
+            candidate_files,
+            key=lambda item: _score_candidate_for_cap(item[0], proj_root / item[0], item[1], task_tokens),
+            reverse=True,
+        )
+        kept_files: list[Path] = []
+        running_bytes = 0
+        for rel, sz in ranked_candidates:
+            if len(kept_files) >= max_source_entries:
+                _record_excluded(
+                    rel,
+                    f"skipped by archive cap: entry limit ({max_archive_entries} max entries) reached; kept higher-priority source files",
+                    is_cap=True,
+                )
+                continue
+            if running_bytes + sz > max_archive_bytes:
+                _record_excluded(
+                    rel,
+                    f"skipped by archive cap: size limit ({max_archive_mb} MB max) reached (file size {_format_size(sz)})",
+                    is_cap=True,
+                )
+                continue
+            kept_files.append(rel)
+            running_bytes += sz
+        selected_files = sorted(kept_files, key=lambda p: p.as_posix().lower())
+    else:
+        selected_files = [rel for rel, _ in candidate_files]
 
     out_zip_path = Path(output_zip).resolve()
     out_zip_path.parent.mkdir(parents=True, exist_ok=True)
@@ -808,10 +954,19 @@ $TargetRoot = '{proj_root}'
 """
         api_index_text = build_api_index(proj_root, selected_files)
         zf.writestr("API_INDEX.md", api_index_text)
-        brief_text = _compose_task_brief(proj_root, selected_files, excluded_files, brief_text)
+        brief_text = _compose_task_brief(
+            proj_root,
+            selected_files,
+            excluded_files,
+            brief_text,
+            cap_excluded_files=cap_excluded_files,
+            binary_skipped_count=binary_skipped_count,
+            max_archive_mb=max_archive_mb,
+            max_entries=max_archive_entries,
+        )
         zf.writestr("TASK_BRIEF.md", brief_text)
 
-    # D13.2: Write TASK_BRIEF.md atomically via a temporary file + os.replace
+    # D13.2: Write TASK_BRIEF.md and API_INDEX.md atomically via temporary files + os.replace
     try:
         local_brief = proj_root / "TASK_BRIEF.md"
         tmp_brief = local_brief.with_name(f".TASK_BRIEF.md.{os.getpid()}.tmp")
@@ -819,21 +974,37 @@ $TargetRoot = '{proj_root}'
         os.replace(str(tmp_brief), str(local_brief))
     except Exception:
         pass
+    try:
+        local_api = proj_root / "API_INDEX.md"
+        tmp_api = local_api.with_name(f".API_INDEX.md.{os.getpid()}.tmp")
+        tmp_api.write_text(api_index_text, encoding="utf-8")
+        os.replace(str(tmp_api), str(local_api))
+    except Exception:
+        pass
 
-    # D13.1: Verify temporary zip archive and move into place atomically (os.replace)
+    # E1.3 & D13.1: Verify TASK_BRIEF.md and API_INDEX.md are both present and readable UTF-8 before os.replace
     with zipfile.ZipFile(tmp_zip_path, "r") as verify_zf:
         archive_members = verify_zf.namelist()
-        if "TASK_BRIEF.md" not in archive_members:
-            raise RuntimeError("Packaged archive is missing TASK_BRIEF.md")
+        for required_member in ("TASK_BRIEF.md", "API_INDEX.md"):
+            if required_member not in archive_members:
+                raise RuntimeError(f"Packaged archive is missing required {required_member}")
+            raw_member = verify_zf.read(required_member)
+            if not raw_member or b"\x00" in raw_member:
+                raise RuntimeError(f"Packaged archive member {required_member} is empty or contains NUL bytes")
+            decoded_member = raw_member.decode("utf-8", errors="strict")
+            if not decoded_member.strip():
+                raise RuntimeError(f"Packaged archive member {required_member} is blank after UTF-8 decode")
     os.replace(str(tmp_zip_path), str(out_zip_path))
 
     size_bytes = out_zip_path.stat().st_size
     size_kb = round(size_bytes / 1024, 2)
     total_entries = len(archive_members)
     print(
-        f"[SUCCESS] Packaged {len(selected_files)} clean files "
-        f"({total_entries} total entries, {size_bytes} bytes / {size_kb} KB) to {out_zip_path}"
+        f"[SUCCESS] Packaged {len(selected_files)} source files | "
+        f"entries={total_entries}, bytes={size_bytes} ({size_kb} KB), "
+        f"binary files skipped={binary_skipped_count}, files skipped by cap={cap_skipped_count} -> {out_zip_path}"
     )
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Package codebase context for Gemini 4 Argon")
@@ -841,7 +1012,17 @@ if __name__ == "__main__":
     parser.add_argument("--output-zip", default="argon_context.zip", help="Output zip filename")
     parser.add_argument("--task", default="", help="Task description or goal")
     parser.add_argument("--files", nargs="*", default=None, help="Specific target files/patterns")
-    parser.add_argument("--max-size-mb", type=int, default=50, help="Max file size in MB (default: 50)")
+    parser.add_argument("--max-size-mb", type=int, default=20, help="Max single file size in MB (default: 20)")
+    parser.add_argument("--max-archive-mb", type=int, default=DEFAULT_MAX_ARCHIVE_MB, help="Max total archive size in MB (default: 20)")
+    parser.add_argument("--max-entries", type=int, default=DEFAULT_MAX_ARCHIVE_ENTRIES, help="Max total archive entries (default: 400)")
     args = parser.parse_args()
 
-    package_context(args.project_path, args.output_zip, args.task, args.files, args.max_size_mb)
+    package_context(
+        args.project_path,
+        args.output_zip,
+        args.task,
+        args.files,
+        args.max_size_mb,
+        max_archive_mb=args.max_archive_mb,
+        max_entries=args.max_entries,
+    )

@@ -2834,11 +2834,13 @@ def _profile_is_busy(profile_dir: Path) -> bool:
     return False
 
 
-def _copy_profile(profile_dir: Path, target) -> Optional[Path]:
+def _copy_profile(profile_dir: Path, target, allow_busy: bool = False) -> Optional[Path]:
     """Copy the browser profile so this run gets its own browser instance.
 
     The copy keeps the same signed-in account and cookies, but nobody else's
-    browser can close it and it cannot close theirs.
+    browser can close it and it cannot close theirs. When `allow_busy=True`,
+    allows snapshotting an active slot profile for a second concurrent task on
+    the same account without blocking (Section 3: No Hard Blocking).
     """
     profile_dir = Path(profile_dir)
     target = Path(target)
@@ -2854,7 +2856,7 @@ def _copy_profile(profile_dir: Path, target) -> Optional[Path]:
         except Exception:
             return dst
 
-    if _profile_is_busy(profile_dir):
+    if not allow_busy and _profile_is_busy(profile_dir):
         print(
             f"[!] Refusing to copy busy profile {profile_dir}: close the running browser first.",
             file=sys.stderr,
@@ -2882,7 +2884,7 @@ def _copy_profile(profile_dir: Path, target) -> Optional[Path]:
         )
         if not target.is_dir():
             return None
-        if not _copy_sqlite_databases(profile_dir, target):
+        if not _copy_sqlite_databases(profile_dir, target, allow_busy=allow_busy):
             shutil.rmtree(target, ignore_errors=True)
             return None
         return target
@@ -2891,12 +2893,11 @@ def _copy_profile(profile_dir: Path, target) -> Optional[Path]:
         return None
 
 
-def _copy_sqlite_databases(src_root: Path, dst_root: Path) -> bool:
+def _copy_sqlite_databases(src_root: Path, dst_root: Path, allow_busy: bool = False) -> bool:
     """Copy the Chrome SQLite databases properly using SQLite's online backup API.
 
-    Returns False if a Cookies database exists in src_root but could not be
-    backed up (for instance because Chrome holds an exclusive lock on it), so
-    the caller never uses a signed-out profile copy.
+    When `allow_busy=True`, falls back to immutable read or direct byte copy if
+    another Chrome process holds a lock on the cookie file.
     """
     import sqlite3
 
@@ -2921,15 +2922,31 @@ def _copy_sqlite_databases(src_root: Path, dst_root: Path) -> bool:
                         sidecar.unlink()
                     except OSError:
                         pass
-            source = sqlite3.connect(f"file:{src.as_posix()}?mode=ro", uri=True)
             try:
-                target = sqlite3.connect(str(dst))
+                source = sqlite3.connect(f"file:{src.as_posix()}?mode=ro", uri=True)
                 try:
-                    source.backup(target)
+                    target = sqlite3.connect(str(dst))
+                    try:
+                        source.backup(target)
+                    finally:
+                        target.close()
                 finally:
-                    target.close()
-            finally:
-                source.close()
+                    source.close()
+            except Exception:
+                if not allow_busy:
+                    raise
+                try:
+                    source = sqlite3.connect(f"file:{src.as_posix()}?mode=ro&immutable=1", uri=True)
+                    try:
+                        target = sqlite3.connect(str(dst))
+                        try:
+                            source.backup(target)
+                        finally:
+                            target.close()
+                    finally:
+                        source.close()
+                except Exception:
+                    dst.write_bytes(src.read_bytes())
             if is_cookie_db and (not dst.is_file() or dst.stat().st_size == 0):
                 return False
         except Exception as exc:
@@ -3357,23 +3374,30 @@ class TaskRegistry:
         slot: Optional[str] = None,
         status: str = "completed",
         screenshot_path: str = "",
+        label: Optional[str] = None,
     ) -> int:
-        """Mark running task(s) for `project_path` (and optional `lane`/`slot`) as completed/abandoned/superseded (D4.2)."""
+        """Mark running task(s) for `project_path` (and optional `lane`/`slot`/`label`) as completed/abandoned/superseded (D4.2)."""
         self.load()
         wanted = _normalize_project_key(project_path)
         lane_str = (lane or "").strip().lower()
         norm_s = normalize_slot(slot) if slot else ""
+        label_str = (label or "").strip().lower()
         count = 0
         now_str = time.strftime("%Y-%m-%d %H:%M:%S")
-        for e in self.data.get("entries") or []:
-            if not isinstance(e, dict) or str(e.get("status") or "") != "running":
-                continue
-            if _normalize_project_key(e.get("project", "")) != wanted:
-                continue
-            if lane_str and str(e.get("lane") or "single").strip().lower() != lane_str:
-                continue
-            if norm_s and normalize_slot(str(e.get("slot") or "/u/0/")) != norm_s:
-                continue
+        matching_entries = [
+            e
+            for e in (self.data.get("entries") or [])
+            if isinstance(e, dict)
+            and str(e.get("status") or "") == "running"
+            and _normalize_project_key(e.get("project", "")) == wanted
+            and (not lane_str or str(e.get("lane") or "single").strip().lower() == lane_str)
+            and (not norm_s or normalize_slot(str(e.get("slot") or "/u/0/")) == norm_s)
+        ]
+        label_filtered = [
+            e for e in matching_entries if label_str and str(e.get("label") or "").strip().lower() == label_str
+        ]
+        target_entries = label_filtered if label_filtered else matching_entries
+        for e in target_entries:
             e["status"] = status
             e["completed_at"] = now_str
             e["updated_at"] = now_str
@@ -3539,8 +3563,9 @@ class SessionStore:
         profile_dir: str = "",
         lane: Optional[str] = None,
         patch_path: str = "",
+        workspace_mode: str = "",
     ) -> Optional[str]:
-        """Store the conversation for a project and return its chat URL.
+        """Store the conversation for a project (including its workspace_mode: 'task' / 'chat') and return its chat URL.
 
         The two dual lanes run as two processes and both write this store, so
         the read-modify-write is serialised with a lock file: otherwise the
@@ -3558,6 +3583,7 @@ class SessionStore:
                 profile_dir=profile_dir,
                 lane=lane,
                 patch_path=patch_path,
+                workspace_mode=workspace_mode,
             )
         finally:
             _release_session_store_lock(lock)
@@ -3572,6 +3598,7 @@ class SessionStore:
         profile_dir: str = "",
         lane: Optional[str] = None,
         patch_path: str = "",
+        workspace_mode: str = "",
     ) -> Optional[str]:
         """The body of remember(); the caller holds the store lock."""
         if not chat_id:
@@ -3583,6 +3610,9 @@ class SessionStore:
             resolved = str(project_path)
 
         clean_mode = (mode or "gemini").strip().lower()
+        clean_ws_mode = (workspace_mode or "").strip().lower()
+        if clean_ws_mode not in ("task", "chat"):
+            clean_ws_mode = ""
         slot_part = normalize_slot(slot) if slot else "/u/0/"
         url_slot = "/u/0/" if _profile_is_isolated_slot(profile_dir) else slot_part
         chat_url = f"https://gemini.google.com{url_slot}app/{chat_id}"
@@ -3612,6 +3642,8 @@ class SessionStore:
             "profile_number": _slot_number(slot_part),
             "updated_at": now_str,
         }
+        if clean_ws_mode:
+            lane_record["workspace_mode"] = clean_ws_mode
         if patch_path:
             lane_record["patch_path"] = str(patch_path)
 
@@ -3633,6 +3665,10 @@ class SessionStore:
             entry["profile_number"] = _slot_number(slot_part)
             entry["chat_id"] = str(chat_id)
             entry["chat_url"] = chat_url
+            if clean_ws_mode:
+                entry["workspace_mode"] = clean_ws_mode
+            elif str(prev_entry.get("chat_id") or "") != str(chat_id):
+                entry.pop("workspace_mode", None)
             if chat_title:
                 entry["chat_title"] = str(chat_title)
             if profile_dir:
@@ -3641,6 +3677,38 @@ class SessionStore:
         sessions[resolved] = entry
         self.save()
         return chat_url
+
+    def get_recorded_workspace_mode(
+        self,
+        project_path: Any,
+        chat_id: str = "",
+        lane: Optional[str] = None,
+        mode: Optional[str] = None,
+    ) -> str:
+        """Return the recorded workspace_mode ('task' or 'chat') for a stored conversation, or 'unknown' (E2.1, E2.2)."""
+        entry = self.lookup(project_path, mode=mode)
+        if not isinstance(entry, dict):
+            return "unknown"
+        wanted_cid = (chat_id or "").strip()
+        lanes = entry.get("lanes") if isinstance(entry.get("lanes"), dict) else {}
+        norm_lane = self.normalize_winner_lane(lane) if lane else None
+        if norm_lane and isinstance(lanes.get(norm_lane), dict):
+            l_data = lanes[norm_lane]
+            l_cid = str(l_data.get("chat_id") or "").strip()
+            l_ws = str(l_data.get("workspace_mode") or "").strip().lower()
+            if l_ws in ("task", "chat") and (not wanted_cid or l_cid == wanted_cid):
+                return l_ws
+        if wanted_cid:
+            for l_data in lanes.values():
+                if isinstance(l_data, dict) and str(l_data.get("chat_id") or "").strip() == wanted_cid:
+                    l_ws = str(l_data.get("workspace_mode") or "").strip().lower()
+                    if l_ws in ("task", "chat"):
+                        return l_ws
+        top_cid = str(entry.get("chat_id") or "").strip()
+        top_ws = str(entry.get("workspace_mode") or "").strip().lower()
+        if top_ws in ("task", "chat") and (not wanted_cid or top_cid == wanted_cid):
+            return top_ws
+        return "unknown"
 
     def remember_dual_round(
         self,
@@ -3751,6 +3819,7 @@ class SessionStore:
         url_slot = "/u/0/" if _profile_is_isolated_slot(win_prof) else win_slot
         win_url = str(winning_lane.get("chat_url") or f"https://gemini.google.com{url_slot}app/{win_cid}")
         win_title = str(winning_lane.get("chat_title") or entry.get("chat_title") or "")
+        win_ws_mode = str(winning_lane.get("workspace_mode") or entry.get("workspace_mode") or "").strip().lower()
 
         winning_lane["slot"] = win_slot
         winning_lane["profile_number"] = _slot_number(win_slot)
@@ -3760,6 +3829,8 @@ class SessionStore:
             winning_lane["chat_title"] = win_title
         if win_prof:
             winning_lane["profile_dir"] = win_prof
+        if win_ws_mode in ("task", "chat"):
+            winning_lane["workspace_mode"] = win_ws_mode
         lanes[norm_winner] = winning_lane
 
         entry["slot"] = win_slot
@@ -3770,6 +3841,8 @@ class SessionStore:
             entry["chat_title"] = win_title
         if win_prof:
             entry["profile_dir"] = win_prof
+        if win_ws_mode in ("task", "chat"):
+            entry["workspace_mode"] = win_ws_mode
         entry["lanes"] = lanes
         entry["winner"] = norm_winner
         entry["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -3778,14 +3851,21 @@ class SessionStore:
         return entry
 
     def get_winner(self, project_path: Any, mode: Optional[str] = None) -> Optional[Dict[str, Any]]:
-        """Return the recorded winning lane metadata for `project_path`, or None if no winner is recorded."""
+        """Return the recorded winning lane metadata for `project_path`, falling back to the stored project chat when unambiguous."""
         entry = self.lookup(project_path, mode=mode)
         if not isinstance(entry, dict):
             return None
+        lanes = entry.get("lanes") if isinstance(entry.get("lanes"), dict) else {}
         norm_winner = self.normalize_winner_lane(entry.get("winner"))
         if norm_winner not in ("followup", "new"):
-            return None
-        lanes = entry.get("lanes") if isinstance(entry.get("lanes"), dict) else {}
+            if isinstance(lanes.get("followup"), dict) and str(lanes["followup"].get("chat_id") or "").strip():
+                norm_winner = "followup"
+            elif str(entry.get("chat_id") or "").strip():
+                norm_winner = "followup"
+            elif isinstance(lanes.get("new"), dict) and str(lanes["new"].get("chat_id") or "").strip():
+                norm_winner = "new"
+            else:
+                return None
         lane_data = lanes.get(norm_winner) if isinstance(lanes.get(norm_winner), dict) else {}
         chat_id = str(lane_data.get("chat_id") or entry.get("chat_id") or "").strip()
         if not chat_id:
@@ -3794,6 +3874,9 @@ class SessionStore:
         prof_val = str(lane_data.get("profile_dir") or entry.get("profile_dir") or "")
         url_slot = "/u/0/" if _profile_is_isolated_slot(prof_val) else slot_val
         chat_url = str(lane_data.get("chat_url") or entry.get("chat_url") or f"https://gemini.google.com{url_slot}app/{chat_id}")
+        ws_mode = str(lane_data.get("workspace_mode") or entry.get("workspace_mode") or "unknown").strip().lower()
+        if ws_mode not in ("task", "chat"):
+            ws_mode = "unknown"
         return {
             "winner": norm_winner,
             "slot": slot_val,
@@ -3802,6 +3885,7 @@ class SessionStore:
             "chat_url": chat_url,
             "chat_title": str(lane_data.get("chat_title") or entry.get("chat_title") or ""),
             "profile_dir": prof_val,
+            "workspace_mode": ws_mode,
         }
 
 
@@ -3933,32 +4017,30 @@ def _element_state(el) -> str:
 
 
 def _mode_is_task(page) -> bool:
-    """Verify Task mode is active rather than Chat.
+    """Return True ONLY when the Chat/Task toggle is rendered on the page AND shows Task selected (E2).
 
-    The Material segmented control (gem-segmented-button) has NO aria-pressed
-    on the button itself. The active segment is marked on the PARENT with the
-    class `gem-segmented-button-selected`.
-
-    On a NEW chat the toggle is offered and Chat is the default, so a toggle
-    that exists and is not selected means Chat mode. On an EXISTING chat the
-    mode was fixed when the chat was created and no toggle is rendered at all -
-    there is nothing to check, so the inherited mode is accepted.
+    Never returns True when no toggle is rendered: a missing toggle means the
+    page's mode cannot be observed from the toggle alone (it may be an existing
+    Chat-mode conversation or a half-rendered page).
     """
     try:
         task = page.get_by_text(RE_TASK)
-        toggle_found = False
         for i in range(min(task.count(), 6)):
             el = task.nth(i)
             if not _safe_visible(el):
                 continue
-            toggle_found = True
             try:
                 marked = el.evaluate(
                     """e => {
                         let n = e;
                         for (let i = 0; i < 4 && n; i++, n = n.parentElement) {
                             const c = (n.getAttribute && (n.getAttribute('class') || '')) || '';
-                            if (/gem-segmented-button-selected/.test(c)) return c;
+                            const ap = (n.getAttribute && (n.getAttribute('aria-pressed') || '')) || '';
+                            const asel = (n.getAttribute && (n.getAttribute('aria-selected') || '')) || '';
+                            const achk = (n.getAttribute && (n.getAttribute('aria-checked') || '')) || '';
+                            if (/gem-segmented-button-selected/.test(c) || ap === 'true' || asel === 'true' || achk === 'true') {
+                                return c || 'selected';
+                            }
                         }
                         return '';
                     }"""
@@ -3967,13 +4049,45 @@ def _mode_is_task(page) -> bool:
                 marked = ""
             if marked:
                 return True
-        if not toggle_found:
-            # No Chat/Task toggle on the page: the conversation already runs in a
-            # fixed mode, so there is nothing to switch.
-            return True
     except Exception:
         pass
     return False
+
+
+def _observe_toggle_mode(page) -> str:
+    """Observe the visible Chat/Task toggle and return 'task', 'chat', or 'unknown' (E2)."""
+    if _mode_is_task(page):
+        return "task"
+    try:
+        chat_btn = page.get_by_text(RE_CHAT)
+        for i in range(min(chat_btn.count(), 6)):
+            el = chat_btn.nth(i)
+            if not _safe_visible(el):
+                continue
+            try:
+                marked = el.evaluate(
+                    """e => {
+                        let n = e;
+                        for (let i = 0; i < 4 && n; i++, n = n.parentElement) {
+                            const c = (n.getAttribute && (n.getAttribute('class') || '')) || '';
+                            const ap = (n.getAttribute && (n.getAttribute('aria-pressed') || '')) || '';
+                            const asel = (n.getAttribute && (n.getAttribute('aria-selected') || '')) || '';
+                            if (/gem-segmented-button-selected/.test(c) || ap === 'true' || asel === 'true') {
+                                return 'chat';
+                            }
+                        }
+                        return '';
+                    }"""
+                )
+            except Exception:
+                marked = ""
+            if marked:
+                return "chat"
+    except Exception:
+        pass
+    if _task_toggle_present(page):
+        return "chat"
+    return "unknown"
 
 
 def _retry(fn, page, attempts: int = 3, delay: float = 2.0) -> bool:
@@ -4619,22 +4733,35 @@ def select_task_mode(
     page,
     require_verifiable: Optional[bool] = None,
     wait_for_toggle_seconds: float = 30.0,
+    recorded_workspace_mode: Optional[str] = None,
 ) -> bool:
-    """Switch Gemini Web into Task mode: PROVEN on a new chat, INHERITED on a continuation (D11)."""
+    """Switch Gemini Web into Task mode and verify it (E2).
+
+    Rules (E2.1 - E2.4):
+      - On a NEW chat, the Chat/Task toggle must be present, switched to Task,
+        and observed in Task mode before any prompt is sent.
+      - On a CONTINUATION, if the toggle is visible and shows Task, Task mode is
+        observed directly. If the toggle is absent, Task mode is accepted ONLY
+        when the conversation's recorded `workspace_mode` in SessionStore is
+        `'task'`. If the recorded mode is `'unknown'` or `'chat'`, reports
+        `mode = Task : UNKNOWN` and returns False (never claims `mode = Task : OK`).
+    """
     if require_verifiable is None:
         is_cont = bool(getattr(page, "_argon_is_continuation", False))
         require_verifiable = not is_cont
 
-    deadline = time.monotonic() + (max(2.0, float(wait_for_toggle_seconds)) if require_verifiable else 3.0)
+    rec_mode = (
+        recorded_workspace_mode
+        if recorded_workspace_mode is not None
+        else str(getattr(page, "_argon_recorded_workspace_mode", "") or "")
+    ).strip().lower()
+
+    deadline = time.monotonic() + (max(2.0, float(wait_for_toggle_seconds)) if require_verifiable else 4.0)
     while True:
         try:
-            # On a NEW chat the mode must be PROVEN: the toggle has to be
-            # there AND show Task. `_mode_is_task()` alone returns True when
-            # no toggle is rendered at all, which would let a Chat-mode run
-            # through. On a continuation the inherited mode is accepted.
-            if _mode_is_task(page) and (
-                not require_verifiable or _task_toggle_present(page)
-            ):
+            if _mode_is_task(page):
+                setattr(page, "_argon_workspace_mode", "task")
+                setattr(page, "_argon_mode_status", "OK (observed toggle=Task)")
                 return True
             task_btn = page.get_by_text(RE_TASK)
             toggle_found = False
@@ -4647,15 +4774,20 @@ def select_task_mode(
                     el.click(timeout=3000)
                     page.wait_for_timeout(1400)
                     if _mode_is_task(page):
+                        setattr(page, "_argon_workspace_mode", "task")
+                        setattr(page, "_argon_mode_status", "OK (switched toggle=Task)")
                         return True
                 except Exception:
                     continue
             if not toggle_found and not require_verifiable:
-                print(
-                    "[+] Mode = Task : INHERITED from existing conversation "
-                    "(no Chat/Task toggle rendered on a continuation chat)."
-                )
-                return True
+                if rec_mode == "task":
+                    setattr(page, "_argon_workspace_mode", "task")
+                    setattr(page, "_argon_mode_status", "OK (recorded workspace_mode=task)")
+                    print(
+                        "[+] Mode = Task : OK (continued conversation has recorded workspace_mode=task)."
+                    )
+                    return True
+                break
         except Exception:
             pass
         if time.monotonic() >= deadline:
@@ -4665,15 +4797,26 @@ def select_task_mode(
         except Exception:
             time.sleep(1.0)
 
-    if require_verifiable:
+    observed = _observe_toggle_mode(page)
+    if not require_verifiable and observed == "unknown":
+        setattr(page, "_argon_workspace_mode", rec_mode or "unknown")
+        setattr(page, "_argon_mode_status", "UNKNOWN")
         print(
-            f"[!] Task mode could not be proven on this new chat after {int(wait_for_toggle_seconds)}s "
-            "(toggle not found or did not activate) - refusing to send in Chat mode.",
+            f"[!] Mode = Task : UNKNOWN (continued conversation has recorded workspace_mode={rec_mode or 'unknown'!r} "
+            "and no Chat/Task toggle is rendered on the page). Task mode is NOT proven.",
             file=sys.stderr,
         )
         return False
-    print("[+] Mode = Task : INHERITED from existing conversation.")
-    return True
+
+    setattr(page, "_argon_workspace_mode", observed)
+    setattr(page, "_argon_mode_status", "UNKNOWN" if observed == "unknown" else f"FAILED (observed mode={observed})")
+    print(
+        f"[!] Mode = Task : {'UNKNOWN' if observed == 'unknown' else 'FAILED'} "
+        f"(Chat/Task toggle could not be verified as Task after {int(wait_for_toggle_seconds)}s; observed={observed!r}) - "
+        "refusing to send in Chat mode.",
+        file=sys.stderr,
+    )
+    return False
 
 
 def ensure_argon_model(
@@ -4786,11 +4929,12 @@ def select_argon_model(
 
 
 def _inspect_zip_archive(zip_path: Path) -> tuple[bool, int, int, str]:
-    """Verify that `zip_path` exists, is non-empty, opens as a valid zip, and contains TASK_BRIEF.md (D14, D15).
+    """Verify that `zip_path` exists, is non-empty, opens as a valid zip, contains readable TASK_BRIEF.md and API_INDEX.md, and has no binary poison (E1, D14, D15).
 
     Returns (ok, size_bytes, entry_count, error_reason).
     """
     import zipfile as _zf
+    from package_context import DEFAULT_EXCLUDED_EXTS as _BIN_EXTS
 
     zp = Path(zip_path)
     if not zp.is_file():
@@ -4806,8 +4950,27 @@ def _inspect_zip_archive(zip_path: Path) -> tuple[bool, int, int, str]:
             members = zf.namelist()
             if not members:
                 return False, sz, 0, f"archive {zp.name} has 0 entries"
-            if "TASK_BRIEF.md" not in members:
-                return False, sz, len(members), f"archive {zp.name} is missing required member TASK_BRIEF.md"
+            for req_member in ("TASK_BRIEF.md", "API_INDEX.md"):
+                if req_member not in members:
+                    return False, sz, len(members), f"archive {zp.name} is missing required member {req_member}"
+                raw_req = zf.read(req_member)
+                if not raw_req or b"\x00" in raw_req:
+                    return False, sz, len(members), f"archive {zp.name} member {req_member} is empty or binary"
+                try:
+                    if not raw_req.decode("utf-8", errors="strict").strip():
+                        return False, sz, len(members), f"archive {zp.name} member {req_member} is blank"
+                except UnicodeDecodeError:
+                    return False, sz, len(members), f"archive {zp.name} member {req_member} is not valid UTF-8"
+            for member in members:
+                if member.endswith("/"):
+                    continue
+                m_ext = Path(member).suffix.lower()
+                if m_ext in _BIN_EXTS:
+                    return False, sz, len(members), f"archive {zp.name} contains binary member {member!r} ({m_ext})"
+                with zf.open(member, "r") as mf:
+                    sample = mf.read(8192)
+                    if b"\x00" in sample:
+                        return False, sz, len(members), f"archive {zp.name} contains binary member {member!r} (NUL byte in first 8 KB)"
             bad = zf.testzip()
             if bad is not None:
                 return False, sz, len(members), f"archive {zp.name} has corrupted entry {bad!r}"
@@ -6208,7 +6371,12 @@ def _check_superseded_prompt(
 
 
 def _known_chat_ids_for_slot(slot: Optional[str]) -> set:
-    """Return all conversation IDs previously recorded on `slot` across SessionStore, TaskState, and TaskRegistry (D19.2)."""
+    """Return all conversation IDs previously recorded across SessionStore, TaskState, and TaskRegistry (E3, D19.2).
+
+    Collects chat IDs for `slot` AND across all active/recorded project lanes so a
+    new session can never reuse the `single` or `followup` chat ID from the same
+    or earlier round.
+    """
     norm_s = normalize_slot(slot) if slot else "/u/0/"
     known: set = set()
     try:
@@ -6216,14 +6384,13 @@ def _known_chat_ids_for_slot(slot: Optional[str]) -> set:
         for _, entry in s_data.items():
             if not isinstance(entry, dict):
                 continue
-            if normalize_slot(str(entry.get("slot") or "/u/0/")) == norm_s and entry.get("chat_id"):
+            if entry.get("chat_id"):
                 known.add(str(entry["chat_id"]))
             lanes = entry.get("lanes")
             if isinstance(lanes, dict):
                 for l_info in lanes.values():
-                    if isinstance(l_info, dict) and normalize_slot(str(l_info.get("slot") or "/u/0/")) == norm_s:
-                        if l_info.get("chat_id"):
-                            known.add(str(l_info["chat_id"]))
+                    if isinstance(l_info, dict) and l_info.get("chat_id"):
+                        known.add(str(l_info["chat_id"]))
     except Exception:
         pass
     try:
@@ -6231,18 +6398,114 @@ def _known_chat_ids_for_slot(slot: Optional[str]) -> set:
         for _, entry in t_data.items():
             if not isinstance(entry, dict):
                 continue
-            if normalize_slot(str(entry.get("slot") or "/u/0/")) == norm_s and entry.get("chat_id"):
+            if entry.get("chat_id"):
                 known.add(str(entry["chat_id"]))
+            lanes = entry.get("lanes")
+            if isinstance(lanes, dict):
+                for l_info in lanes.values():
+                    if isinstance(l_info, dict) and l_info.get("chat_id"):
+                        known.add(str(l_info["chat_id"]))
     except Exception:
         pass
     try:
         for entry in (TaskRegistry().data.get("entries") or []):
+            if isinstance(entry, dict) and entry.get("chat_id"):
+                known.add(str(entry["chat_id"]))
             if isinstance(entry, dict) and normalize_slot(str(entry.get("slot") or "/u/0/")) == norm_s:
-                if entry.get("chat_id"):
-                    known.add(str(entry["chat_id"]))
+                cid_u = _extract_chat_id(str(entry.get("chat_url") or ""))
+                if cid_u:
+                    known.add(cid_u)
     except Exception:
         pass
     return known
+
+
+def _wait_for_conversation_loaded(page, timeout: float = 15.0) -> None:
+    """Wait until the page has finished loading the conversation and earlier turns are rendered (E3.2)."""
+    _wait_for_workspace(page, timeout=min(25.0, max(5.0, timeout)))
+    try:
+        page.wait_for_timeout(1800)
+    except Exception:
+        time.sleep(1.8)
+    deadline = time.monotonic() + max(2.0, float(timeout))
+    prev_snapshot = None
+    stable_streak = 0
+    while time.monotonic() < deadline:
+        try:
+            state = page.evaluate(
+                """() => {
+                    const ready = document.readyState === 'complete';
+                    const spinners = Array.from(
+                        document.querySelectorAll("mat-progress-spinner, .mat-progress-spinner, [role='progressbar'], .loading-spinner")
+                    ).filter(e => !!(e.offsetWidth || e.offsetHeight));
+                    const userTurns = document.querySelectorAll(
+                        "user-query, [data-test-id='user-query'], .user-query-text, .query-text, message-turn.user-query, div.user-query"
+                    ).length;
+                    const modelTurns = document.querySelectorAll(
+                        "model-response, [data-test-id='model-response'], .model-response-text, message-turn.model-response, div.model-response"
+                    ).length;
+                    return {
+                        ready,
+                        spinners: spinners.length,
+                        userTurns,
+                        modelTurns,
+                        url: String(location.href || '')
+                    };
+                }"""
+            )
+        except Exception:
+            state = None
+        if isinstance(state, dict) and state.get("ready") and int(state.get("spinners", 0)) == 0:
+            snap = (state.get("url"), state.get("userTurns"), state.get("modelTurns"))
+            if snap == prev_snapshot:
+                stable_streak += 1
+                if stable_streak >= 2:
+                    break
+            else:
+                prev_snapshot = snap
+                stable_streak = 1
+        try:
+            page.wait_for_timeout(900)
+        except Exception:
+            time.sleep(0.9)
+
+
+def _conversation_emptiness_report(page, forbidden: Optional[set] = None) -> tuple[bool, str, int, int]:
+    """Return (is_empty_and_fresh, chat_id, user_turn_count, assistant_turn_count) after conversation loads (E3.1, E3.2)."""
+    try:
+        u_now = str(getattr(page, "url", "") or "")
+    except Exception:
+        u_now = ""
+    cid_now = _extract_chat_id(u_now) or ""
+    user_txt = _last_user_message_text(page)
+    turns = _assistant_turns(page)
+    asst_count = len(turns) if turns else 0
+    dom_counts = {"user": 1 if user_txt else 0, "asst": asst_count}
+    try:
+        raw_counts = page.evaluate(
+            """() => {
+                const vis = el => !!(el && (el.offsetWidth || el.offsetHeight) && (el.innerText || '').trim().length > 0);
+                const u = Array.from(document.querySelectorAll(
+                    "user-query, [data-test-id='user-query'], .user-query-text, .query-text, message-turn.user-query, div.user-query"
+                )).filter(vis).length;
+                const m = Array.from(document.querySelectorAll(
+                    "model-response, [data-test-id='model-response'], .model-response-text, message-turn.model-response, div.model-response"
+                )).filter(vis).length;
+                return { u, m };
+            }"""
+        )
+        if isinstance(raw_counts, dict):
+            dom_counts["user"] = max(dom_counts["user"], int(raw_counts.get("u") or 0))
+            dom_counts["asst"] = max(dom_counts["asst"], int(raw_counts.get("m") or 0))
+    except Exception:
+        pass
+    forb = forbidden or set()
+    is_fresh = (
+        (not cid_now or cid_now not in forb)
+        and dom_counts["user"] == 0
+        and dom_counts["asst"] == 0
+    )
+    return is_fresh, cid_now, dom_counts["user"], dom_counts["asst"]
 
 
 def _start_fresh_chat(
@@ -6251,14 +6514,13 @@ def _start_fresh_chat(
     isolated_profile: bool = True,
     forbidden_chat_ids: Optional[set] = None,
 ) -> bool:
-    """Open and verify a GENUINELY new conversation (never reusing a restored foreign chat) (D19).
+    """Open and verify a GENUINELY empty new conversation after the page finishes loading (E3.1, E3.2, D19).
 
-     Gemini's home URL (`/u/0/app`) often auto-restores the account's previous
-    conversation. This function records the restored chat ID (and all known chat
-    IDs for `slot`), clicks the sidebar 'New chat' control (expanding the main
-    menu if needed), and verifies that the conversation in the URL is NOT any
-    previous chat ID and has no prior user messages. Fails loudly (`return False`)
-    if the page remains on an existing conversation.
+    Verifies AFTER the conversation finishes loading that:
+      1. there is no user message and no assistant turn in the conversation, AND
+      2. the conversation's chat_id is not already known for `slot` (or `forbidden_chat_ids`).
+    If not proven, opens another new chat; if it still cannot, reports the exact
+    `chat_id` it ended up in and returns False (never silently continues an old chat).
     """
     slot_part = "/u/0/" if isolated_profile else (normalize_slot(slot) if slot else "/u/0/")
     app_url = f"https://gemini.google.com{slot_part}app"
@@ -6266,32 +6528,49 @@ def _start_fresh_chat(
     forbidden.update(_known_chat_ids_for_slot(slot))
 
     try:
-        cur_cid = _extract_chat_id(str(getattr(page, "url", "") or ""))
-        if cur_cid:
-            forbidden.add(cur_cid)
-    except Exception:
-        pass
-
-    try:
         cur_url_now = str(getattr(page, "url", "") or "")
         if not cur_url_now or "gemini.google.com" not in cur_url_now.lower():
             page.goto(app_url, wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(3500)
-        else:
-            page.wait_for_timeout(2000)
     except Exception:
         return False
 
-    try:
-        restored_cid = _extract_chat_id(str(getattr(page, "url", "") or ""))
-        if restored_cid:
-            forbidden.add(restored_cid)
-            print(
-                f"[i] Gemini restored previous chat {restored_cid} on {slot}; "
-                "clicking 'New chat' to open a clean session."
-            )
-    except Exception:
-        pass
+    # E3.2: Wait until the page has finished loading the conversation before inspecting turns or URL.
+    _wait_for_conversation_loaded(page, timeout=15.0)
+
+    # E3.1: a conversation that ALREADY carries a chat id is a RESTORED conversation -
+    # this run did not create it, so an empty restored chat is still NOT a new chat.
+    # Only the plain home URL (no id at all) or a chat we just opened with the
+    # "New chat" control counts as a brand-new conversation.
+    opened_new_chat = False
+
+    def _is_genuinely_fresh() -> bool:
+        _wait_for_conversation_loaded(page, timeout=10.0)
+        ok_fresh, cid_now, u_cnt, a_cnt = _conversation_emptiness_report(page, forbidden)
+        if cid_now and not opened_new_chat:
+            ok_fresh = False
+        if not ok_fresh and cid_now:
+            forbidden.add(cid_now)
+        return ok_fresh
+
+    ok_initial, initial_cid, init_u, init_a = _conversation_emptiness_report(page, forbidden)
+    if initial_cid and (not ok_initial or initial_cid in forbidden):
+        forbidden.add(initial_cid)
+        print(
+            f"[i] Conversation {initial_cid} on {slot} is not a fresh empty chat "
+            f"(user_turns={init_u}, assistant_turns={init_a}); opening a brand-new chat."
+        )
+    elif ok_initial and not initial_cid:
+        # No conversation id at all: this IS Gemini's new-chat state.
+        print(
+            f"[+] Verified empty brand-new chat session on {slot} "
+            f"(chat_id=(new), URL={getattr(page, 'url', app_url)}, known_prior_ids={len(forbidden)})."
+        )
+        return True
+    elif ok_initial:
+        print(
+            f"[i] The page restored the existing conversation {initial_cid} on {slot} "
+            f"(it is empty, but this run did not create it); opening a brand-new chat."
+        )
 
     new_chat_selectors = (
         "a[aria-label*='New chat' i]",
@@ -6309,22 +6588,7 @@ def _start_fresh_chat(
         "text=New chat",
     )
 
-    def _is_genuinely_fresh() -> bool:
-        try:
-            u_now = str(getattr(page, "url", "") or "")
-        except Exception:
-            u_now = ""
-        cid_now = _extract_chat_id(u_now)
-        if cid_now and cid_now in forbidden:
-            return False
-        if _last_user_message_text(page):
-            return False
-        turns = _assistant_turns(page)
-        if turns and len(turns) > 0:
-            return False
-        return True
-
-    for attempt in range(3):
+    for attempt in range(4):
         clicked_new = False
         for sel in new_chat_selectors:
             try:
@@ -6333,7 +6597,6 @@ def _start_fresh_chat(
                     el = loc.nth(i)
                     if _safe_visible(el):
                         el.click(timeout=5000)
-                        page.wait_for_timeout(3000)
                         clicked_new = True
                         break
                 if clicked_new:
@@ -6341,8 +6604,7 @@ def _start_fresh_chat(
             except Exception:
                 continue
 
-        if not clicked_new and attempt == 0:
-            # Expand the collapsible sidebar menu if 'New chat' was hidden
+        if not clicked_new:
             for menu_sel in (
                 "button[aria-label*='Main menu' i]",
                 "button[aria-label*='প্রধান মেনু']",
@@ -6357,30 +6619,45 @@ def _start_fresh_chat(
                         break
                 except Exception:
                     continue
-            continue
+            for sel in new_chat_selectors:
+                try:
+                    loc = page.locator(sel)
+                    for i in range(min(loc.count(), 4)):
+                        el = loc.nth(i)
+                        if _safe_visible(el):
+                            el.click(timeout=5000)
+                            clicked_new = True
+                            break
+                    if clicked_new:
+                        break
+                except Exception:
+                    continue
+
+        if clicked_new:
+            # E3.1: we really opened a new chat, so a chat id that appears now is
+            # one this run created - it may be accepted.
+            opened_new_chat = True
 
         if _is_genuinely_fresh():
+            _, verified_cid, _, _ = _conversation_emptiness_report(page, forbidden)
             print(
-                f"[+] Verified brand-new chat session on {slot} "
-                f"(URL: {getattr(page, 'url', app_url)}, forbidden prior IDs: {len(forbidden)})."
+                f"[+] Verified brand-new empty chat session on {slot} "
+                f"(chat_id={verified_cid or '(new)'}, URL={getattr(page, 'url', app_url)}, forbidden prior IDs={len(forbidden)})."
             )
             return True
 
         try:
             page.goto(app_url, wait_until="domcontentloaded", timeout=45000)
-            page.wait_for_timeout(2500)
         except Exception:
             pass
 
-    if _is_genuinely_fresh():
-        print(f"[+] Verified clean new chat session on {slot} ({getattr(page, 'url', app_url)}).")
-        return True
-
-    lingering_cid = _extract_chat_id(str(getattr(page, "url", "") or ""))
+    _, ended_cid, ended_u, ended_a = _conversation_emptiness_report(page, forbidden)
+    ended_url = str(getattr(page, "url", "") or app_url)
     print(
-        f"[ERROR] Failed to start a genuinely new chat on {slot}: page remained on "
-        f"existing conversation {lingering_cid or getattr(page, 'url', '?')!r}. "
-        "Refusing to paste prompt into a foreign conversation!",
+        f"[ERROR] Failed to open a verified empty new chat on {slot}: ended up in "
+        f"chat_id={ended_cid or '(no-chat-id)'!r} (url={ended_url!r}, "
+        f"user_messages={ended_u}, assistant_turns={ended_a}). "
+        "Refusing to silently continue an old conversation!",
         file=sys.stderr,
     )
     return False
@@ -7024,9 +7301,14 @@ def dispatch_to_argon(
 ) -> int:
     proj_root = Path(project_path).resolve()
     zip_path = proj_root / output_zip if not Path(output_zip).is_absolute() else Path(output_zip)
-    active_downloads_dir = (
-        Path(delivery_dir).resolve() if delivery_dir else (proj_root / "downloads")
-    )
+    if new_session and not lane:
+        lane = "new"
+    if delivery_dir:
+        active_downloads_dir = Path(delivery_dir).resolve()
+    elif lane in ("followup", "new"):
+        active_downloads_dir = (proj_root / "downloads" / lane).resolve()
+    else:
+        active_downloads_dir = (proj_root / "downloads").resolve()
     active_downloads_dir.mkdir(parents=True, exist_ok=True)
 
     # 1. Load account pool configuration & session/task state/registry stores
@@ -7199,23 +7481,14 @@ def dispatch_to_argon(
         )
     print(f"[+] Chosen account slot: {active_slot} ({slot_reason})")
 
-    # D4.4: Enforce at most MAX_TASKS_PER_SLOT (2) concurrent tasks per account in TaskRegistry
+    # Section 3 (No Hard Blocking) & Rule 1-3: Never refuse or block when an account is busy.
     if not resume_chat:
         slot_ok, slot_cap_reason = task_registry.is_slot_available(active_slot, max_tasks=MAX_TASKS_PER_SLOT)
         if not slot_ok:
-            # Allow if the running registry entry is this exact (project, lane) pre-registered by the agent
-            own_active = [
-                e
-                for e in task_registry.active_tasks_for_project(proj_root, lane=lane)
-                if normalize_slot(str(e.get("slot") or "/u/0/")) == active_slot
-            ]
-            if not own_active:
-                print(
-                    f"[!] Account at {active_slot} is at its concurrency limit ({slot_cap_reason}). "
-                    "Moving to the next account.",
-                    file=sys.stderr,
-                )
-                return EXIT_SLOT_BUSY
+            print(
+                f"[+] Account at {active_slot} is busy ({slot_cap_reason}); "
+                "continuing on this slot without blocking (limit is advisory, never a hard block)."
+            )
 
     # 3. Session continuity: a follow-up task on the same project continues in
     #    the SAME Gemini conversation when running on the same mode and slot.
@@ -7224,9 +7497,15 @@ def dispatch_to_argon(
     slot_profile = _profile_dir_for_slot(base_profile, active_slot)
     print(f"[+] Slot browser profile: {slot_profile}")
 
-    session = None if (new_session or resume_chat) else session_store.lookup(proj_root, mode=mode)
+    session = None if (new_session or lane == "new" or resume_chat) else session_store.lookup(proj_root, mode=mode)
     if session and (session.get("mode") or "gemini") != (mode or "gemini").strip().lower():
         session = None
+    if session and lane == "followup":
+        s_lanes = session.get("lanes") if isinstance(session.get("lanes"), dict) else {}
+        f_lane_entry = s_lanes.get("followup") if isinstance(s_lanes.get("followup"), dict) else {}
+        if f_lane_entry.get("chat_url") and (not slot or normalize_slot(str(f_lane_entry.get("slot") or active_slot)) == active_slot):
+            session = dict(session)
+            session.update({k: v for k, v in f_lane_entry.items() if v})
     # A Gemini conversation URL belongs to the Google account slot it was created in.
     # If an explicit slot was requested (e.g. during pool rotation) that differs from
     # the stored session's slot, start a fresh chat on the requested slot.
@@ -7234,7 +7513,7 @@ def dispatch_to_argon(
         if normalize_slot(session["slot"]) != active_slot:
             session = None
 
-    is_continuation = bool(session and session.get("chat_url") and not resume_chat)
+    is_continuation = bool(session and session.get("chat_url") and not resume_chat and not new_session and lane != "new")
     if resume_chat and resume_entry is not None:
         if slot is None and resume_entry.get("slot"):
             active_slot = normalize_slot(resume_entry["slot"])
@@ -7305,23 +7584,22 @@ def dispatch_to_argon(
     # two different slots never fight over one Chrome profile. The slot lock
     # stops two runs from using the SAME slot at once.
     slot_lock = SlotLock(active_slot, profile_dir=slot_profile)
-    if not slot_lock.acquire(slot_profile):
-        print(
-            f"[!] Slot {active_slot} is busy. Use another account, or wait for the "
-            f"running task to finish.",
-            file=sys.stderr,
-        )
-        return EXIT_SLOT_BUSY
+    lock_acquired = slot_lock.acquire(slot_profile)
+    temp_concurrent_profile: Optional[Path] = None
 
     context = None
     try:
-        if _profile_is_busy(slot_profile):
+        if not lock_acquired or _profile_is_busy(slot_profile):
             print(
-                f"[!] Slot {active_slot} profile ({slot_profile}) is already open in another browser. "
-                f"Refusing to touch the running browser.",
-                file=sys.stderr,
+                f"[+] Slot {active_slot} profile ({slot_profile}) already has an active run; "
+                f"cloning a concurrent profile directory for {active_slot} so this run continues without blocking."
             )
-            return EXIT_SLOT_BUSY
+            concurrent_cand = slot_profile.parent / f"{slot_profile.name}-concurrent-{os.getpid()}"
+            src_for_clone = slot_profile if (slot_profile / "Default").is_dir() else base_profile
+            cloned_prof = _copy_profile(src_for_clone, concurrent_cand, allow_busy=True)
+            if cloned_prof is not None:
+                temp_concurrent_profile = cloned_prof
+                slot_profile = cloned_prof
 
         profile_dir = slot_profile
         try:
@@ -7494,7 +7772,18 @@ def dispatch_to_argon(
                 return None
 
             forbidden_new_chat_ids = _known_chat_ids_for_slot(active_slot)
+            recorded_ws_mode = (
+                session_store.get_recorded_workspace_mode(
+                    proj_root,
+                    chat_id=_extract_chat_id(target_url) or "",
+                    lane=lane,
+                    mode=mode,
+                )
+                if is_continuation
+                else "unknown"
+            )
             setattr(page, "_argon_is_continuation", bool(is_continuation))
+            setattr(page, "_argon_recorded_workspace_mode", recorded_ws_mode)
             setattr(page, "_argon_lane", lane)
             setattr(page, "_argon_reopen_hook", _recover_preflight_or_send_browser)
 
@@ -7694,29 +7983,33 @@ def dispatch_to_argon(
                 )
                 mode_ok = model_ok = think_ok = attached = True
             else:
-                # A NEW chat has no inherited mode: Task mode must be PROVEN,
-                # not assumed. A continuation keeps the mode it was created with.
+                # E2.1 - E2.4: Never report `mode = Task : OK` unless Task mode was actually
+                # observed via the toggle or recorded as `workspace_mode == 'task'` in SessionStore.
                 mode_ok = True if manual_setup else _retry(
-                    lambda p: select_task_mode(p, require_verifiable=not is_continuation),
+                    lambda p: select_task_mode(
+                        p,
+                        require_verifiable=not is_continuation,
+                        recorded_workspace_mode=recorded_ws_mode,
+                    ),
                     page,
                 )
-                preflight.append(f"mode = Task : {'OK (manual)' if manual_setup else ('OK (inherited)' if is_continuation else ('OK' if mode_ok else 'FAILED'))}")
-                # The same for the model: a continuation has no model switcher
-                # at all, so its model is inherited from the chat.
+                mode_status_str = (
+                    "OK (manual)"
+                    if manual_setup
+                    else (
+                        str(getattr(page, "_argon_mode_status", "") or ("OK" if mode_ok else "UNKNOWN"))
+                    )
+                )
+                preflight.append(f"mode = Task : {mode_status_str}")
                 model_ok = True if manual_setup else _retry(
                     lambda p: select_argon_model(p, require_chip=not is_continuation),
                     page,
                 )
-                preflight.append(f"model = 4 Argon : {'OK (manual)' if manual_setup else ('OK' if model_ok else 'FAILED')}")
+                check_basis = "recorded/inherited on continuation" if is_continuation else "proven on new chat"
+                preflight.append(
+                    f"model = 4 Argon : {'OK (manual)' if manual_setup else ('OK' if model_ok else 'FAILED')} ({check_basis})"
+                )
                 think_ok = True
-
-            # D11.3: Annotate pre-flight mode & model lines with PROVEN (new chat) vs INHERITED (continuation)
-            if not resume_chat:
-                check_basis = "inherited from existing conversation" if is_continuation else "proven on new chat"
-                preflight = [
-                    (f"{ln} ({check_basis})" if ("proven" not in ln.lower() and "inherited" not in ln.lower()) else ln)
-                    for ln in preflight
-                ]
 
             attached = True if resume_chat else _retry(lambda p: attach_zip(p, zip_path), page)
             if not resume_chat:
@@ -7977,6 +8270,33 @@ def dispatch_to_argon(
                                 task_state_store.set(proj_root, state="preflight_failed", diagnostic_evidence=ev_sg)
                                 _print_run_failure_summary(ev_sg)
                                 return EXIT_PREFLIGHT_FAILED
+                            # E3.1 & E3.2: Right before send on a NEW chat, verify once more (after pre-flight & upload
+                            # have given the page plenty of time to finish loading) that the conversation is still EMPTY
+                            # and its chat_id is not already known.
+                            if not is_continuation and not resume_chat:
+                                ok_pre_send, pre_send_cid, pre_u, pre_a = _conversation_emptiness_report(
+                                    page, forbidden_new_chat_ids
+                                )
+                                if not ok_pre_send:
+                                    shot_foreign_pre = _take_step_screenshot(
+                                        page,
+                                        proj_root,
+                                        "preflight_failure.png",
+                                        step_label="foreign_chat_before_send",
+                                        state_label=f"New chat is not empty before send (chat_id={pre_send_cid})",
+                                        lane=lane,
+                                    )
+                                    print(
+                                        f"[ERROR] New session check failed right before send on {active_slot}: "
+                                        f"ended up in non-empty/known conversation chat_id={pre_send_cid or '(no-chat-id)'!r} "
+                                        f"(url={getattr(page, 'url', target_url)!r}, user_messages={pre_u}, assistant_turns={pre_a}). "
+                                        f"Screenshot: {shot_foreign_pre}",
+                                        file=sys.stderr,
+                                    )
+                                    task_registry.register_done(
+                                        proj_root, lane=lane, slot=active_slot, status="failed", screenshot_path=str(shot_foreign_pre or "")
+                                    )
+                                    return EXIT_PREFLIGHT_FAILED
                             _type_and_send(page, composer, prompt_text)
                             sent_hms = time.strftime("%H:%M:%S")
                             just_sent_prompt = True
@@ -8130,11 +8450,13 @@ def dispatch_to_argon(
             except Exception:
                 profile_dir_str = ""
             effective_chat_url = page.url or target_url
+            proven_ws_mode = str(getattr(page, "_argon_workspace_mode", "") or ("task" if mode_ok else "unknown"))
             if chat_id:
                 chat_url = session_store.remember(
                     proj_root, mode, active_slot, chat_id,
                     chat_title=chat_title, profile_dir=profile_dir_str,
                     lane=lane,
+                    workspace_mode=proven_ws_mode,
                 )
                 effective_chat_url = chat_url or effective_chat_url
                 task_state.set(
@@ -8665,6 +8987,7 @@ def dispatch_to_argon(
                         proj_root, mode, active_slot, chat_id,
                         chat_title=chat_title, profile_dir=profile_dir_str,
                         lane=lane, patch_path=str(delivered_path),
+                        workspace_mode=proven_ws_mode,
                     )
                 print(f"[SUCCESS] Delivered patch file: {delivered_path}")
                 _, summary_text = _copy_and_save_response_summary(
@@ -8978,6 +9301,11 @@ def dispatch_to_argon(
                 pass
             context = None
         slot_lock.release()
+        if temp_concurrent_profile is not None and temp_concurrent_profile.exists():
+            try:
+                shutil.rmtree(temp_concurrent_profile, ignore_errors=True)
+            except Exception:
+                pass
         print("[+] Browser closed and the slot lock released.")
 
 
@@ -9090,9 +9418,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--lane",
-        choices=["followup", "new"],
+        choices=["followup", "new", "single"],
         default=None,
-        help="Tag this dispatch run as the 'followup' or 'new' lane of a dual dispatch.",
+        help="Tag this dispatch run as the 'followup', 'new', or 'single' lane.",
     )
     parser.add_argument(
         "--prompt-file",
@@ -9140,9 +9468,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Agent action: explicitly mark the running task for --project-path (and optional --lane/--slot) as completed in ~/.gemini/argon_tasks.json.",
     )
     parser.add_argument(
+        "--label",
         "--task-label",
+        dest="task_label",
         default="",
-        help="Free-text label stored in ~/.gemini/argon_tasks.json when using --register-task-start.",
+        help="Free-text label stored in ~/.gemini/argon_tasks.json when using --register-task-start or --register-task-done.",
     )
     parser.add_argument(
         "--list-tasks",
@@ -9200,17 +9530,21 @@ def select_account_slot(
             c_slot = normalize_slot(str(c_entry["slot"]))
             return c_slot, f"CARRY-OVER policy: staying on {c_slot} where the failed run's context lives"
 
-    # Check if this is a FOLLOW-UP (existing session history and not --new-session)
-    existing_session = None if new_session else sess_store.lookup(project_path, mode=mode)
+    # Rule 1: The follow-up always goes to the account that holds the chat - never rotated.
+    # Even when that account is already busy with two tasks, that chat lives there, so USE it and say so in one line.
+    existing_session = None if (new_session or lane == "new") else sess_store.lookup(project_path, mode=mode)
     if existing_session and existing_session.get("chat_url") and existing_session.get("slot"):
         f_slot = normalize_slot(str(existing_session["slot"]))
         f_cid = str(existing_session.get("chat_id") or "")
+        f_load = len(reg.active_tasks_for_slot(f_slot))
+        busy_note = f"; slot already has {f_load} active task(s), using it anyway because the chat lives there" if f_load >= MAX_TASKS_PER_SLOT else f" (registry load {f_load}/{MAX_TASKS_PER_SLOT})"
         return (
             f_slot,
-            f"FOLLOW-UP policy: continuing conversation {f_cid or '(stored)'} on the account that holds it ({f_slot})",
+            f"FOLLOW-UP policy: continuing conversation {f_cid or '(stored)'} on the account that holds it ({f_slot}{busy_note})",
         )
 
-    # Otherwise this is a NEW TASK: must pick a DIFFERENT account than the one that just ran!
+    # Rule 2 & 3: A new task prefers an account that is not busy. When no account is free,
+    # continue on the least loaded account and print the reason. Never refuse to work because an account is busy.
     last_ran_slots: set = set(excluded)
     if existing_session and existing_session.get("slot"):
         last_ran_slots.add(normalize_slot(str(existing_session["slot"])))
@@ -9246,7 +9580,19 @@ def select_account_slot(
                 f"NEW-TASK policy: rotated to next free account {norm_c} (skipped previous {sorted(last_ran_slots)}, registry load 0/{MAX_TASKS_PER_SLOT})",
             )
 
-    # Pass 2: Any slot under MAX_TASKS_PER_SLOT (2) different from last_ran_slots
+    # Pass 2: Any slot with 0 tasks in registry and profile not busy
+    for cand in ordered_pool:
+        norm_c = normalize_slot(cand)
+        if norm_c in excluded:
+            continue
+        active_on_slot = reg.active_tasks_for_slot(norm_c)
+        if len(active_on_slot) == 0 and not _profile_is_busy(_profile_dir_for_slot(base_prof, norm_c)):
+            return (
+                norm_c,
+                f"NEW-TASK policy: selected idle account {norm_c} (registry load 0/{MAX_TASKS_PER_SLOT})",
+            )
+
+    # Pass 3: Any slot under MAX_TASKS_PER_SLOT (2) different from last_ran_slots
     for cand in ordered_pool:
         norm_c = normalize_slot(cand)
         if norm_c in last_ran_slots:
@@ -9258,17 +9604,23 @@ def select_account_slot(
                 f"NEW-TASK policy: rotated to available account {norm_c} (skipped previous {sorted(last_ran_slots)}, {cap_reason})",
             )
 
-    # Pass 3: Fallback to any slot in ordered_pool under MAX_TASKS_PER_SLOT not in excluded
-    for cand in ordered_pool:
-        norm_c = normalize_slot(cand)
-        if norm_c in excluded:
-            continue
-        ok_s, cap_reason = reg.is_slot_available(norm_c, max_tasks=MAX_TASKS_PER_SLOT)
-        if ok_s:
-            return norm_c, f"NEW-TASK fallback: selected {norm_c} ({cap_reason})"
-
-    fallback_s = ordered_pool[0] if ordered_pool else "/u/0/"
-    return fallback_s, f"fallback slot {fallback_s}"
+    # Pass 4: Least-loaded slot across the pool (never refuse because an account is busy)
+    pool_candidates = [normalize_slot(c) for c in ordered_pool if normalize_slot(c) not in excluded] or [
+        normalize_slot(c) for c in ordered_pool
+    ]
+    least_loaded = min(
+        pool_candidates,
+        key=lambda s: (
+            len(reg.active_tasks_for_slot(s)),
+            1 if s in last_ran_slots else 0,
+            1 if _profile_is_busy(_profile_dir_for_slot(base_prof, s)) else 0,
+        ),
+    )
+    ll_count = len(reg.active_tasks_for_slot(least_loaded))
+    return (
+        least_loaded,
+        f"NEW-TASK least-loaded fallback: all accounts are busy; continuing on least-loaded account {least_loaded} (registry load {ll_count}/{MAX_TASKS_PER_SLOT})",
+    )
 
 
 def _pool_slots_in_order(
@@ -9375,10 +9727,12 @@ def main(argv: Optional[List[str]] = None) -> int:
             lane=args.lane,
             slot=args.slot,
             status="completed",
+            label=args.task_label,
         )
         print(
             f"[+] Marked {closed} running task(s) as completed in {reg.path} "
-            f"for project {Path(args.project_path).resolve()}."
+            f"for project {Path(args.project_path).resolve()}"
+            + (f" (label={args.task_label!r})." if args.task_label else ".")
         )
         return EXIT_SUCCESS
 
@@ -9398,8 +9752,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         reg = TaskRegistry()
         ok_s, cap_msg = reg.is_slot_available(chosen_slot, max_tasks=MAX_TASKS_PER_SLOT)
         if not ok_s:
-            print(f"[ERROR] Cannot register task on {chosen_slot}: {cap_msg}", file=sys.stderr)
-            return EXIT_SLOT_BUSY
+            print(
+                f"[+] Slot {chosen_slot} is busy ({cap_msg}); continuing on {chosen_slot} without blocking ({reason})."
+            )
         rec = reg.register_start(
             args.project_path,
             slot=chosen_slot,

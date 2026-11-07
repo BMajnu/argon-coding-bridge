@@ -1828,20 +1828,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Import bulk email:password lines from a .txt file into accounts_pool.json and auto-login.",
     )
     parser.add_argument(
-        "--import-file",
-        type=str,
-        default=None,
-        metavar="TXT_PATH",
-        help="Import bulk email:password lines from a .txt file into accounts_pool.json and auto-login.",
-    )
-    parser.add_argument(
-        "--import-file",
-        type=str,
-        default=None,
-        metavar="TXT_PATH",
-        help="Import bulk email:password lines from a .txt file into accounts_pool.json and auto-login.",
-    )
-    parser.add_argument(
         "--tier",
         type=str,
         default="PRO",

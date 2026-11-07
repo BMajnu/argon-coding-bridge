@@ -102,8 +102,12 @@ def pick_new_session_slot(
     pool_cfg: Optional[PoolConfig],
     followup_slot: str,
     preferred_slot: Optional[str] = None,
-) -> Optional[str]:
-    """Pick a free pool slot for the NEW-SESSION lane using TaskRegistry & D3 Account Policy."""
+) -> str:
+    """Pick a pool slot for the NEW-SESSION lane using TaskRegistry & Account Policy without hard blocking (Section 3).
+
+    Prefers an idle account different from `followup_slot`. When all accounts are
+    busy, selects the least-loaded account and prints the reason (never refuses).
+    """
     norm_followup = normalize_slot(followup_slot)
     base_profile = pool_cfg.profile_dir if pool_cfg is not None else (Path.home() / ".gemini" / "argon_browser_profile")
     reg = TaskRegistry()
@@ -111,11 +115,14 @@ def pick_new_session_slot(
 
     if preferred_slot:
         norm_pref = normalize_slot(preferred_slot)
-        if norm_pref == norm_followup:
-            return None
-        if _is_slot_free(base_profile, norm_pref):
+        if norm_pref != norm_followup:
+            if not _is_slot_free(base_profile, norm_pref):
+                load_p = len(reg.active_tasks_for_slot(norm_pref))
+                print(
+                    f"[+] Preferred new-session slot {norm_pref} is busy (registry load {load_p}/{MAX_TASKS_PER_SLOT}); "
+                    f"using {norm_pref} without blocking."
+                )
             return norm_pref
-        return None
 
     candidates: List[str] = []
     if pool_cfg is not None:
@@ -146,7 +153,20 @@ def pick_new_session_slot(
     for cand in candidates:
         if _is_slot_free(base_profile, cand, require_zero_tasks=False):
             return cand
-    return None
+    # Pass 4 (No Hard Blocking): Pick the least-loaded candidate slot and print the reason
+    least_loaded = min(
+        candidates,
+        key=lambda c: (
+            len(reg.active_tasks_for_slot(c)),
+            1 if _profile_is_busy(_profile_dir_for_slot(base_profile, c)) else 0,
+        ),
+    )
+    ll_load = len(reg.active_tasks_for_slot(least_loaded))
+    print(
+        f"[+] All candidate pool slots are busy; picked least-loaded slot {least_loaded} "
+        f"(registry load {ll_load}/{MAX_TASKS_PER_SLOT}) for NEW lane without blocking."
+    )
+    return least_loaded
 
 
 def prepare_dual_round(
@@ -258,74 +278,33 @@ def run_dual_dispatch(
     session_store = SessionStore()
     session_entry = session_store.lookup(proj_root, mode=mode)
 
-    # R3: If the project has no session history at all, send ONE normal API call.
-    if not has_session_history(session_entry):
-        print(
-            f"[+] No session history found for {proj_root} - taking the SINGLE dispatch path "
-            "(1 prompt, 1 chat). Dual dispatch applies from the next round onward."
-        )
-        if dry_run:
-            single_prompt = build_surgical_prompt(task, target_directory=str(proj_root), is_continuation=False)
-            first_ln = single_prompt.splitlines()[0] if single_prompt.splitlines() else ""
-            print(f"[+] Single prompt length: {len(single_prompt)} chars | first line: {first_ln}")
-            return EXIT_SUCCESS
-        return dispatch_to_argon(
-            task=task,
-            project_path=str(proj_root),
-            mode=mode,
-            slot=slot,
-            headless=headless,
-            auto_apply=False,
-            manual_setup=manual_setup,
-            target_files=target_files,
-            output_zip=output_zip,
-            new_session=False,
-            resume=False,
-            carry_over=True,
-            verify_timeout=verify_timeout,
-            verify_cmd=verify_cmd,
-            skip_verify=skip_verify,
-        )
-
-    # R5 & D3: With session history present, require an explicitly recorded winner.
-    winner_info = session_store.get_winner(proj_root, mode=mode)
-    if winner_info is None:
-        print(
-            f"[ERROR] Session history exists for {proj_root}, but NO WINNER has been recorded "
-            "for the previous round.",
-            file=sys.stderr,
-        )
-        print(
-            "        Refusing to guess which session won. Record the winner explicitly first:",
-            file=sys.stderr,
-        )
-        print(
-            f'          python "{SCRIPTS_DIR / "dispatch_argon.py"}" --project-path "{proj_root}" --record-winner followup',
-            file=sys.stderr,
-        )
-        print(
-            f'          python "{SCRIPTS_DIR / "dispatch_argon.py"}" --project-path "{proj_root}" --record-winner new',
-            file=sys.stderr,
-        )
-        return EXIT_FAILURE
-
-    followup_slot = normalize_slot(winner_info["slot"])
-    followup_chat_id = str(winner_info["chat_id"])
-    followup_chat_url = str(winner_info["chat_url"])
-
     try:
         pool_cfg = PoolConfig()
     except Exception:
         pool_cfg = None
 
-    new_slot = pick_new_session_slot(pool_cfg, followup_slot, preferred_slot=second_slot)
-    if not new_slot or normalize_slot(new_slot) == followup_slot:
-        print(
-            f"[ERROR] Dual dispatch requires two DIFFERENT free pool slots. "
-            f"Follow-up lane uses {followup_slot}, and no distinct free slot was available for the NEW lane.",
-            file=sys.stderr,
+    # E4.1 & E4.2: Resolve follow-up conversation (from recorded winner or stored project session)
+    # and run the two lanes as two separate processes, each with its own conversation and delivery folder.
+    winner_info = session_store.get_winner(proj_root, mode=mode)
+    if winner_info is not None:
+        followup_slot = normalize_slot(slot or winner_info["slot"])
+        followup_chat_id = str(winner_info["chat_id"])
+        followup_chat_url = str(winner_info["chat_url"])
+        winner_label = str(winner_info.get("winner") or "followup")
+    elif isinstance(session_entry, dict) and (session_entry.get("chat_id") or session_entry.get("chat_url")):
+        followup_slot = normalize_slot(slot or session_entry.get("slot") or "/u/0/")
+        followup_chat_id = str(session_entry.get("chat_id") or "")
+        followup_chat_url = str(
+            session_entry.get("chat_url") or f"https://gemini.google.com/u/0/app/{followup_chat_id}"
         )
-        return EXIT_SLOT_BUSY
+        winner_label = "followup"
+    else:
+        followup_slot = normalize_slot(slot or (pool_cfg.active_slot() if pool_cfg else "/u/0/"))
+        followup_chat_id = "(new-followup-chat)"
+        followup_chat_url = f"https://gemini.google.com/u/0/app"
+        winner_label = "followup"
+
+    new_slot = pick_new_session_slot(pool_cfg, followup_slot, preferred_slot=second_slot)
 
     round_meta = prepare_dual_round(
         task=task,
@@ -341,11 +320,12 @@ def run_dual_dispatch(
     followup_prompt_path: Path = round_meta["followup_prompt_path"]
     new_prompt_path: Path = round_meta["new_prompt_path"]
 
+    new_initial_url = "https://gemini.google.com/u/0/app (fresh chat via --new-session)"
     print(
-        f"[+] Lane FOLLOW-UP : slot {followup_slot} -> continuing winning chat {followup_chat_id} ({followup_chat_url})"
+        f"[+] Lane FOLLOW-UP : slot={followup_slot} | chat_id={followup_chat_id} | url={followup_chat_url} | delivery_dir={followup_dir}"
     )
     print(
-        f"[+] Lane NEW       : slot {new_slot} -> opening a brand-new chat (--new-session) on a distinct pool slot"
+        f"[+] Lane NEW       : slot={new_slot} | chat_id=(new-session-on-{new_slot.strip('/')}) | url={new_initial_url} | delivery_dir={new_dir}"
     )
 
     zip_path = proj_root / output_zip if not Path(output_zip).is_absolute() else Path(output_zip)
@@ -421,19 +401,9 @@ def run_dual_dispatch(
         target_files=target_files,
     )
 
-    # Ensure top-level session entry points at the winning chat before follow-up starts.
-    recorded = session_store.record_winner(proj_root, winner_info["winner"])
-    if not recorded:
-        # Without this the follow-up lane would quietly open a NEW chat
-        # instead of continuing in the winning one - and the whole point of
-        # the dual dispatch would be lost.
-        print(
-            "[ERROR] The winner could not be promoted to the top-level session "
-            "entry, so the follow-up lane would not continue in the winning "
-            "chat. Aborting instead of running both lanes on the wrong chats.",
-            file=sys.stderr,
-        )
-        return EXIT_FAILURE
+    # Ensure top-level session entry points at the follow-up chat before follow-up starts.
+    if winner_info is not None:
+        session_store.record_winner(proj_root, winner_label)
 
     print("[+] Starting FOLLOW-UP and NEW-SESSION processes concurrently...")
     proc_followup = subprocess.Popen(
@@ -505,6 +475,11 @@ def run_dual_dispatch(
         merged_patch=str(merged_patch_path),
     )
 
+    f_final_cid = str(f_lane_data.get("chat_id") or followup_chat_id)
+    f_final_url = str(f_lane_data.get("chat_url") or followup_chat_url)
+    n_final_cid = str(n_lane_data.get("chat_id") or "(none)")
+    n_final_url = str(n_lane_data.get("chat_url") or new_initial_url)
+
     if followup_patch is not None and new_patch is not None:
         comparison = compare_patches(followup_patch, new_patch, project_path=proj_root)
         render_comparison_html(
@@ -516,7 +491,10 @@ def run_dual_dispatch(
         print("=" * 78)
         print(f"  DUAL DISPATCH COMPLETE - ROUND {rid}")
         print("=" * 78)
+        print("  delivery status   : BOTH lanes (followup and new) produced a delivery")
+        print(f"  follow-up lane    : chat_id={f_final_cid} | url={f_final_url}")
         print(f"  follow-up patch   : {followup_patch}")
+        print(f"  new-session lane  : chat_id={n_final_cid} | url={n_final_url}")
         print(f"  new-session patch : {new_patch}")
         print(f"  comparison report : {comparison_html_path}")
         print("  NOTE: Neither patch was auto-applied. Compare them and record the winner:")
@@ -525,7 +503,7 @@ def run_dual_dispatch(
         )
         print("  Or compare / merge / apply with one click:")
         print(
-            f'    python "{SCRIPTS_DIR / "compare_argon_patches.py"}" --round-dir "{round_dir}" --open'
+            f'    python "{SCRIPTS_DIR / "compare_argon_patches.py"}" --followup-patch "{followup_patch}" --new-patch "{new_patch}" --merge --pick new --apply'
         )
         print("=" * 78)
         if open_comparison:
@@ -537,8 +515,24 @@ def run_dual_dispatch(
                 pass
         return EXIT_SUCCESS
 
+    # E4.2: When one lane fails, the other lane still finishes and the summary states which lane produced the delivery.
+    if followup_patch is not None or new_patch is not None:
+        surviving_lane = "followup" if followup_patch is not None else "new"
+        surviving_patch = followup_patch if followup_patch is not None else new_patch
+        failed_lane = "new" if followup_patch is not None else "followup"
+        failed_rc = rc_new if followup_patch is not None else rc_followup
+        print("=" * 78)
+        print(f"  DUAL DISPATCH PARTIAL SUCCESS - ROUND {rid}")
+        print("=" * 78)
+        print(f"  delivery status   : {surviving_lane.upper()} lane produced the delivery ({failed_lane} lane failed with rc={failed_rc})")
+        print(f"  follow-up lane    : chat_id={f_final_cid} | url={f_final_url} | patch={followup_patch or '(none)'}")
+        print(f"  new-session lane  : chat_id={n_final_cid} | url={n_final_url} | patch={new_patch or '(none)'}")
+        print(f"  delivered patch   : {surviving_patch}")
+        print("=" * 78)
+        return EXIT_SUCCESS
+
     print(
-        f"[!] Dual dispatch finished without both patches (followup_rc={rc_followup}, new_rc={rc_new}, "
+        f"[!] Dual dispatch finished with no delivery from either lane (followup_rc={rc_followup}, new_rc={rc_new}, "
         f"followup_patch={followup_patch}, new_patch={new_patch}).",
         file=sys.stderr,
     )

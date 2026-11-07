@@ -589,6 +589,7 @@ def build_merged_patch(
     choices: Optional[Dict[str, str]] = None,
     pick_side: Optional[str] = None,
     target_root_override: Optional[str] = None,
+    merge_both: bool = False,
 ) -> Path:
     """Build a single-run PowerShell patch script (`apply_changes.ps1`) from the comparison.
 
@@ -614,7 +615,7 @@ def build_merged_patch(
         st = item["status"]
         rel_file = item["file"]
 
-        if norm_pick == "followup":
+        if norm_pick == "followup" and not merge_both:
             if st == STATUS_ONLY_NEW:
                 continue
             selected_per_file.setdefault(rel_file, []).append(
@@ -628,7 +629,7 @@ def build_merged_patch(
             )
             continue
 
-        if norm_pick == "new":
+        if norm_pick == "new" and not merge_both:
             if st == STATUS_ONLY_FOLLOWUP:
                 continue
             selected_per_file.setdefault(rel_file, []).append(
@@ -642,7 +643,7 @@ def build_merged_patch(
             )
             continue
 
-        # Full merge mode (both lanes combined)
+        # Full merge mode (both lanes combined; --pick provides default side for conflicts when combined with --merge)
         if st in (STATUS_IDENTICAL, STATUS_ONLY_FOLLOWUP):
             selected_per_file.setdefault(rel_file, []).append(
                 {
@@ -664,7 +665,7 @@ def build_merged_patch(
                 }
             )
         elif st == STATUS_CONFLICT:
-            chosen = _resolve_conflict_side(item, resolved_choices)
+            chosen = _resolve_conflict_side(item, resolved_choices) or norm_pick
             if chosen not in ("followup", "new"):
                 cid = item.get("conflict_id", "?")
                 bkey = item.get("block_key", rel_file)
@@ -1149,6 +1150,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 choices=parsed_choices,
                 pick_side=args.pick,
                 target_root_override=str(proj_root) if args.project_path != "." else None,
+                merge_both=bool(args.merge),
             )
             print(f"[+] Wrote single-run patch script: {merged_path}")
             target_patch_to_apply = merged_path
