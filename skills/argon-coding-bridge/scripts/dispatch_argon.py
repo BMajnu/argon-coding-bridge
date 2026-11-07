@@ -1498,7 +1498,7 @@ class DeliveryLedger:
         return projects[canonical]
 
     def lookup_digest(self, project_path: Any, text: str) -> Optional[Dict[str, Any]]:
-        """Return the ledger record if `text` was already handled for `project_path`, else None."""
+        """Return the ledger record if `text` was already handled for `project_path` or across any project, else None."""
         if not text or not text.strip():
             return None
         short_h = _hash_text(text)
@@ -1511,6 +1511,18 @@ class DeliveryLedger:
             eh_full = str(entry.get("sha256") or "")
             if (short_h and eh_short in (short_h, short_norm)) or (full_h and eh_full == full_h):
                 return entry
+        self.load()
+        projects = self.data.get("projects", {})
+        if isinstance(projects, dict):
+            for p_key, entries in projects.items():
+                if isinstance(entries, list):
+                    for entry in entries:
+                        if not isinstance(entry, dict):
+                            continue
+                        eh_short = str(entry.get("short_hash") or "")
+                        eh_full = str(entry.get("sha256") or "")
+                        if (short_h and eh_short in (short_h, short_norm)) or (full_h and eh_full == full_h):
+                            return entry
         return None
 
     def known_hashes(self, project_path: Any) -> set:
@@ -1577,9 +1589,9 @@ def _is_leftover_delivery(
 ) -> bool:
     """True when the captured delivery is one that was already handled (D1.1, D1.2).
 
-    Consults both `previous_hashes` and the persistent `DeliveryLedger`. When a
-    match is found, prints the round id, chat id, sha256, and timestamp it
-    belongs to and refuses the old file.
+    A capture whose SHA-256 is already known - in ~/.gemini/argon_delivery_ledger.json
+    or in a patch already applied in this repository - must not be reported as a NEW delivery.
+    Refuses with a loud warning naming the digest and the earlier delivery it duplicates.
     """
     if not text or not text.strip():
         return False
@@ -1590,23 +1602,49 @@ def _is_leftover_delivery(
             ledger_hit = DeliveryLedger().lookup_digest(project_path, text)
             if ledger_hit is not None:
                 print(
-                    f"[!] Refusing already-handled delivery from round {ledger_hit.get('round_id') or 'previous'} "
-                    f"(chat={ledger_hit.get('chat_id') or '?'}, sha256={str(ledger_hit.get('sha256') or digest)[:16]}, "
-                    f"captured_at={ledger_hit.get('timestamp') or '?'}). Waiting for the new delivery chip.",
+                    f"\n[!] REFUSED DUPLICATE DELIVERY:\n"
+                    f"    SHA-256  : {full_sha}\n"
+                    f"    Duplicate: round {ledger_hit.get('round_id') or 'previous'} "
+                    f"(chat={ledger_hit.get('chat_id') or '?'}, captured_at={ledger_hit.get('timestamp') or '?'}, "
+                    f"file={ledger_hit.get('file_path') or '?'})\n"
+                    f"    This delivery is already known in ~/.gemini/argon_delivery_ledger.json.\n"
+                    f"    Waiting for the new delivery chip.",
                     file=sys.stderr,
                 )
                 return True
         except Exception:
             pass
-    if not previous_hashes:
-        return False
-    if (digest and digest in previous_hashes) or (full_sha and full_sha in previous_hashes):
+    if previous_hashes and ((digest and digest in previous_hashes) or (full_sha and full_sha in previous_hashes)):
         print(
-            f"[!] Refusing already-handled delivery (digest={digest} matches an earlier round in this project). "
-            "Ignoring it and waiting for the new delivery.",
+            f"\n[!] REFUSED DUPLICATE DELIVERY:\n"
+            f"    SHA-256  : {full_sha} (digest={digest})\n"
+            f"    Duplicate: matches a known pre-existing hash from earlier rounds.\n"
+            f"    Waiting for the new delivery chip.",
             file=sys.stderr,
         )
         return True
+    if project_path is not None:
+        try:
+            proj = Path(project_path).resolve()
+            for cand_dir in (proj / "downloads", proj / ".argon_backup"):
+                if cand_dir.is_dir():
+                    for ps1_file in cand_dir.glob("**/*.ps1"):
+                        if ps1_file.is_file() and ps1_file.stat().st_size >= MIN_PATCH_FILE_BYTES:
+                            try:
+                                content_f = ps1_file.read_text(encoding="utf-8", errors="replace")
+                                if _sha256_full(content_f) == full_sha:
+                                    print(
+                                        f"\n[!] REFUSED DUPLICATE DELIVERY:\n"
+                                        f"    SHA-256  : {full_sha}\n"
+                                        f"    Duplicate: byte-identical to existing repository patch: {ps1_file}\n"
+                                        f"    Waiting for the new delivery chip.",
+                                        file=sys.stderr,
+                                    )
+                                    return True
+                            except Exception:
+                                continue
+        except Exception:
+            pass
     return False
 
 
@@ -1764,6 +1802,7 @@ def capture_generated_file(
                         )
                     except Exception:
                         pass
+                print(f"[+] Captured delivery file: {downloaded.name} (bytes={len(dl_text.encode('utf-8'))}, sha256={_sha256_full(dl_text)})")
                 _close_preview(page)
                 return downloaded
             # D5.1: If the toolbar button produced an invalid/truncated file on this chip, do not re-download in a loop
@@ -5438,7 +5477,7 @@ def _paste_into_composer(page, composer, prompt_text: str) -> str:
     return landed
 
 
-def _type_and_send(page, composer, prompt_text: str) -> None:
+def _type_and_send(page, composer, prompt_text: str, on_progress: Optional[Any] = None) -> None:
     """Put the prompt into the composer, verify it landed, send it, and verify
     that the message was really delivered into the conversation.
 
@@ -5511,12 +5550,23 @@ def _type_and_send(page, composer, prompt_text: str) -> None:
             )
             continue
 
+        if on_progress:
+            try:
+                on_progress("prompt_pasted")
+            except Exception:
+                pass
+
         print(f"[+] Composer populated (length={len(landed_text)} chars). Sending...")
 
         # 2. Send. The keyboard is used first: a keyboard event goes to the
         #    focused element and never waits for the editor to become
         #    "stable", which on a huge Quill editor takes minutes.
         _focus_composer_dom(composer)
+        if on_progress:
+            try:
+                on_progress("prompt_sent")
+            except Exception:
+                pass
         try:
             page.keyboard.press("Control+Enter")
         except Exception:
@@ -5571,6 +5621,11 @@ def _type_and_send(page, composer, prompt_text: str) -> None:
                 time.sleep(0.5)
 
         if delivered_ok:
+            if on_progress:
+                try:
+                    on_progress("verified")
+                except Exception:
+                    pass
             return
 
         print(
@@ -5771,20 +5826,10 @@ RE_WORKING = re.compile(
 def _is_argon_working(page) -> bool:
     """True while Argon is still thinking, typing or the chat is still loading.
 
-    A conversation that is still LOADING shows the old error banner of an
-    earlier round and looks like a failed run - but the work is actually still
-    going. Carrying the task over then would cut a running job short, so the
-    working state has to be checked before anything is declared finished.
+    Must return False on a conversation whose last assistant turn has already finished.
     """
     try:
-        text = page.locator("body").inner_text(timeout=6000) or ""
-    except Exception:
-        text = ""
-    tail = text[-1200:]
-    if RE_WORKING.search(tail):
-        return True
-    try:
-        # The stop button only exists while a response is being produced.
+        # 1. The stop button only exists while a response is being actively generated.
         for sel in (
             "button[aria-label*='Stop' i]",
             "button[aria-label*='থামান']",
@@ -5796,10 +5841,56 @@ def _is_argon_working(page) -> bool:
                     return True
     except Exception:
         pass
+
     try:
-        # A spinner means the conversation is still being loaded. A
-        # `role=progressbar` is a loading indicator by definition, so its mere
-        # presence counts - it is often rendered without a size.
+        # 2. Check if the newest assistant turn has already finished.
+        turns = _assistant_turns(page)
+        if turns:
+            newest_turn = turns[-1]
+            if _element_is_after_last_user_turn(newest_turn):
+                # If there is a delivery chip in this turn, it is definitely finished.
+                if _generated_file_chip(page) is not None:
+                    return False
+
+                # Check for active loaders/spinners strictly within this turn
+                turn_has_loader = False
+                for sel in (
+                    ".mat-progress-spinner",
+                    "[class*='spinner']",
+                    "[class*='loader']",
+                    "[data-test-id*='loading']",
+                    "[class*='thinking']",
+                ):
+                    try:
+                        turn_loc = newest_turn.locator(sel)
+                        for i in range(min(turn_loc.count(), 3)):
+                            if _safe_visible(turn_loc.nth(i)):
+                                turn_has_loader = True
+                                break
+                        if turn_has_loader:
+                            break
+                    except Exception:
+                        pass
+                if turn_has_loader:
+                    return True
+
+                # If the turn has substantive text and no active loader or stop button,
+                # the assistant turn has finished.
+                try:
+                    t_text = (newest_turn.inner_text(timeout=2000) or "").strip()
+                    if t_text:
+                        return False
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    try:
+        # 3. Check for visible spinners in chat while conversation is loading.
+        # A `role=progressbar` is a loading indicator by definition, so its mere
+        # presence counts - it is often rendered without a size. This is checked
+        # ONLY after step 2 has ruled out a finished assistant turn, so a chat
+        # that already delivered its answer never counts as working.
         try:
             if page.locator("[role='progressbar']").count() > 0:
                 return True
@@ -5812,6 +5903,18 @@ def _is_argon_working(page) -> bool:
                     return True
     except Exception:
         pass
+
+    try:
+        # 4. Check RE_WORKING only if no completed assistant turn was found
+        text = page.locator("body").inner_text(timeout=4000) or ""
+        tail = text[-1200:]
+        if RE_WORKING.search(tail):
+            turns = _assistant_turns(page)
+            if not turns or not _element_is_after_last_user_turn(turns[-1]):
+                return True
+    except Exception:
+        pass
+
     return False
 
 
@@ -6215,33 +6318,93 @@ def _prompt_hash(text: str) -> str:
 
 
 def _last_user_message_text(page) -> str:
-    """Return the visible text of the last user message in the conversation, if any."""
+    """Return the visible text of the last user message in the conversation, if any.
+
+    Strictly excludes composer/input area elements, attachment cards/chips, and
+    'You said' headers so it never returns upload chips or the composer template.
+    """
+    try:
+        text = page.evaluate(
+            r"""() => {
+                const turnSelectors = [
+                    'message-turn.user-query',
+                    'message-turn:has(user-query)',
+                    'user-query',
+                    '[data-test-id="user-query"]',
+                    '.user-query-container'
+                ];
+                const allTurns = Array.from(document.querySelectorAll(turnSelectors.join(',')))
+                    .filter(el => {
+                        if (el.closest('rich-textarea, .input-area, .chat-input, footer, form, [data-test-id="chat-input"]')) {
+                            return false;
+                        }
+                        const r = el.getBoundingClientRect();
+                        return r.width > 0 && r.height > 0;
+                    });
+                if (!allTurns.length) return "";
+                const lastTurn = allTurns[allTurns.length - 1];
+
+                const textSelectors = [
+                    '.user-query-text',
+                    '.query-text',
+                    '[data-test-id="user-query-text"]',
+                    '.query-content',
+                    '.text-content',
+                    '.message-content'
+                ];
+                for (const sel of textSelectors) {
+                    const textEl = lastTurn.querySelector(sel);
+                    if (textEl) {
+                        const t = (textEl.innerText || "").trim();
+                        if (t) return t;
+                    }
+                }
+
+                const clone = lastTurn.cloneNode(true);
+                const stripSelectors = [
+                    'attachment-chip',
+                    '.attachment-chip',
+                    '[data-test-id*="attachment"]',
+                    'attachment-card',
+                    '.file-card',
+                    'mat-chip',
+                    '.file-preview',
+                    '[class*="attachment"]',
+                    '[class*="chip"]',
+                    '.user-query-header',
+                    'h2',
+                    'button'
+                ];
+                for (const sel of stripSelectors) {
+                    clone.querySelectorAll(sel).forEach(node => node.remove());
+                }
+                let t = (clone.innerText || "").trim();
+                t = t.replace(/^(You said|আপনি বলেছেন)[\s:\n]*/i, "").trim();
+                return t;
+            }"""
+        )
+        if text:
+            return text.strip()
+    except Exception:
+        pass
+
     for sel in (
-        "user-query",
-        "[data-test-id='user-query']",
         ".user-query-text",
         ".query-text",
-        "message-turn.user-query",
-        "div.user-query",
-        "[class*='user-query']",
+        "[data-test-id='user-query'] .user-query-text",
+        "user-query .user-query-text",
     ):
         try:
             loc = page.locator(sel)
             n = loc.count()
+            for i in range(n - 1, -1, -1):
+                el = loc.nth(i)
+                if _safe_visible(el):
+                    t = (el.inner_text(timeout=1500) or "").strip()
+                    if t:
+                        return t
         except Exception:
             continue
-        if not n:
-            continue
-        for i in range(n - 1, -1, -1):
-            try:
-                el = loc.nth(i)
-                if not _safe_visible(el):
-                    continue
-                t = (el.inner_text(timeout=1500) or "").strip()
-                if t:
-                    return t
-            except Exception:
-                continue
     return ""
 
 
@@ -6260,8 +6423,7 @@ def _check_duplicate_prompt(
     """Return the HH:MM:SS timestamp when this prompt is already the last user message.
 
     Checks both:
-      1. the last user message in the live conversation (using a hash of the
-         trimmed prompt or its first 200 characters), and
+      1. the last user message in the live conversation (comparing prompt hash or full normalized text), and
       2. the stored task state in ~/.gemini/argon_task_state.json when an
          unfinished task for the same project carries the same prompt/task hash.
 
@@ -6281,8 +6443,6 @@ def _check_duplicate_prompt(
     t_hash = _prompt_hash(trimmed_task) if trimmed_task else ""
     p_norm = _normalize_ws(trimmed_prompt)
     t_norm = _normalize_ws(trimmed_task)
-    p_prefix = p_norm[:200]
-    t_prefix = t_norm[:200]
 
     prev = prev_state if isinstance(prev_state, dict) else {}
     prev_status = str(prev.get("state") or "").strip().lower()
@@ -6290,30 +6450,27 @@ def _check_duplicate_prompt(
         str(prev.get("sent_at") or prev.get("started_at") or prev.get("updated_at") or "")
     )
 
+    # When the stored state is delivered or applied, the previous round FINISHED.
+    # A new prompt must NEVER be blocked by the DOM rule.
+    if prev_status in ("delivered", "applied"):
+        return None
+
     # 1. Inspect the last user message in the conversation DOM.
     last_user_raw = _last_user_message_text(page)
     if last_user_raw:
         u_hash = _prompt_hash(last_user_raw)
         u_norm = _normalize_ws(last_user_raw)
-        u_prefix = u_norm[:200]
         dom_matches = False
         if p_hash and u_hash == p_hash:
             dom_matches = True
         elif t_hash and u_hash == t_hash:
             dom_matches = True
-        elif p_prefix and len(p_prefix) >= 20 and (p_prefix in u_norm or u_prefix in p_norm):
-            dom_matches = True
-        elif t_prefix and len(t_prefix) >= 20 and t_prefix in u_norm:
+        elif p_norm and u_norm and (p_norm == u_norm or (len(p_norm) > 100 and p_norm in u_norm)):
             dom_matches = True
 
         if dom_matches:
-            # Rule 1.4: if the previous turn with this text ALREADY finished and
-            # delivered its patch, a follow-up that repeats the task text is
-            # still a new task. Only block when the last user message has no
-            # completed delivery yet (or is still running).
             already_completed = (
-                prev_status in ("delivered", "applied")
-                and not _is_argon_working(page)
+                not _is_argon_working(page)
                 and _generated_file_chip(page) is not None
             )
             if not already_completed:
@@ -7359,6 +7516,54 @@ def dispatch_to_argon(
     task_registry = TaskRegistry()
     delivery_ledger = DeliveryLedger()
 
+    send_progress = "none"
+    if not resume:
+        task_state_store.set(proj_root, lane=lane, send_progress="none")
+        task_registry.update_running(proj_root, lane=lane, send_progress="none")
+
+    def _track_send_progress(p_val: str) -> None:
+        nonlocal send_progress
+        send_progress = p_val
+        task_state_store.set(proj_root, lane=lane, send_progress=p_val)
+        task_registry.update_running(proj_root, lane=lane, send_progress=p_val)
+
+    def _emit_send_failure(step_name: str, shot_path_val: Optional[Path] = None, page_obj: Any = None) -> None:
+        try:
+            from manual_handoff import write_manual_handoff_pack
+            from argon_pool_login import find_chrome_executable
+            c_exe = find_chrome_executable()
+            p_dir = Path.home() / ".gemini" / "argon_profiles" / f"slot-{_slot_key(active_slot)}"
+            cur_chat = ""
+            if page_obj is not None:
+                try:
+                    cur_chat = str(getattr(page_obj, "url", "") or "")
+                except Exception:
+                    cur_chat = ""
+            md_p, _ = write_manual_handoff_pack(
+                proj_root=proj_root,
+                lane=lane or "new",
+                slot=active_slot or "/u/0/",
+                email=target_email or "",
+                chat_url=cur_chat or target_url or "https://gemini.google.com/u/0/app",
+                prompt_text=prompt_text or "",
+                prompt_path=Path(prompt_file).resolve() if prompt_file and Path(prompt_file).is_file() else None,
+                zip_path=zip_path,
+                send_progress=send_progress,
+                failed_step=step_name,
+                last_screenshot=shot_path_val,
+                chrome_exe=c_exe,
+                profile_dir=p_dir,
+            )
+            print("\n[i] Manual hand-off summary:")
+            print(f"    Account e-mail : {target_email or '(none / unconfigured)'}")
+            print(f"    Chat link      : {cur_chat or target_url or 'https://gemini.google.com/u/0/app'}")
+            print(f"    Prompt path    : {str((Path(prompt_file).resolve()) if prompt_file and Path(prompt_file).is_file() else (md_p.parent / 'dispatch_prompt.md').resolve())}")
+            print(f"    ZIP path       : {str(zip_path.resolve())}")
+            print(f"    Last screenshot: {str(shot_path_val.resolve()) if shot_path_val else '(none)'}")
+            print(f"[i] Manual hand-off pack: {md_p.resolve()}")
+        except Exception as _handoff_err:
+            print(f"[!] Warning: Could not write manual hand-off pack: {_handoff_err}", file=sys.stderr)
+
     # D4.5: Surface any STALE tasks in the registry (with their age and screenshot)
     stale_list = task_registry.stale_tasks()
     if stale_list:
@@ -8063,6 +8268,8 @@ def dispatch_to_argon(
                 think_ok = True
 
             attached = True if resume_chat else _retry(lambda p: attach_zip(p, zip_path), page)
+            if attached and not resume_chat:
+                _track_send_progress("zip_attached")
             if not resume_chat:
                 ok_z, z_sz, z_cnt, _ = _inspect_zip_archive(zip_path)
                 size_tag = f" ({z_sz} bytes, {z_cnt} entries, TASK_BRIEF.md verified)" if ok_z else " (invalid/corrupt archive)"
@@ -8191,6 +8398,7 @@ def dispatch_to_argon(
                 task_state_store.set(proj_root, lane=lane, state="preflight_failed", diagnostic_evidence=ev_pf)
                 task_registry.register_done(proj_root, lane=lane, slot=active_slot, status="failed", screenshot_path=str(shot_saved or ""))
                 _print_run_failure_summary(ev_pf)
+                _emit_send_failure("preflight_failure", shot_saved, page_obj=page)
                 return EXIT_PREFLIGHT_FAILED
 
             # D6.1: Take step screenshot right after pre-flight and upload completion
@@ -8361,7 +8569,7 @@ def dispatch_to_argon(
                                         print(f"[!] Warning: Could not read brief summary {bs_path}: {exc}", file=sys.stderr)
                                 else:
                                     print(f"[!] Warning: Brief summary file not found at {bs_path}; continuing without summary display.", file=sys.stderr)
-                            _type_and_send(page, composer, prompt_text)
+                            _type_and_send(page, composer, prompt_text, on_progress=_track_send_progress)
                             sent_hms = time.strftime("%H:%M:%S")
                             just_sent_prompt = True
                             sent_shot = _take_step_screenshot(
@@ -8419,7 +8627,7 @@ def dispatch_to_argon(
                             print(f"    account / profile : {active_slot}  ({profile_dir_str})")
                         else:
                             print("[!] Composer not visible - the prompt was not sent.", file=sys.stderr)
-                            _take_step_screenshot(
+                            shot_cm = _take_step_screenshot(
                                 page,
                                 proj_root,
                                 "preflight_failure.png",
@@ -8428,6 +8636,7 @@ def dispatch_to_argon(
                                 lane=lane,
                             )
                             task_registry.register_done(proj_root, lane=lane, slot=active_slot, status="failed")
+                            _emit_send_failure("composer_missing", shot_cm, page_obj=page)
                             return EXIT_PREFLIGHT_FAILED
             except Exception as exc:
                 if _is_target_closed_error(exc):
@@ -9053,7 +9262,14 @@ def dispatch_to_argon(
                         lane=lane, patch_path=str(delivered_path),
                         workspace_mode=proven_ws_mode,
                     )
-                print(f"[SUCCESS] Delivered patch file: {delivered_path}")
+                print(f"[SUCCESS] Delivered patch file: {delivered_path} (sha256={_sha256_full(delivered_text if 'delivered_text' in locals() and delivered_text else delivered_path.read_text(encoding='utf-8', errors='replace'))})")
+                if lane == "new":
+                    print(
+                        f"\n[i] Winner confirmation for 'new' lane:\n"
+                        f"    Account e-mail : {target_email or '(none)'}\n"
+                        f"    Chat link      : {effective_chat_url}\n"
+                        f"    Please confirm or correct whether this conversation should be recorded as the winner."
+                    )
                 _, summary_text = _copy_and_save_response_summary(
                     page,
                     delivered_path.parent,
@@ -9520,6 +9736,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Reuse an existing argon_context.zip without re-running package_context.",
     )
     parser.add_argument(
+        "--manual-handoff",
+        action="store_true",
+        help="Generate a manual hand-off pack for this project/lane without sending a prompt.",
+    )
+    parser.add_argument(
+        "--open-browser",
+        action="store_true",
+        help="When generating a manual hand-off pack, open the target conversation in that slot's real Chrome profile and leave it open.",
+    )
+    parser.add_argument(
         "--open-comparison",
         action="store_true",
         help="Open comparison.html in the default browser when --dual finishes.",
@@ -9804,6 +10030,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     _make_console_utf8_safe()
     parser = build_arg_parser()
     args = parser.parse_args(argv)
+
+    if getattr(args, "manual_handoff", False):
+        from manual_handoff import run_manual_handoff_cli
+
+        return run_manual_handoff_cli(
+            project_path=args.project_path,
+            lane=args.lane,
+            slot=args.slot,
+            open_browser=getattr(args, "open_browser", False),
+            mode=args.mode,
+        )
 
     if args.list_sessions:
         return list_sessions()
