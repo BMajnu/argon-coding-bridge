@@ -63,7 +63,7 @@ Open the repository root (where `skills/argon-coding-bridge/SKILL.md` lives) or 
 
 5. **Multi-Account Pool Automatic Sign-In, Per-Slot Isolation & Rotation:**
    - `argon_pool_login.py` and `login_pool_accounts.py` sign each Google Pro account in `skills/argon-coding-bridge/config/accounts_pool.json` into its own dedicated slot profile (`~/.gemini/argon_profiles/slot-uN/`), using `~/.gemini/argon_browser_profile` as the master seed profile.
-   - Automatically fills credentials via Google's `AddSession` flow, prefers Chrome's saved password autofill when present, and pauses with a Windows tray notification, audible alert, and in-app modal dialog whenever human 2FA/OTP approval is required.
+   - Automatically fills credentials via Google's `ServiceLogin` flow, completes account registration and Gemini consent, prefers Chrome's saved password autofill when present, and pauses with a Windows tray notification, audible alert, and in-app modal dialog whenever human 2FA/OTP approval is required.
    - Prevents parallel runs from colliding via per-slot lock files (`~/.gemini/argon_locks/slot-uN.lock`) with stale-PID reclamation, SQLite online cookie backup seeding, and automatic rotation to the next free pool account.
 
 ---
@@ -108,6 +108,29 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File .\skills\argon-coding-bridge\scrip
   -AutoApply
 
 ```
+
+---
+
+## 📋 The Brief Is Shown Before It Is Sent
+
+To avoid misunderstandings before dispatch, `prepare_brief.py` summarizes what will be sent:
+- Fenced, byte-exact prompt preview with SHA-256 and byte length.
+- Context archive entry count and size.
+- Target files parsed from the brief to show blast radius.
+- Dispatch facts (slot, account email, Task mode, 4 Argon model).
+
+```bash
+python skills/argon-coding-bridge/scripts/prepare_brief.py --project-path . --brief <brief.md> --lane followup --slot /u/0/
+```
+
+---
+
+## 🛠️ Fix Memory and Contribution Branches
+
+Defect fixes and architectural improvements are tracked in structured debugging memory:
+- **Record fixes:** `record_fix.py` saves structured notes to `~/.gemini/argon_fixes/fixes/<id>.md`, updates `index.json`, and copies notes to `knowledge/fixes/` for branch commit (`fixes/<scope-slug>`).
+- **Analyze fixes:** `analyze_fixes.py` matches unmerged commits on `fixes/*` branches with recorded notes and outputs brief-ready instructions for subsequent rounds.
+- See `CONTRIBUTING.md` and `knowledge/fixes/README.md` for contributor guidelines.
 
 ---
 

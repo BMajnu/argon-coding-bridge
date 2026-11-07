@@ -44,9 +44,8 @@ DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "accou
 
 GEMINI_CONTINUE_URL = "https://gemini.google.com/u/0/app"
 GOOGLE_ADD_SESSION_URL = (
-    "https://accounts.google.com/v3/signin/identifier"
-    "?flowName=GlifWebSignIn&flowEntry=AddSession"
-    "&continue=https%3A%2F%2Fgemini.google.com%2Fu%2F0%2Fapp"
+    "https://accounts.google.com/ServiceLogin"
+    "?continue=https%3A%2F%2Fgemini.google.com%2Fu%2F0%2Fapp"
 )
 GEMINI_WEB_URL = "https://gemini.google.com{slot}app"
 
@@ -1249,6 +1248,21 @@ class GoogleLogin:
         # page - only the guest sidebar item counts.
         if "sign in to save activity" in body or "sign in or create an account" in body:
             return False
+
+        # Verify account is registered in profile Preferences (account_info)
+        try:
+            pref_file = self.profile_dir / "Default" / "Preferences"
+            if pref_file.is_file():
+                pref_data = json.loads(pref_file.read_text(encoding="utf-8", errors="replace"))
+                acc_info = pref_data.get("account_info")
+                # If account_info is an empty list or dict, registration at index 0 failed
+                if acc_info is not None:
+                    if isinstance(acc_info, (list, dict)) and not acc_info:
+                        logger.warning("Default/Preferences has empty account_info; account is not registered at index 0.")
+                        return False
+        except Exception as exc:
+            logger.warning("Could not check account_info in Preferences: %s", exc)
+
         try:
             if page.locator(
                 "a[aria-label*='Google Account'], button[aria-label*='Google Account']"
@@ -1542,9 +1556,15 @@ class GoogleLogin:
                     email=email,
                 )
 
-            # Final check if signed in
+            # Final check if signed in and verified in profile
             self._dismiss_post_login_prompts(page)
             if self.is_signed_in(page):
+                if not self.verify_session():
+                    return LoginResult(
+                        status=STATUS_FAILED,
+                        detail=f"Sign-in completed but account registration verification failed for {email} (shows guest page or missing Preferences account_info).",
+                        email=email,
+                    )
                 return LoginResult(
                     status=STATUS_OK,
                     detail=f"Signed in {email}.",

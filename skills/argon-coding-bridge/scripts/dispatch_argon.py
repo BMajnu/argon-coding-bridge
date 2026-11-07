@@ -4022,7 +4022,17 @@ def _mode_is_task(page) -> bool:
     Never returns True when no toggle is rendered: a missing toggle means the
     page's mode cannot be observed from the toggle alone (it may be an existing
     Chat-mode conversation or a half-rendered page).
+    Returns False immediately if the visible model chip says 'Argon High'
+    (which proves Chat mode with thinking level).
     """
+    try:
+        chip = _model_chip(page)
+        if chip is not None:
+            c_name = (_model_name(chip) or "").strip().lower()
+            if "high" in c_name:
+                return False
+    except Exception:
+        pass
     try:
         task = page.get_by_text(RE_TASK)
         for i in range(min(task.count(), 6)):
@@ -4756,12 +4766,28 @@ def select_task_mode(
         else str(getattr(page, "_argon_recorded_workspace_mode", "") or "")
     ).strip().lower()
 
+    chip_el = _model_chip(page)
+    chip_text = (_model_name(chip_el) or "").strip() if chip_el is not None else ""
+    if chip_text:
+        setattr(page, "_argon_chip_seen", chip_text)
+    if chip_text and "high" in chip_text.lower():
+        setattr(page, "_argon_workspace_mode", "chat")
+        setattr(page, "_argon_mode_status", f"REFUSED (chip='{chip_text}')")
+        print(
+            f"[!] Mode = Chat : REFUSED (chip={chip_text!r} indicates Chat mode thinking level) - "
+            "refusing to send in Chat mode.",
+            file=sys.stderr,
+        )
+        return False
+
     deadline = time.monotonic() + (max(2.0, float(wait_for_toggle_seconds)) if require_verifiable else 4.0)
     while True:
         try:
             if _mode_is_task(page):
+                c_now = getattr(page, "_argon_chip_seen", "")
+                c_tag = f", chip='{c_now}'" if c_now else ""
                 setattr(page, "_argon_workspace_mode", "task")
-                setattr(page, "_argon_mode_status", "OK (observed toggle=Task)")
+                setattr(page, "_argon_mode_status", f"OK (observed toggle=Task{c_tag})")
                 return True
             task_btn = page.get_by_text(RE_TASK)
             toggle_found = False
@@ -5794,6 +5820,7 @@ STOPPED_RESPONSE_MARKERS = (
     "আপনি এই উত্তরটি থামিয়েছেন",
     "আপনি এই উত্তরটি থামিয়েছেন",
     "response was stopped",
+    "stopped",
 )
 
 
@@ -5806,6 +5833,13 @@ def _detect_stopped_response(page) -> Optional[str]:
             for marker in STOPPED_RESPONSE_MARKERS:
                 if marker in t_txt:
                     return "You stopped this response"
+            lines = [ln.strip() for ln in t_txt.splitlines() if ln.strip()]
+            if lines and (
+                lines[-1] == "stopped"
+                or (len(lines) >= 2 and lines[-2] == "gemini said" and lines[-1] == "stopped")
+                or any(ln == "stopped" for ln in lines[-3:])
+            ):
+                return "You stopped this response"
     except Exception:
         pass
     try:
@@ -5817,6 +5851,12 @@ def _detect_stopped_response(page) -> Optional[str]:
     for marker in STOPPED_RESPONSE_MARKERS:
         if marker in tail_joined:
             return "You stopped this response"
+    if tail_lines and (
+        tail_lines[-1] == "stopped"
+        or (len(tail_lines) >= 2 and tail_lines[-2] == "gemini said" and tail_lines[-1] == "stopped")
+        or any(ln == "stopped" for ln in tail_lines[-3:])
+    ):
+        return "You stopped this response"
     return None
 
 
@@ -7298,6 +7338,7 @@ def dispatch_to_argon(
     skip_package: bool = False,
     force: bool = False,
     deadline_seconds: int = 1800,
+    brief_summary: Optional[str] = None,
 ) -> int:
     proj_root = Path(project_path).resolve()
     zip_path = proj_root / output_zip if not Path(output_zip).is_absolute() else Path(output_zip)
@@ -7993,14 +8034,24 @@ def dispatch_to_argon(
                     ),
                     page,
                 )
-                mode_status_str = (
-                    "OK (manual)"
-                    if manual_setup
-                    else (
-                        str(getattr(page, "_argon_mode_status", "") or ("OK" if mode_ok else "UNKNOWN"))
+                chip_seen_pf = getattr(page, "_argon_chip_seen", "")
+                if not chip_seen_pf:
+                    chip_el_pf = _model_chip(page)
+                    chip_seen_pf = (_model_name(chip_el_pf) or "").strip() if chip_el_pf is not None else ""
+
+                if not manual_setup and chip_seen_pf and "high" in chip_seen_pf.lower():
+                    preflight.append(f"mode = Chat : REFUSED (chip='{chip_seen_pf}')")
+                    mode_ok = False
+                else:
+                    chip_tag = f" (chip='{chip_seen_pf}')" if (chip_seen_pf and mode_ok and "chip=" not in str(getattr(page, "_argon_mode_status", ""))) else ""
+                    mode_status_str = (
+                        "OK (manual)"
+                        if manual_setup
+                        else (
+                            str(getattr(page, "_argon_mode_status", "") or ("OK" if mode_ok else "UNKNOWN"))
+                        )
                     )
-                )
-                preflight.append(f"mode = Task : {mode_status_str}")
+                    preflight.append(f"mode = Task : {mode_status_str}{chip_tag}")
                 model_ok = True if manual_setup else _retry(
                     lambda p: select_argon_model(p, require_chip=not is_continuation),
                     page,
@@ -8297,6 +8348,19 @@ def dispatch_to_argon(
                                         proj_root, lane=lane, slot=active_slot, status="failed", screenshot_path=str(shot_foreign_pre or "")
                                     )
                                     return EXIT_PREFLIGHT_FAILED
+                            if brief_summary:
+                                bs_path = Path(brief_summary).resolve()
+                                if bs_path.is_file():
+                                    try:
+                                        print("\n" + "=" * 78)
+                                        print(f"[i] Brief Summary ({bs_path}):")
+                                        print("=" * 78)
+                                        print(bs_path.read_text(encoding="utf-8"))
+                                        print("=" * 78 + "\n")
+                                    except Exception as exc:
+                                        print(f"[!] Warning: Could not read brief summary {bs_path}: {exc}", file=sys.stderr)
+                                else:
+                                    print(f"[!] Warning: Brief summary file not found at {bs_path}; continuing without summary display.", file=sys.stderr)
                             _type_and_send(page, composer, prompt_text)
                             sent_hms = time.strftime("%H:%M:%S")
                             just_sent_prompt = True
@@ -9315,10 +9379,26 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--project-path", default=".", help="Path to the project root")
     parser.add_argument(
         "--mode",
-        choices=["gemini"],
         default="gemini",
-        help="Target workspace: 'gemini' (https://gemini.google.com/app). Google AI "
-             "Studio was removed - it consistently fails on agentic work.",
+        help="Target workspace ('gemini') or workspace mode ('task'/'chat' when using --record-workspace-mode).",
+    )
+    parser.add_argument(
+        "--record-workspace-mode",
+        default=None,
+        metavar="CHAT_ID",
+        help="Record workspace mode ('task' or 'chat') for an existing conversation in session store.",
+    )
+    parser.add_argument(
+        "--brief-summary",
+        default=None,
+        metavar="PATH",
+        help="Print this brief summary file before sending prompt and record in task registry.",
+    )
+    parser.add_argument(
+        "--brief-text",
+        default=None,
+        metavar="FILE",
+        help="Send the contents of this brief file as the task instead of --task.",
     )
     parser.add_argument("--slot", default=None, help="Account pool slot (e.g. /u/0/)")
     parser.add_argument("--headless", action="store_true", help="Run browser in headless mode")
@@ -9704,7 +9784,24 @@ def list_registered_tasks_cli() -> int:
     return EXIT_SUCCESS
 
 
+def _make_console_utf8_safe() -> None:
+    """Never let a print kill the dispatcher with UnicodeEncodeError.
+
+    A redirected pipe on Windows defaults to cp1252. The brief summary that
+    --brief-summary prints contains emoji and Bengali text, so printing it raw
+    raises UnicodeEncodeError; the surrounding try/except then swallows the
+    summary instead of showing it. Keep the stream's own encoding but replace
+    whatever it cannot represent, so the summary is always displayed.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except Exception:
+            pass
+
+
 def main(argv: Optional[List[str]] = None) -> int:
+    _make_console_utf8_safe()
     parser = build_arg_parser()
     args = parser.parse_args(argv)
 
@@ -9719,6 +9816,45 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.record_winner is not None:
         return record_winner_cli(args.project_path, args.record_winner, mode=args.mode)
+
+    if getattr(args, "record_workspace_mode", None) is not None:
+        cid = str(args.record_workspace_mode).strip()
+        wanted_mode = (getattr(args, "workspace_mode", "") or args.mode or "").strip().lower()
+        if wanted_mode not in ("task", "chat"):
+            print(f"[!] Error: Mode must be 'task' or 'chat', got {wanted_mode!r}.", file=sys.stderr)
+            return EXIT_PREFLIGHT_FAILED
+        sess_store = SessionStore()
+        sess_store.load()
+        proj_key = sess_store._find_key(args.project_path)
+        if not proj_key:
+            print(
+                f"[!] Error: Project {Path(args.project_path).resolve()} not found in session store ({sess_store.path}).",
+                file=sys.stderr,
+            )
+            return EXIT_PREFLIGHT_FAILED
+        s_data = sess_store.data.get("sessions", {}).get(proj_key, {})
+        matched = False
+        if s_data.get("chat_id") == cid:
+            s_data["workspace_mode"] = wanted_mode
+            matched = True
+        lanes = s_data.get("lanes", {})
+        if isinstance(lanes, dict):
+            for l_key, l_val in lanes.items():
+                if isinstance(l_val, dict) and l_val.get("chat_id") == cid:
+                    l_val["workspace_mode"] = wanted_mode
+                    matched = True
+        if not matched:
+            print(
+                f"[!] Error: Chat ID {cid!r} is not known for project {Path(args.project_path).resolve()}; "
+                f"cannot record workspace_mode.",
+                file=sys.stderr,
+            )
+            return EXIT_PREFLIGHT_FAILED
+        sess_store.save()
+        print(
+            f"[+] Recorded workspace_mode={wanted_mode!r} for conversation {cid} in session store ({sess_store.path})."
+        )
+        return EXIT_SUCCESS
 
     if getattr(args, "register_task_done", False):
         reg = TaskRegistry()
@@ -9767,8 +9903,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
         return EXIT_SUCCESS
 
+    if getattr(args, "brief_text", None):
+        bt_path = Path(args.brief_text).resolve()
+        if not bt_path.is_file():
+            parser.error(f"--brief-text file not found: {args.brief_text}")
+        args.task = bt_path.read_text(encoding="utf-8")
+
     if not args.resume and not (args.task or "").strip():
-        parser.error("the following arguments are required: --task (unless --resume is used)")
+        parser.error("the following arguments are required: --task (unless --resume or --brief-text is used)")
 
     if args.dual:
         from dual_dispatch import run_dual_dispatch

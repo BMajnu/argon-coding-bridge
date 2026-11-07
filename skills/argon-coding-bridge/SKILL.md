@@ -76,25 +76,44 @@ Command:  `python "./skills/argon-coding-bridge/scripts/dispatch_argon.py" --pro
 Why:  the registry is what tells you (and the next run) which account is
       already busy. It is the ONLY source of truth for "is this slot free".
 
-### Step 2 - Send the FOLLOW-UP first
+### Step 2 - Prepare the brief and SHOW IT TO THE USER
+
+Commands:
+  python ./skills/argon-coding-bridge/scripts/prepare_brief.py --project-path . \
+         --brief "<the brief file you wrote>" --lane followup --slot "<slot>"
+
+Then show the user the contents of the summary file the command printed, and
+say plainly:
+  - what you understood the request to be,
+  - the exact prompt text that is going to be sent (the brief, verbatim),
+  - what the archive contains,
+  - which files are going to change,
+  - which account and which mode are going to be used.
+
+WAIT for the user. If the user corrects anything, fix the brief file and run the
+command again. Only when the user is happy do you continue to Step 3.
+
+Never send a prompt the user has not seen.
+
+### Step 3 - Send the FOLLOW-UP first
 Command:  `python "./skills/argon-coding-bridge/scripts/dispatch_argon.py" --project-path . --task "<task>" --slot "<the account that holds the chat>" --lane followup`
 Why:  the follow-up runs in the conversation that already knows this codebase.
       Send this one FIRST and let it finish.
 
-### Step 3 - CHECK the follow-up before you go on
+### Step 4 - CHECK the follow-up before you go on
 Read the screenshot of the run (the path is printed) and check three things:
   a. the conversation was in TASK mode (not Chat),
   b. the model chip said 4 Argon,
   c. Argon produced a real answer, not a chat-style reply.
 If anything is wrong, FIX IT FIRST and send the follow-up again.
-Only when the follow-up is confirmed good do you continue to Step 4.
+Only when the follow-up is confirmed good do you continue to Step 5.
 
-### Step 4 - Then run the NEW task
+### Step 5 - Then run the NEW task
 Command:  `python "./skills/argon-coding-bridge/scripts/dispatch_argon.py" --project-path . --task "<task>" --new-session --slot "<another account>"`
 Why:  a new task belongs in a new conversation, on a different account, so the
       two runs never collide.
 
-### Step 5 - Compare and apply
+### Step 6 - Compare and apply
 Command:  `python "./skills/argon-coding-bridge/scripts/compare_argon_patches.py" --followup-patch "downloads/followup/apply_changes.ps1" --new-patch "downloads/new/apply_changes.ps1" --merge --pick new --apply`
 Why:  compares the follow-up delivery and the new-session delivery side by side,
       combines their non-conflicting blocks (using `--pick new` or `--choices`
@@ -102,7 +121,7 @@ Why:  compares the follow-up delivery and the new-session delivery side by side,
       the local build verification once. Record the winning lane afterwards with:
       `python "./skills/argon-coding-bridge/scripts/dispatch_argon.py" --project-path . --record-winner followup|new`
 
-### Step 6 - Mark the task completed
+### Step 7 - Mark the task completed
 Command:  `python "./skills/argon-coding-bridge/scripts/dispatch_argon.py" --project-path . --register-task-done --label "<same label>"`
 Why:  releases the task in `~/.gemini/argon_tasks.json` so the next round sees
       accurate slot load counts.
@@ -121,7 +140,14 @@ Why:  releases the task in `~/.gemini/argon_tasks.json` so the next round sees
    wall. A third task on the same account should be avoided, not blocked.
 4. **Never send a prompt in Chat mode.** If the mode cannot be proven, the
    agent opens a NEW chat, switches it to Task, and checks the chip before it
-   sends.
+   sends. If a follow-up is refused with `mode = Task : UNKNOWN`, inspect the
+   conversation: if the user confirms it is a Task-mode conversation, record it with
+   `python ./skills/argon-coding-bridge/scripts/dispatch_argon.py --project-path . --record-workspace-mode <chat-id> --mode task`
+   and retry. Never record a mode that has not been confirmed.
+5. **Show the brief before it is sent.** The agent summarizes what it understood
+   and waits for user approval.
+6. **Record what you fixed.** When fixing defects, record debugging notes with
+   `record_fix.py` and commit on a dedicated `fixes/<scope-slug>` branch.
 5. **Read the step screenshot before every decision.** The terminal line is a
    summary; the screenshot is the evidence.
 
