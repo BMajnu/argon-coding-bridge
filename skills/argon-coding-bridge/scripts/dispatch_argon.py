@@ -356,21 +356,113 @@ def build_dual_prompts(
     )
 
 
+QUARANTINE_DIR_NAME = ".argon_quarantine"
+MAX_CHIP_DOWNLOAD_ATTEMPTS = 3
+MAX_LADDER_ATTEMPTS = 3
+
+
+def _is_quarantined_path(path: Path) -> bool:
+    """Return True when `path` sits inside `.argon_quarantine` (Section 2.1.C)."""
+    try:
+        parts = [pt.lower() for pt in Path(path).parts]
+        return QUARANTINE_DIR_NAME.lower() in parts or "quarantine" in parts
+    except Exception:
+        return False
+
+
+def _quarantine_rejected_file(
+    file_path: Path,
+    reason: str,
+    project_path: Optional[Path] = None,
+    dest_dir: Optional[Path] = None,
+    defects: Optional[List[Dict[str, Any]]] = None,
+) -> Optional[Path]:
+    """Move a rejected download into `<project_root>/.argon_quarantine/` so it is NEVER deleted (Section 2.1.B & 2.1.C).
+
+    Both `find_delivered_patch()` and `_is_leftover_delivery()` skip `.argon_quarantine`,
+    so a kept rejected file is never re-picked as a delivery or mis-read as a duplicate.
+    Prints the file name, its byte size, the exact check that failed, and its ABSOLUTE PATH.
+    """
+    try:
+        src = Path(file_path)
+        if not src.is_file():
+            return None
+        try:
+            file_bytes = src.stat().st_size
+        except OSError:
+            file_bytes = 0
+
+        proj_root = project_path
+        if proj_root is None and dest_dir is not None:
+            proj_root = _infer_project_root_from_dest(Path(dest_dir))
+        if proj_root is None:
+            proj_root = _infer_project_root_from_dest(src.parent) or src.parent.parent
+
+        q_dir = Path(proj_root).resolve() / QUARANTINE_DIR_NAME
+        q_dir.mkdir(parents=True, exist_ok=True)
+
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        clean_name = re.sub(r"^\.staging_\d+_\d+_", "", src.name)
+        if not clean_name.lower().endswith(".ps1"):
+            clean_name = f"{clean_name}.ps1"
+        q_dest = q_dir / f"{ts}_{os.getpid()}_{clean_name}"
+        counter = 1
+        while q_dest.exists():
+            counter += 1
+            q_dest = q_dir / f"{ts}_{os.getpid()}_{counter}_{clean_name}"
+
+        try:
+            os.replace(str(src), str(q_dest))
+        except Exception:
+            shutil.copy2(str(src), str(q_dest))
+            try:
+                src.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+        abs_q = q_dest.resolve()
+        print(
+            f"[!] Rejected delivery file kept in quarantine (NEVER deleted):\n"
+            f"    File name      : {clean_name}\n"
+            f"    File size      : {file_bytes} bytes\n"
+            f"    Failed check   : {reason}\n"
+            f"    Quarantine path: {abs_q}",
+            file=sys.stderr,
+        )
+        if defects:
+            for d in defects:
+                print(
+                    f"  [REFUSED] file={d.get('file', '<script>')}  "
+                    f"label={d.get('label', 'check')}  "
+                    f"offset={d.get('offset', 0)}  "
+                    f"reason={d.get('reason', reason)}",
+                    file=sys.stderr,
+                )
+        print(
+            f'    Inspect or apply by hand with: Open_Argon_Apply.bat -PatchFile "{abs_q}"',
+            file=sys.stderr,
+        )
+        return abs_q
+    except Exception as exc:
+        print(f"[!] Could not move rejected file {file_path} to quarantine: {exc}", file=sys.stderr)
+        return file_path if Path(file_path).is_file() else None
+
+
 def find_delivered_patch(search_dirs, target_name: str = "apply_changes",
                          newer_than: Optional[float] = None) -> Optional[Path]:
     """Find the newest delivered `apply_changes*.ps1` inside the given folders.
 
     `newer_than` filters by modification time so a file that was already lying
-    around cannot be mistaken for a fresh delivery.
+    around cannot be mistaken for a fresh delivery. Skips `.argon_quarantine`.
     """
     best: Optional[Path] = None
     for d in search_dirs:
         try:
             d = Path(d)
-            if not d.is_dir():
+            if not d.is_dir() or _is_quarantined_path(d):
                 continue
             for p in d.glob(f"{target_name}*.ps1"):
-                if not p.is_file():
+                if not p.is_file() or _is_quarantined_path(p):
                     continue
                 if newer_than is not None:
                     try:
@@ -405,11 +497,75 @@ TYPOGRAPHIC_QUOTES = (chr(0x2018), chr(0x2019), chr(0x201C), chr(0x201D))
 PROSE_ONLY_EXTENSIONS = {".md", ".txt", ".rst"}
 
 
-def _extract_patch_payload_blocks(patch_text: str) -> List[Dict[str, Any]]:
-    """Extract every here-string payload block (@'...'@ and @"..."@) with its target file and label."""
+class _PatchCheckResult:
+    """Boolean-compatible validation result that also carries the exact failure reason and defects list (Section 2.1.B).
+
+    Supports:
+      - `if _looks_like_patch(text):` / `if not _patch_is_complete(text):` (via `__bool__`)
+      - `ok, reason = _looks_like_patch(text)` (via `__iter__`)
+      - `res.ok`, `res.reason`, `res.defects`
+      - `str(res)` -> returns `res.reason`
+    """
+
+    def __init__(
+        self,
+        ok: bool,
+        reason: str = "",
+        defects: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
+        self.ok = bool(ok)
+        self.reason = str(reason or "")
+        self.defects: List[Dict[str, Any]] = list(defects or [])
+        if not self.ok and self.reason and not self.defects:
+            self.defects.append(
+                {
+                    "file": "<script>",
+                    "label": "patch-check",
+                    "offset": 0,
+                    "reason": self.reason,
+                }
+            )
+
+    def __bool__(self) -> bool:
+        return self.ok
+
+    def __iter__(self):
+        yield self.ok
+        yield self.reason
+
+    def __eq__(self, other: Any) -> bool:
+        if isinstance(other, bool):
+            return self.ok == other
+        if isinstance(other, _PatchCheckResult):
+            return self.ok == other.ok and self.reason == other.reason
+        if isinstance(other, str):
+            return self.reason == other
+        return False
+
+    def __str__(self) -> str:
+        return self.reason if not self.ok else "ok"
+
+    def __repr__(self) -> str:
+        return f"_PatchCheckResult(ok={self.ok}, reason={self.reason!r})"
+
+
+def _parse_herestring_blocks(
+    patch_text: str,
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], str]:
+    """Parse PowerShell here-string blocks line-by-line and evaluate delimiter balance PER BLOCK (Section 2.1.A).
+
+    In PowerShell, a here-string opens ONLY at the end of a script line
+    and closes ONLY on a line whose start is the matching closer at column 0 with nothing else
+    on that line. Any delimiter token inside an already-open payload body is payload content,
+    not a script delimiter.
+    # Preserves balance for ' (or ') and ' (or ')
+
+    Returns `(blocks, delimiter_defects, outside_script_text)`.
+    """
     blocks: List[Dict[str, Any]] = []
+    delimiter_defects: List[Dict[str, Any]] = []
     if not patch_text:
-        return blocks
+        return blocks, delimiter_defects, ""
 
     open_sq = chr(64) + chr(39)
     close_sq = chr(39) + chr(64)
@@ -417,108 +573,253 @@ def _extract_patch_payload_blocks(patch_text: str) -> List[Dict[str, Any]]:
     close_dq = chr(34) + chr(64)
 
     file_assign_re = re.compile(
-        r"(?:\$(?:relPath|rel|relativePath|file|targetRel)\s*=\s*['\"]([^'\"]+)['\"]|"
+        r"(?:\$(?:relPath|rel|relativePath|file|targetRel)(?:_\w+|\d+)?\s*=\s*['\"]([^'\"]+)['\"]|"
         r"Join-Path\s+\$TargetRoot\s+['\"]([^'\"]+)['\"]|"
-        r"(?:-RelPath|File\s*=)\s*['\"]([^'\"]+)['\"])",
+        r"(?:-RelPath|(?:RelPath|File)\s*=)\s*['\"]([^'\"]+)['\"])",
         re.IGNORECASE,
     )
     label_assign_re = re.compile(
         r"(?:\$([A-Za-z_]\w*)\s*=\s*$|(?:-Label|Label\s*=)\s*['\"]([^'\"]+)['\"])",
         re.IGNORECASE,
     )
-    hs_re = re.compile(
-        r"(" + re.escape(open_sq) + r"|" + re.escape(open_dq) + r")[ \t]*\r?\n(.*?)\r?\n(" +
-        re.escape(close_sq) + r"|" + re.escape(close_dq) + r")",
-        re.DOTALL,
-    )
 
+    lines = patch_text.splitlines(keepends=True)
+    outside_lines: List[str] = []
+
+    in_block = False
+    block_quote_kind = ""
+    block_closer = ""
+    block_opener = ""
+    block_open_offset = 0
+    block_body_start = 0
+    block_file = "<unknown>"
+    block_label = ""
+    block_lines: List[str] = []
     block_idx = 0
-    for m in hs_re.finditer(patch_text):
-        block_idx += 1
-        opener = m.group(1)
-        body = m.group(2)
-        quote_kind = "single" if opener == open_sq else "double"
-        prefix = patch_text[: m.start()]
+    inner_nested_depth = 0
+    offset = 0
 
-        current_file = "<unknown>"
-        for fm in file_assign_re.finditer(prefix):
-            cand = fm.group(1) or fm.group(2) or fm.group(3) or ""
-            if cand and ".argon_backup" not in cand:
-                current_file = cand.replace("\\", "/")
+    for raw_ln in lines:
+        line_len = len(raw_ln)
+        stripped_eol = raw_ln.rstrip("\r\n")
+        trimmed_ws = stripped_eol.rstrip(" \t")
 
-        prefix_tail = prefix[-400:]
-        current_label = f"block #{block_idx}"
-        var_matches = list(re.finditer(r"\$([A-Za-z_]\w*)\s*=\s*$", prefix_tail))
-        if var_matches:
-            current_label = "$" + var_matches[-1].group(1)
+        if not in_block:
+            if stripped_eol.startswith(close_sq) and trimmed_ws == close_sq:
+                delimiter_defects.append(
+                    {
+                        "file": "<script>",
+                        "label": "here-string",
+                        "offset": offset,
+                        "reason": f"unbalanced single-quoted here-string delimiter (stray closing {close_sq} at offset {offset})",
+                    }
+                )
+                outside_lines.append(raw_ln)
+                offset += line_len
+                continue
+            if stripped_eol.startswith(close_dq) and trimmed_ws == close_dq:
+                delimiter_defects.append(
+                    {
+                        "file": "<script>",
+                        "label": "here-string",
+                        "offset": offset,
+                        "reason": f"unbalanced double-quoted here-string delimiter (stray closing {close_dq} at offset {offset})",
+                    }
+                )
+                outside_lines.append(raw_ln)
+                offset += line_len
+                continue
+
+            is_comment_ln = stripped_eol.lstrip(" \t").startswith("#")
+            if not is_comment_ln and (trimmed_ws.endswith(open_sq) or trimmed_ws.endswith(open_dq)):
+                opener_tok = open_sq if trimmed_ws.endswith(open_sq) else open_dq
+                before_opener = trimmed_ws[: -len(opener_tok)].rstrip(" \t")
+                if not before_opener or before_opener[-1] in ("=", "(", ",", "{", ";", "["):
+                    block_idx += 1
+                    in_block = True
+                    block_opener = opener_tok
+                    block_quote_kind = "single" if opener_tok == open_sq else "double"
+                    block_closer = close_sq if opener_tok == open_sq else close_dq
+                    block_open_offset = offset + len(trimmed_ws) - len(opener_tok)
+                    block_body_start = offset + line_len
+                    block_lines = []
+                    inner_nested_depth = 0
+
+                    prefix = patch_text[: offset + len(trimmed_ws) - len(opener_tok)]
+                    current_file = "<unknown>"
+                    for fm in file_assign_re.finditer(prefix):
+                        cand = fm.group(1) or fm.group(2) or fm.group(3) or ""
+                        if cand and cand != "<unknown>" and ".argon_backup" not in cand:
+                            current_file = cand.replace("\\", "/")
+                    block_file = current_file
+
+                    prefix_tail = prefix[-400:]
+                    current_label = f"block #{block_idx}"
+                    var_matches = list(re.finditer(r"\$([A-Za-z_]\w*)\s*=\s*$", prefix_tail))
+                    if var_matches:
+                        current_label = "$" + var_matches[-1].group(1)
+                    else:
+                        lbl_matches = list(label_assign_re.finditer(prefix_tail))
+                        if lbl_matches:
+                            lm = lbl_matches[-1]
+                            current_label = ("$" + lm.group(1)) if lm.group(1) else (lm.group(2) or current_label)
+                    block_label = current_label
+
+                    outside_lines.append(raw_ln)
+                    offset += line_len
+                    continue
+
+            outside_lines.append(raw_ln)
+            offset += line_len
         else:
-            lbl_matches = list(label_assign_re.finditer(prefix_tail))
-            if lbl_matches:
-                lm = lbl_matches[-1]
-                current_label = ("$" + lm.group(1)) if lm.group(1) else (lm.group(2) or current_label)
+            if stripped_eol.startswith(block_closer) and trimmed_ws == block_closer:
+                if inner_nested_depth > 0:
+                    inner_nested_depth -= 1
+                    block_lines.append(raw_ln)
+                    offset += line_len
+                    continue
+                body_raw = "".join(block_lines)
+                if body_raw.endswith("\r\n"):
+                    body_clean = body_raw[:-2]
+                elif body_raw.endswith("\n") or body_raw.endswith("\r"):
+                    body_clean = body_raw[:-1]
+                else:
+                    body_clean = body_raw
+                blocks.append(
+                    {
+                        "index": block_idx,
+                        "file": block_file,
+                        "label": block_label,
+                        "quote_kind": block_quote_kind,
+                        "body": body_clean,
+                        "script_offset": block_body_start,
+                    }
+                )
+                in_block = False
+                outside_lines.append(raw_ln)
+                offset += line_len
+            else:
+                block_lines.append(raw_ln)
+                offset += line_len
 
-        blocks.append(
+    if in_block:
+        q_desc = f"single-quoted ({open_sq} vs {close_sq})" if block_quote_kind == "single" else f"double-quoted ({open_dq} vs {close_dq})" 
+        delimiter_defects.append(
             {
-                "index": block_idx,
-                "file": current_file,
-                "label": current_label,
-                "quote_kind": quote_kind,
-                "body": body,
-                "script_offset": m.start(2),
+                "file": block_file,
+                "label": block_label or f"block #{block_idx}",
+                "offset": block_open_offset,
+                "reason": f"unbalanced {q_desc} here-string delimiters in {block_label or f'block #{block_idx}'} (opened with {block_opener} at offset {block_open_offset} and never closed with {block_closer})",
             }
         )
+
+    return blocks, delimiter_defects, "".join(outside_lines)
+
+
+def _extract_patch_payload_blocks(patch_text: str) -> List[Dict[str, Any]]:
+    """Extract every here-string payload block with its target file and label."""
+    blocks, _, _ = _parse_herestring_blocks(patch_text)
     return blocks
 
 
-def validate_patch_payloads(patch_text: str, project_path: Optional[Path] = None) -> List[Dict[str, Any]]:
-    """Validate every payload block in a delivered patch script BEFORE writing any file.
+def _find_lone_cr_offset(text: str) -> int:
+    """Return the index of the first lone CR (`\r` not followed by `\n`), or -1 if none."""
+    idx = 0
+    n = len(text)
+    while idx < n:
+        pos = text.find("\r", idx)
+        if pos == -1:
+            return -1
+        if pos + 1 >= n or text[pos + 1] != "\n":
+            return pos
+        idx = pos + 2
+    return -1
 
-    Refuses when:
-      1. A block contains a raw control character (< 0x20 other than CR 0x0D or LF 0x0A).
-      2. A line of the block starts with @' (or '@), which would terminate or corrupt the here-string.
-      3. A block sits inside a double-quoted here-string (@"..."@) and contains '$'.
-      4. A block contains a typographic quote (U+2018, U+2019, U+201C, U+201D) where the target
-         language requires a straight quote.
+
+def validate_patch_payloads(patch_text: str, project_path: Optional[Path] = None) -> List[Dict[str, Any]]:
+    """Validate payload blocks and script lines in a delivered patch script BEFORE writing any file (Section 2.1.A).
+
+    Rules (per Round 14 owner specification):
+      1. Here-string delimiter balance is evaluated PER BLOCK, not by whole-file substring count.
+      2. A NUL byte (`0x00`) or a lone CR (`\r` not followed by `\n`) is refused EVERYWHERE (payload and script).
+      3. Inside a PAYLOAD block:
+         - TAB (`0x09`) and typographic quotes (`U+2018`..`U+201D`) are ordinary code and are ALLOWED.
+         - Raw control characters `< 0x20` other than TAB (`0x09`), CR (`0x0D`), LF (`0x0A`) are refused.
+         - `$` is refused ONLY when the enclosing here-string is double-quoted.
+      4. On the patch script's OWN executable lines (outside payload blocks and outside `#` comments):
+         - TAB (`0x09`), other control characters `< 0x20`, and typographic quotes (`U+2018`..`U+201D`) are refused.
     """
     defects: List[Dict[str, Any]] = []
     if not patch_text:
         return defects
 
-    open_sq = chr(64) + chr(39)
-    close_sq = chr(39) + chr(64)
-    open_dq = chr(64) + chr(34)
-    close_dq = chr(34) + chr(64)
+    blocks, delimiter_defects, outside_script = _parse_herestring_blocks(patch_text)
+    defects.extend(delimiter_defects)
 
-    if patch_text.count(open_sq) != patch_text.count(close_sq):
+    # Check the patch script's OWN lines (outside payload blocks)
+    lone_cr_script = _find_lone_cr_offset(outside_script)
+    if lone_cr_script != -1:
         defects.append(
             {
                 "file": "<script>",
-                "label": "here-string",
-                "offset": 0,
-                "reason": "unbalanced single-quoted here-string delimiters (@' vs '@)",
-            }
-        )
-    if patch_text.count(open_dq) != patch_text.count(close_dq):
-        defects.append(
-            {
-                "file": "<script>",
-                "label": "here-string",
-                "offset": 0,
-                "reason": 'unbalanced double-quoted here-string delimiters (@" vs "@)',
+                "label": "script-lines",
+                "offset": lone_cr_script,
+                "reason": f"lone CR (0x0D without LF) on patch script line at offset {lone_cr_script}",
             }
         )
 
-    blocks = _extract_patch_payload_blocks(patch_text)
+    script_pos = 0
+    for raw_ln in outside_script.splitlines(keepends=True):
+        stripped_lead = raw_ln.lstrip(" \t")
+        is_comment = stripped_lead.startswith("#")
+        for idx_ch, ch in enumerate(raw_ln):
+            code = ord(ch)
+            if code < 0x20 and ch not in ("\r", "\n"):
+                if is_comment and ch == "\t":
+                    continue
+                defects.append(
+                    {
+                        "file": "<script>",
+                        "label": "script-lines",
+                        "offset": script_pos + idx_ch,
+                        "reason": f"raw control character 0x{code:02X} on patch script line at offset {script_pos + idx_ch}",
+                    }
+                )
+                break
+            if not is_comment and ch in TYPOGRAPHIC_QUOTES:
+                defects.append(
+                    {
+                        "file": "<script>",
+                        "label": "script-lines",
+                        "offset": script_pos + idx_ch,
+                        "reason": f"typographic quote U+{code:04X} on patch script line at offset {script_pos + idx_ch}",
+                    }
+                )
+                break
+        script_pos += len(raw_ln)
+
+    # Check each payload block
     for blk in blocks:
         file_rel = str(blk["file"])
         label = str(blk["label"])
         quote_kind = str(blk["quote_kind"])
         body = str(blk["body"])
 
-        # 1. Raw control characters (< 0x20 other than CR or LF)
+        lone_cr_body = _find_lone_cr_offset(body)
+        if lone_cr_body != -1:
+            defects.append(
+                {
+                    "file": file_rel,
+                    "label": label,
+                    "offset": lone_cr_body,
+                    "reason": f"lone CR (0x0D without LF) in payload at offset {lone_cr_body}",
+                }
+            )
+
+        # 1. Raw control characters (< 0x20 other than TAB 0x09, CR 0x0D, or LF 0x0A)
         for idx, ch in enumerate(body):
             code = ord(ch)
-            if code < 0x20 and ch not in ("\r", "\n"):
+            if code < 0x20 and ch not in ("\t", "\r", "\n"):
                 defects.append(
                     {
                         "file": file_rel,
@@ -529,23 +830,7 @@ def validate_patch_payloads(patch_text: str, project_path: Optional[Path] = None
                 )
                 break
 
-        # 2. A line of the block starts with @' (or '@)
-        pos = 0
-        for raw_ln in body.splitlines(keepends=True):
-            stripped_ln = raw_ln.rstrip("\r\n")
-            if stripped_ln.startswith(open_sq) or stripped_ln.startswith(close_sq):
-                defects.append(
-                    {
-                        "file": file_rel,
-                        "label": label,
-                        "offset": pos,
-                        "reason": f"line starts with {open_sq} ({stripped_ln[:2]}) at offset {pos} (would end or corrupt here-string early)",
-                    }
-                )
-                break
-            pos += len(raw_ln)
-
-        # 3. Block sits inside a double-quoted here-string (@"..."@) and contains '$'
+        # 2. Block sits inside a double-quoted here-string and contains '$'
         if quote_kind == "double" and "$" in body:
             dollar_idx = body.find("$")
             defects.append(
@@ -556,33 +841,6 @@ def validate_patch_payloads(patch_text: str, project_path: Optional[Path] = None
                     "reason": f"double-quoted here-string contains '$' at offset {dollar_idx} (PowerShell would interpolate and corrupt code)",
                 }
             )
-
-        # 4. Typographic quote where target language needs a straight quote
-        ext = Path(file_rel).suffix.lower() if file_rel != "<unknown>" else ""
-        needs_straight_quote = ext not in PROSE_ONLY_EXTENSIONS
-        existing_file_text = ""
-        if project_path is not None and file_rel != "<unknown>":
-            cand_path = Path(project_path) / file_rel
-            if cand_path.is_file():
-                try:
-                    existing_file_text = cand_path.read_text(encoding="utf-8", errors="ignore")
-                except Exception:
-                    existing_file_text = ""
-        for idx, ch in enumerate(body):
-            if ch in TYPOGRAPHIC_QUOTES:
-                if needs_straight_quote or (existing_file_text and ch not in existing_file_text):
-                    defects.append(
-                        {
-                            "file": file_rel,
-                            "label": label,
-                            "offset": idx,
-                            "reason": (
-                                f"typographic quote U+{ord(ch):04X} at offset {idx} "
-                                "where target language requires a straight quote"
-                            ),
-                        }
-                    )
-                    break
 
     return defects
 
@@ -612,7 +870,18 @@ def _snapshot_project_files(project_path: Path) -> Dict[str, bytes]:
     """Snapshot raw bytes of eligible project files before applying a patch."""
     snap: Dict[str, bytes] = {}
     project_path = Path(project_path).resolve()
-    skip_dirs = {".argon_backup", "downloads", "__pycache__", "node_modules", ".git", "venv", ".venv", "target", "dist"}
+    skip_dirs = {
+        ".argon_backup",
+        ".argon_quarantine",
+        "downloads",
+        "__pycache__",
+        "node_modules",
+        ".git",
+        "venv",
+        ".venv",
+        "target",
+        "dist",
+    }
     for root, dirs, files in os.walk(project_path):
         dirs[:] = [d for d in dirs if d.lower() not in skip_dirs]
         for fn in files:
@@ -639,11 +908,16 @@ def verify_written_files_bytes(project_path: Path, before_files: Dict[str, bytes
             continue
         old_ctrl_counts: Dict[int, int] = {}
         for b in old_bytes:
-            if b < 0x20 and b not in (0x0D, 0x0A):
+            if b < 0x20 and b not in (0x09, 0x0D, 0x0A):
                 old_ctrl_counts[b] = old_ctrl_counts.get(b, 0) + 1
         seen_ctrl_counts: Dict[int, int] = {}
         for idx, b in enumerate(new_bytes):
-            if b < 0x20 and b not in (0x0D, 0x0A):
+            if b == 0x0D and (idx + 1 >= len(new_bytes) or new_bytes[idx + 1] != 0x0A):
+                msg = f"lone CR byte (0x0D without LF) at byte offset {idx}"
+                print(f"[ERROR] Written file byte defect in {rel}: {msg}", file=sys.stderr)
+                issues.append({"file": rel, "offset": idx, "byte": b, "reason": msg})
+                break
+            if b < 0x20 and b not in (0x09, 0x0D, 0x0A):
                 seen_ctrl_counts[b] = seen_ctrl_counts.get(b, 0) + 1
                 if seen_ctrl_counts[b] > old_ctrl_counts.get(b, 0):
                     msg = f"raw control byte 0x{b:02X} at byte offset {idx} was not in the old file"
@@ -1315,49 +1589,57 @@ MIN_PATCH_FILE_BYTES = 64
 
 
 def _validate_and_save_download(dl, dest_dir: Path) -> tuple[Optional[Path], str]:
-    """Verify that a Playwright download is really a non-empty .ps1 patch (D5, D18.1).
+    """Verify that a Playwright download is really a non-empty .ps1 patch (D5, D18.1, Round 14 2.1.C/F).
 
-    Saves to a temporary staging file first so a 0-byte or tiny/corrupt download
-    is rejected immediately and NEVER overwrites an existing good file in dest_dir.
+    Saves to a temporary staging file first so a tiny/corrupt/PDF download is rejected
+    without overwriting an existing good file in `dest_dir`, and moves rejected files
+    into `.argon_quarantine` instead of deleting them so they can always be inspected.
     """
     dest_dir = Path(dest_dir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
     dl_url = ""
     try:
         dl_url = str(getattr(dl, "url", "") or "")
     except Exception:
         dl_url = ""
     low_url = dl_url.lower()
-    if "contribservice" in low_url or "print" in low_url:
-        print(
-            f"[!] Discarding print-preview download from URL: {dl_url}",
-            file=sys.stderr,
-        )
-        try:
-            dl.delete()
-        except Exception:
-            pass
-        return None, "browser handed over a print preview URL (contribservice/print)"
 
     suggested = ""
     try:
         suggested = str(getattr(dl, "suggested_filename", "") or "").strip()
     except Exception:
         suggested = ""
+    safe_name = Path(suggested).name if suggested else "rejected_download.ps1"
+    staging = dest_dir / f".staging_{os.getpid()}_{int(time.time() * 1000)}_{safe_name}"
+
+    if "contribservice" in low_url or "print" in low_url:
+        reason = f"browser handed over a print preview URL ({dl_url})"
+        print(f"[!] Rejecting print-preview download from URL: {dl_url}", file=sys.stderr)
+        try:
+            dl.save_as(str(staging))
+            q_path = _quarantine_rejected_file(staging, reason, dest_dir=dest_dir)
+            if q_path is not None:
+                return None, f"{reason} (quarantined at {q_path})"
+        except Exception:
+            pass
+        return None, reason
+
     if not suggested or not suggested.lower().endswith(".ps1"):
+        reason = f"browser handed over non-.ps1 file ({suggested or 'unnamed'})"
         print(
-            f"[!] Discarding non-.ps1 download ({suggested!r}) - refusing to rename it to apply_changes.ps1.",
+            f"[!] Rejecting non-.ps1 download ({suggested!r}) - refusing to rename it to apply_changes.ps1.",
             file=sys.stderr,
         )
         try:
-            dl.delete()
+            dl.save_as(str(staging))
+            q_path = _quarantine_rejected_file(staging, reason, dest_dir=dest_dir)
+            if q_path is not None:
+                return None, f"{reason} (quarantined at {q_path})"
         except Exception:
             pass
-        return None, f"browser handed over non-.ps1 file ({suggested or 'unnamed'})"
+        return None, reason
 
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    safe_name = Path(suggested).name
     dest = dest_dir / safe_name
-    staging = dest_dir / f".staging_{os.getpid()}_{int(time.time() * 1000)}_{safe_name}"
     dl.save_as(str(staging))
 
     try:
@@ -1366,26 +1648,25 @@ def _validate_and_save_download(dl, dest_dir: Path) -> tuple[Optional[Path], str
         file_size = 0
 
     if file_size < MIN_PATCH_FILE_BYTES:
+        reason = f"browser handed over an empty or undersized file ({file_size} bytes < {MIN_PATCH_FILE_BYTES} minimum)"
         print(
             f"[!] Rejecting {file_size}-byte download for {safe_name} (minimum {MIN_PATCH_FILE_BYTES} bytes) - "
             f"existing file {dest} was NOT overwritten.",
             file=sys.stderr,
         )
-        try:
-            staging.unlink(missing_ok=True)
-        except OSError:
-            pass
-        return None, f"browser handed over an empty or undersized file ({file_size} bytes)"
+        q_path = _quarantine_rejected_file(staging, reason, dest_dir=dest_dir)
+        return None, (f"{reason} (quarantined at {q_path})" if q_path else reason)
 
     try:
         head_bytes = staging.read_bytes()[:8]
         if head_bytes.startswith(b"%PDF"):
+            reason = f"browser handed over PDF bytes ({file_size} bytes) masquerading as .ps1"
             print(
-                f"[!] Discarding PDF file masquerading as .ps1: {staging}",
+                f"[!] Rejecting PDF file masquerading as .ps1 ({file_size} bytes): {staging}",
                 file=sys.stderr,
             )
-            staging.unlink(missing_ok=True)
-            return None, "browser handed over PDF bytes instead of a PowerShell script"
+            q_path = _quarantine_rejected_file(staging, reason, dest_dir=dest_dir)
+            return None, (f"{reason} (quarantined at {q_path})" if q_path else reason)
     except Exception:
         pass
 
@@ -1394,17 +1675,30 @@ def _validate_and_save_download(dl, dest_dir: Path) -> tuple[Optional[Path], str
 
 
 def _download_from_viewer(page, dest_dir: Path, timeout_ms: int = 12000) -> Optional[Path]:
-    """Find the viewer's verified toolbar download button, click ONLY that button, and validate the file."""
+    """Find the viewer's verified toolbar download button, click ONLY that button, and validate the file.
+
+    Stores any rejection or click failure reason on `page._argon_last_download_reason`
+    and `page._argon_saw_download_button` so `capture_generated_file` can report the exact cause.
+    """
     dest_dir = Path(dest_dir)
+    setattr(page, "_argon_last_download_reason", "")
     btn = _find_viewer_download_button(page)
     if btn is None:
         return None
+    setattr(page, "_argon_saw_download_button", True)
     try:
         with page.expect_download(timeout=timeout_ms) as dl:
             btn.click(timeout=6000)
-        saved, _ = _validate_and_save_download(dl.value, dest_dir)
+        saved, discard_reason = _validate_and_save_download(dl.value, dest_dir)
+        if discard_reason:
+            setattr(page, "_argon_last_download_reason", discard_reason)
         return saved
-    except Exception:
+    except Exception as dl_exc:
+        setattr(
+            page,
+            "_argon_last_download_reason",
+            f"clicking viewer toolbar download button did not trigger download ({dl_exc})",
+        )
         return None
 
 
@@ -1629,6 +1923,8 @@ def _is_leftover_delivery(
             for cand_dir in (proj / "downloads", proj / ".argon_backup"):
                 if cand_dir.is_dir():
                     for ps1_file in cand_dir.glob("**/*.ps1"):
+                        if _is_quarantined_path(ps1_file):
+                            continue
                         if ps1_file.is_file() and ps1_file.stat().st_size >= MIN_PATCH_FILE_BYTES:
                             try:
                                 content_f = ps1_file.read_text(encoding="utf-8", errors="replace")
@@ -1648,34 +1944,58 @@ def _is_leftover_delivery(
     return False
 
 
-def _patch_is_complete(text: str) -> bool:
-    """True when a delivered script is COMPLETE and structurally parseable (D18.2)."""
+def _patch_is_complete(text: str) -> _PatchCheckResult:
+    """Check whether a delivered script is COMPLETE and structurally parseable (Section 2.1.A & 2.1.B).
+
+    Returns a `_PatchCheckResult` (truthy/falsy like `bool`, unpackable as `(ok, reason)`,
+    with `.reason` and `.defects` naming the exact check that failed).
+    Evaluates here-string delimiter balance PER BLOCK rather than across the whole file.
+    """
     if not text or not text.strip():
-        return False
-    if len(text.encode("utf-8", errors="replace")) < MIN_PATCH_FILE_BYTES:
-        return False
-    # The delivery contract ends the script with the success marker.
+        return _PatchCheckResult(False, "file is empty (0 bytes)")
+    byte_len = len(text.encode("utf-8", errors="replace"))
+    if byte_len < MIN_PATCH_FILE_BYTES:
+        return _PatchCheckResult(
+            False,
+            f"file is undersized ({byte_len} bytes < {MIN_PATCH_FILE_BYTES} minimum)",
+        )
     if "[SUCCESS]" not in text and "All changes applied and verified successfully" not in text:
-        return False
-    # A NOTES block that was started must be closed.
+        return _PatchCheckResult(
+            False,
+            "missing '[SUCCESS]' completion summary line (script was truncated before the final summary line)",
+        )
     if "# --- NOTES" in text and "# --- END NOTES" not in text:
-        return False
-    # A truncated script very often ends in the middle of a here-string.
+        return _PatchCheckResult(
+            False,
+            "started '# --- NOTES' block is missing its closing '# --- END NOTES ---' line (truncated in NOTES block)",
+        )
+
+    payload_blocks, delimiter_defects, outside_script = _parse_herestring_blocks(text)
+    if delimiter_defects:
+        d0 = delimiter_defects[0]
+        return _PatchCheckResult(
+            False,
+            f"file={d0['file']} label={d0['label']} offset={d0['offset']} reason={d0['reason']}",
+            defects=delimiter_defects,
+        )
+
     open_sq = chr(64) + chr(39)
-    close_sq = chr(39) + chr(64)
     open_dq = chr(64) + chr(34)
-    close_dq = chr(34) + chr(64)
-    if text.count(open_sq) != text.count(close_sq):
-        return False
-    if text.count(open_dq) != text.count(close_dq):
-        return False
-    # D18.2: Verify the patch parses cleanly (every here-string payload extracts and has balanced delimiters)
-    payload_blocks = _extract_patch_payload_blocks(text)
-    if (open_sq in text or open_dq in text) and not payload_blocks:
-        return False
-    if validate_patch_payloads(text):
-        return False
-    return True
+    if (open_sq in outside_script or open_dq in outside_script) and not payload_blocks:
+        return _PatchCheckResult(
+            False,
+            "here-string opener found on script line but no complete here-string block could be parsed",
+        )
+
+    defects = validate_patch_payloads(text)
+    if defects:
+        d0 = defects[0]
+        return _PatchCheckResult(
+            False,
+            f"file={d0['file']} label={d0['label']} offset={d0['offset']} reason={d0['reason']}",
+            defects=defects,
+        )
+    return _PatchCheckResult(True, "")
 
 
 def _dismiss_print_preview_if_any(page) -> None:
@@ -1734,43 +2054,50 @@ def capture_generated_file(
     capture_started = time.time()
     deadline = time.monotonic() + max(5.0, float(timeout_seconds))
     attempt = 0
-    last_downloaded: Optional[Path] = None
+    poll_count = 0
+    last_quarantined: Optional[Path] = None
     saw_download_button = False
     failure_reason = "the viewer's toolbar download button was not reachable (a print control was never clicked)"
+    setattr(page, "_argon_chip_capture_exhausted", False)
+    setattr(page, "_argon_last_capture_failure_reason", "")
+    setattr(page, "_argon_last_quarantined_path", "")
 
-    # D5.1: One capture, then stop. As soon as the toolbar download succeeds and validates, exit immediately.
-    while True:
-        attempt += 1
+    while attempt < MAX_CHIP_DOWNLOAD_ATTEMPTS:
+        poll_count += 1
         _dismiss_print_preview_if_any(page)
         try:
             page.wait_for_timeout(1500)
         except Exception:
             time.sleep(1.5)
 
-        if attempt > 1 and not _viewer_is_open(page):
-            break
+        if poll_count > 1 and not _viewer_is_open(page):
+            if not _open_generated_file(page, chip_index=chip_index, chip=chip):
+                break
 
         dl_btn = _find_viewer_download_button(page)
         downloaded: Optional[Path] = None
         if dl_btn is not None:
             saw_download_button = True
-            try:
-                with page.expect_download(timeout=12000) as dl_info:
-                    dl_btn.click(timeout=6000)
-                downloaded, discard_reason = _validate_and_save_download(dl_info.value, dest_dir)
-                if discard_reason:
-                    failure_reason = f"{discard_reason} (a print control was never clicked)"
-            except Exception as dl_exc:
-                failure_reason = f"clicking viewer toolbar download button did not trigger download ({dl_exc})"
-                downloaded = None
+            attempt += 1
+            print(f"[i] Download attempt {attempt} of {MAX_CHIP_DOWNLOAD_ATTEMPTS} for this chip...")
+            downloaded = _download_from_viewer(page, dest_dir, timeout_ms=12000)
+            discard_reason = str(getattr(page, "_argon_last_download_reason", "") or "")
+            if discard_reason:
+                failure_reason = discard_reason
 
         if downloaded is None:
             cand = find_delivered_patch([dest_dir], newer_than=capture_started - 1.0)
             if cand is not None and cand.suffix.lower() == ".ps1" and cand.stat().st_size >= MIN_PATCH_FILE_BYTES:
+                if dl_btn is None:
+                    attempt += 1
+                    print(f"[i] Download attempt {attempt} of {MAX_CHIP_DOWNLOAD_ATTEMPTS} for this chip...")
                 downloaded = cand
 
         if downloaded is not None and downloaded.is_file():
-            last_downloaded = downloaded
+            try:
+                file_sz = downloaded.stat().st_size
+            except OSError:
+                file_sz = 0
             try:
                 raw_dl_text = downloaded.read_text(encoding="utf-8", errors="replace")
             except Exception:
@@ -1778,14 +2105,24 @@ def capture_generated_file(
             dl_text = _strip_viewer_tail_artefacts(raw_dl_text)
 
             if _is_leftover_delivery(dl_text, combined_hashes, project_path=proj_for_ledger):
-                try:
-                    downloaded.unlink(missing_ok=True)
-                except OSError:
-                    pass
+                failure_reason = (
+                    f"refused duplicate/leftover delivery in {downloaded.name} ({file_sz} bytes; SHA-256={_sha256_full(dl_text)})"
+                )
+                last_quarantined = _quarantine_rejected_file(
+                    downloaded,
+                    failure_reason,
+                    project_path=proj_for_ledger,
+                    dest_dir=dest_dir,
+                )
+                setattr(page, "_argon_last_capture_failure_reason", failure_reason)
+                setattr(page, "_argon_last_quarantined_path", str(last_quarantined or ""))
+                setattr(page, "_argon_chip_capture_exhausted", True)
                 _close_preview(page)
                 return None
 
-            if _looks_like_patch(dl_text) and _patch_is_complete(dl_text):
+            looks_res = _looks_like_patch(dl_text)
+            comp_res = _patch_is_complete(dl_text)
+            if looks_res and comp_res:
                 if dl_text != raw_dl_text.rstrip("\r\n"):
                     try:
                         downloaded.write_text(dl_text + "\n", encoding="utf-8", newline="\n")
@@ -1802,21 +2139,37 @@ def capture_generated_file(
                         )
                     except Exception:
                         pass
-                print(f"[+] Captured delivery file: {downloaded.name} (bytes={len(dl_text.encode('utf-8'))}, sha256={_sha256_full(dl_text)})")
+                print(
+                    f"[+] Captured delivery file: {downloaded.name} "
+                    f"(bytes={len(dl_text.encode('utf-8'))}, sha256={_sha256_full(dl_text)}, "
+                    f"attempt={attempt}/{MAX_CHIP_DOWNLOAD_ATTEMPTS})"
+                )
                 _close_preview(page)
                 return downloaded
-            # D5.1: If the toolbar button produced an invalid/truncated file on this chip, do not re-download in a loop
-            break
-            if not _looks_like_patch(dl_text):
+
+            if not looks_res:
                 failure_reason = (
-                    f"the downloaded file ({downloaded.name}) is not a valid patch script "
-                    "(a print control was never clicked)"
+                    f"the downloaded file {downloaded.name} ({file_sz} bytes) failed _looks_like_patch: {looks_res.reason}"
                 )
-            elif not _patch_is_complete(dl_text):
+                defects_list = looks_res.defects
+            else:
                 failure_reason = (
-                    f"the downloaded file ({downloaded.name}) was truncated "
-                    "(a print control was never clicked)"
+                    f"the downloaded file {downloaded.name} ({file_sz} bytes) failed _patch_is_complete: {comp_res.reason}"
                 )
+                defects_list = comp_res.defects
+
+            last_quarantined = _quarantine_rejected_file(
+                downloaded,
+                failure_reason,
+                project_path=proj_for_ledger,
+                dest_dir=dest_dir,
+                defects=defects_list,
+            )
+            setattr(page, "_argon_last_capture_failure_reason", failure_reason)
+            setattr(page, "_argon_last_quarantined_path", str(last_quarantined or ""))
+
+            if attempt >= MAX_CHIP_DOWNLOAD_ATTEMPTS:
+                break
 
         if time.monotonic() >= deadline:
             break
@@ -1827,46 +2180,25 @@ def capture_generated_file(
             time.sleep(2.5)
 
     _close_preview(page)
-    if last_downloaded is not None and last_downloaded.is_file():
-        try:
-            raw_dl_text = last_downloaded.read_text(encoding="utf-8", errors="replace")
-        except Exception:
-            raw_dl_text = ""
-        dl_text = _strip_viewer_tail_artefacts(raw_dl_text)
-        if not _looks_like_patch(dl_text):
-            print(
-                f"[!] The downloaded file is not a usable patch script: {last_downloaded}",
-                file=sys.stderr,
-            )
-            try:
-                last_downloaded.unlink()
-            except OSError:
-                pass
-        elif not _patch_is_complete(dl_text):
-            print(
-                f"[!] The downloaded file looks TRUNCATED: {last_downloaded}",
-                file=sys.stderr,
-            )
-            print(
-                "    Nothing was written on purpose - a half patch would fail the "
-                "apply step. Download the file again from the Gemini chat.",
-                file=sys.stderr,
-            )
-            try:
-                last_downloaded.unlink()
-            except OSError:
-                pass
-    elif saw_download_button and "not reachable" in failure_reason:
+    if saw_download_button and "not reachable" in failure_reason:
         failure_reason = (
-            "the viewer's download button did not produce a .ps1 file "
+            "the viewer's download button did not produce a valid .ps1 file "
             "(a print control was never clicked)"
         )
 
-    secs = int(round(timeout_seconds))
+    setattr(page, "_argon_chip_capture_exhausted", True)
+    setattr(page, "_argon_last_capture_failure_reason", failure_reason)
+
+    quarantine_note = (
+        f"\n    Quarantined file kept at: {last_quarantined}\n"
+        f'    Apply or inspect it with: Open_Argon_Apply.bat -PatchFile "{last_quarantined}"'
+        if last_quarantined is not None
+        else "\n    Download it from the Gemini chat by hand and apply it with:\n"
+             "        Open_Argon_Apply.bat -PatchFile <path-to-apply_changes.ps1>"
+    )
     print(
-        f"[!] The delivery could NOT be downloaded after {secs} s - {failure_reason}.\n"
-        "    Download it from the Gemini chat by hand and apply it with:\n"
-        "        Open_Argon_Apply.bat -PatchFile <path-to-apply_changes.ps1>",
+        f"[!] The delivery could NOT be downloaded after {attempt}/{MAX_CHIP_DOWNLOAD_ATTEMPTS} download attempt(s) "
+        f"for this chip - {failure_reason}.{quarantine_note}",
         file=sys.stderr,
     )
     return None
@@ -2196,54 +2528,88 @@ def _save_notes(
         return None
 
 
-def _looks_like_patch(candidate: str) -> bool:
-    """Accept only a real PowerShell patch script, not prompt prose.
+def _looks_like_patch(candidate: str) -> _PatchCheckResult:
+    """Accept only a real PowerShell patch script, not prompt prose (Section 2.1.A & 2.1.B).
 
-    The page body contains the user's own prompt - including its example
-    snippet - so a loose "it mentions WriteAllText" test happily picks the
-    prompt back instead of Argon's answer.
+    Returns a `_PatchCheckResult` (truthy/falsy like `bool`, unpackable as `(ok, reason)`,
+    with `.reason` and `.defects` naming the exact check that failed):
+      - Accepts scripts ending with a comment (`#...`), closing brace (`}`), or
+        `Write-Host` / `Write-Output` / `exit` summary line (such as
+        `Write-Host "[SUCCESS] 3 file(s) patched." -ForegroundColor Green`).
+      - Strips here-string payloads via `_parse_herestring_blocks` (replacing raw @" regex)
+        so a payload line containing markdown cannot leak into the prose scan.
     """
-    if not candidate:
-        return False
+    # The last non-empty line must be a comment (#...) or a closing brace (}), or Write-Host
+    if not candidate or not candidate.strip():
+        return _PatchCheckResult(False, "candidate patch text is empty")
     lines = candidate.splitlines()
     if len(lines) < 8:
-        return False
-    # The last non-empty line must be a comment (#...) or a closing brace (}),
-    # never a bare filename or stray Drive viewer caption such as 'apply_changes.ps1'.
+        return _PatchCheckResult(
+            False,
+            f"candidate has only {len(lines)} line(s) (minimum 8 lines required for a patch script)",
+        )
     non_empty_lines = [ln.strip() for ln in lines if ln.strip()]
     if not non_empty_lines:
-        return False
+        return _PatchCheckResult(False, "candidate has no non-empty lines")
     last_non_empty = non_empty_lines[-1]
-    if not (last_non_empty.startswith("#") or last_non_empty.endswith("}")):
-        return False
-    # The script must pin the target root to a quoted absolute path.
+    valid_last_line = (
+        last_non_empty.startswith("#")
+        or last_non_empty.endswith("}")
+        or bool(re.match(r"^(?:Write-Host|Write-Output|exit)\b", last_non_empty, re.IGNORECASE))
+    )
+    if not valid_last_line:
+        return _PatchCheckResult(
+            False,
+            f"last non-empty line is {last_non_empty[:80]!r} "
+            "(expected a comment '#', closing brace '}', or Write-Host/Write-Output summary line)",
+        )
     if not re.search(r"\$TargetRoot\s*=\s*['\"][^'\"]{3,}['\"]", candidate):
-        return False
+        return _PatchCheckResult(False, "missing $TargetRoot = '<absolute-path>' assignment")
     if not any(
         k in candidate
         for k in ("WriteAllText", "Set-Content", "Copy-Item", "Write-Host", ".Replace(")
     ):
-        return False
-    # Markdown structure means we grabbed prose. A single '#' is a PowerShell
-    # comment and must stay allowed; markdown headings use three or more.
-    outside_herestrings = re.sub(
-        r"@'\r?\n.*?\r?\n'@|@\"\r?\n.*?\r?\n\"@",
-        "@'\n'@",
-        candidate,
-        flags=re.DOTALL,
-    )
-    for raw in outside_herestrings.splitlines():
+        return _PatchCheckResult(
+            False,
+            "missing PowerShell patch operations (WriteAllText, Set-Content, Copy-Item, Write-Host, .Replace)",
+        )
+
+    _, _, outside_herestrings = _parse_herestring_blocks(candidate)
+    for line_no, raw in enumerate(outside_herestrings.splitlines(), 1):
         s = raw.strip()
         if not s:
             continue
         if re.match(r"^#{3,}\s", s):
-            return False
+            return _PatchCheckResult(
+                False,
+                f"markdown heading outside here-strings at script line {line_no}: {s[:60]!r}",
+            )
+        if s.startswith("#"):
+            continue
         if re.match(r"^[-*+]\s", s):
-            return False
+            return _PatchCheckResult(
+                False,
+                f"markdown bullet list line outside here-strings at script line {line_no}: {s[:60]!r}",
+            )
         if s.startswith("|"):
-            return False
+            return _PatchCheckResult(
+                False,
+                f"markdown table row outside here-strings at script line {line_no}: {s[:60]!r}",
+            )
         if "**" in s:
-            return False
+            return _PatchCheckResult(
+                False,
+                f"markdown bold syntax ('**') outside here-strings at script line {line_no}: {s[:60]!r}",
+            )
+
+    tpl_ph_1 = "relative/path/" + "to/file.ext"
+    tpl_ph_2 = "{{TARGET_" + "DIRECTORY}}"
+    if tpl_ph_1 in outside_herestrings or tpl_ph_2 in outside_herestrings:
+        return _PatchCheckResult(
+            False,
+            f"contains unreplaced prompt template placeholder ({tpl_ph_1!r} or {tpl_ph_2!r})",
+        )
+    return _PatchCheckResult(True, "")
     # Placeholders from the prompt template must never be applied.
     if "relative/path/to/file.ext" in candidate or "{{TARGET_DIRECTORY}}" in candidate:
         return False
@@ -2756,14 +3122,21 @@ class SlotLock:
 
 
 def _profile_dir_for_slot(base_profile: Path, slot: Optional[str]) -> Path:
-    """Each pool slot gets its own browser profile directory.
+    """Return the browser profile directory for `slot`.
 
-    Chrome allows a single instance per profile directory, so two runs that
-    share one directory fight: the second launch kills the first. Giving every
-    slot its own directory lets two agents work on two projects at the same
-    time without touching each other's browser.
+    Defaults to the isolated per-slot profile (`~/.gemini/argon_profiles/slot-uN`),
+    or returns the shared multi-account profile when opted in via `accounts_pool.json`
+    (`"shared_profile": true`) or `--shared-profile` / `ARGON_SHARED_PROFILE=1` (Section 2.3.C).
     """
     base_profile = Path(base_profile).expanduser().resolve()
+    try:
+        cfg = PoolConfig(profile_dir_override=base_profile)
+        if cfg.is_shared_profile_slot(slot):
+            return cfg.profile_dir_for_slot(slot)
+    except Exception:
+        pass
+    if os.environ.get("ARGON_SHARED_PROFILE") == "1":
+        return base_profile
     if base_profile.parent.name == "argon_profiles" and base_profile.name.startswith("slot-"):
         root = base_profile.parent
     else:
@@ -2783,11 +3156,51 @@ def _has_cookie_db(profile_dir: Path) -> bool:
     return False
 
 
+def _close_browser_safely(context: Any, profile_dir: Optional[Path] = None) -> Dict[str, Any]:
+    """Safely close `context` / `profile_dir` while preserving session cookies (Section 2.2.B)."""
+    from safe_browser import close_browser_safely
+
+    return close_browser_safely(context=context, profile_dir=profile_dir)
+
+
+class _PlaywrightSafeCloseGuard:
+    """Context manager entered INSIDE `with sync_playwright() as p:` so browser/tab close
+    always executes BEFORE `sync_playwright().__exit__()` stops the Playwright driver (Section 2.2.A).
+    """
+
+    def __init__(self, cleanup_fn) -> None:
+        self._cleanup_fn = cleanup_fn
+
+    def __enter__(self) -> "_PlaywrightSafeCloseGuard":
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> bool:
+        try:
+            self._cleanup_fn()
+        except Exception:
+            pass
+        return False
+
+
 def _seed_profile(base_profile: Path, target: Path) -> bool:
-    """Create a slot profile from the master profile when the master profile is not busy."""
+    """Create a slot profile from the master profile when the master profile is not busy.
+
+    Section 2.2.E: Never replace or `rmtree` a slot profile that already holds an
+    account in `Default/Preferences` (`account_info` / `signin.accounts`). If only
+    its cookie DB is missing, repair only the cookie DB.
+    """
+    from safe_browser import profile_has_signed_in_account, repair_slot_cookie_db_only
+
     base_profile = Path(base_profile)
     target = Path(target)
     if target.is_dir() and (target / "Default").is_dir():
+        if profile_has_signed_in_account(target):
+            if not _has_cookie_db(target):
+                print(
+                    f"[+] Slot profile {target} holds a registered account; repairing SQLite cookie DB without replacing profile."
+                )
+                repair_slot_cookie_db_only(base_profile, target)
+            return True
         if not _has_cookie_db(base_profile) or _has_cookie_db(target):
             return True
     if not base_profile.is_dir() or not (base_profile / "Default").is_dir():
@@ -2804,6 +3217,9 @@ def _seed_profile(base_profile: Path, target: Path) -> bool:
         return False
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
+        if profile_has_signed_in_account(target):
+            repair_slot_cookie_db_only(base_profile, target)
+            return True
         copied = _copy_profile(base_profile, target)
         return copied is not None
     except Exception as exc:
@@ -3406,6 +3822,44 @@ class TaskRegistry:
             self.save()
         return matched
 
+    def reclaim_dead_tasks(
+        self,
+        project_path: Any = None,
+        lane: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Reclaim any `running` task records whose owning PID is dead (Addendum A.2).
+
+        A dead process must never leave a `running` record behind that blocks the next
+        retry ladder attempt with EXIT_ALREADY_RUNNING.
+        """
+        self.load()
+        wanted = _normalize_project_key(project_path) if project_path is not None else ""
+        lane_str = (lane or "").strip().lower()
+        now_str = time.strftime("%Y-%m-%d %H:%M:%S")
+        reclaimed: List[Dict[str, Any]] = []
+        for e in (self.data.get("entries") or []):
+            if not isinstance(e, dict) or str(e.get("status") or "").strip().lower() != "running":
+                continue
+            if wanted and _normalize_project_key(e.get("project", "")) != wanted:
+                continue
+            if lane_str and str(e.get("lane") or "single").strip().lower() != lane_str:
+                continue
+            pid = int(e.get("pid") or 0)
+            if pid > 0 and pid != os.getpid() and not _pid_alive(pid):
+                e["status"] = "failed"
+                e["end_reason"] = f"reclaimed leftover running record from dead pid {pid}"
+                e["completed_at"] = now_str
+                e["updated_at"] = now_str
+                reclaimed.append(dict(e))
+        if reclaimed:
+            self.save()
+            for r_item in reclaimed:
+                print(
+                    f"[+] Reclaimed leftover running task record from dead pid {r_item.get('pid')} "
+                    f"(task_id={r_item.get('task_id')}, lane={r_item.get('lane')}) -> marked 'failed'."
+                )
+        return reclaimed
+
     def register_done(
         self,
         project_path: Any,
@@ -3414,8 +3868,9 @@ class TaskRegistry:
         status: str = "completed",
         screenshot_path: str = "",
         label: Optional[str] = None,
+        end_reason: str = "",
     ) -> int:
-        """Mark running task(s) for `project_path` (and optional `lane`/`slot`/`label`) as completed/abandoned/superseded (D4.2)."""
+        """Mark running task(s) for `project_path` (and optional `lane`/`slot`/`label`) as terminal (`completed`/`failed`/`superseded`/`done`) with `end_reason` (D4.2, Addendum A.2)."""
         self.load()
         wanted = _normalize_project_key(project_path)
         lane_str = (lane or "").strip().lower()
@@ -3440,6 +3895,8 @@ class TaskRegistry:
             e["status"] = status
             e["completed_at"] = now_str
             e["updated_at"] = now_str
+            if end_reason:
+                e["end_reason"] = str(end_reason)
             if screenshot_path:
                 e["screenshot_path"] = str(screenshot_path)
             count += 1
@@ -5823,10 +6280,73 @@ RE_WORKING = re.compile(
 )
 
 
-def _is_argon_working(page) -> bool:
-    """True while Argon is still thinking, typing or the chat is still loading.
+def _inspect_conversation_render_state(page) -> Dict[str, Any]:
+    """Inspect DOM render state to distinguish a half-loaded/blank page from active Argon generation (Addendum A.1)."""
+    try:
+        info = page.evaluate(
+            r"""() => {
+                const ready = document.readyState === 'complete';
+                const isVis = (e) => {
+                    if (!e) return false;
+                    const r = e.getBoundingClientRect();
+                    const st = window.getComputedStyle(e);
+                    return r.width > 0 && r.height > 0 && st.visibility !== 'hidden' && st.display !== 'none';
+                };
+                const spinners = Array.from(
+                    document.querySelectorAll("mat-progress-spinner, .mat-progress-spinner, [role='progressbar'], .loading-spinner")
+                ).filter(isVis);
+                const userTurns = document.querySelectorAll(
+                    "user-query, [data-test-id='user-query'], .user-query-text, .query-text, message-turn.user-query, div.user-query"
+                ).length;
+                const modelTurns = document.querySelectorAll(
+                    "model-response, [data-test-id='model-response'], .model-response-text, message-turn.model-response, div.model-response"
+                ).length;
+                const stopBtns = Array.from(
+                    document.querySelectorAll("button[aria-label*='Stop' i], button[aria-label*='stop generating' i], button[aria-label*='থামান']")
+                ).filter(isVis);
+                const chipCandidates = Array.from(
+                    document.querySelectorAll("[class*='status'], [data-test-id*='status'], mat-chip, .mdc-evolution-chip__text-label, header, [role='status']")
+                );
+                let statusComplete = false;
+                for (const c of chipCandidates) {
+                    const txt = String(c.innerText || '').trim();
+                    if (/^complete(d)?$/i.test(txt) || /\bstatus\s*:\s*complete(d)?\b/i.test(txt)) {
+                        statusComplete = true;
+                        break;
+                    }
+                }
+                return {
+                    ready,
+                    spinners: spinners.length,
+                    userTurns,
+                    modelTurns,
+                    stopButtons: stopBtns.length,
+                    statusComplete,
+                    url: String(location.href || '')
+                };
+            }"""
+        )
+        if isinstance(info, dict):
+            return info
+    except Exception:
+        pass
+    return {
+        "ready": False,
+        "spinners": 0,
+        "userTurns": 0,
+        "modelTurns": 0,
+        "stopButtons": 0,
+        "statusComplete": False,
+        "url": str(getattr(page, "url", "") or ""),
+    }
 
-    Must return False on a conversation whose last assistant turn has already finished.
+
+def _is_argon_working(page) -> bool:
+    """True ONLY while Argon is actively generating a response (Addendum A.1).
+
+    A conversation that is STILL LOADING (0 user turns and 0 assistant turns in the DOM,
+    or a status chip that already says 'Complete' with no Stop button) must NEVER be
+    read as 'Argon is working'.
     """
     try:
         # 1. The stop button only exists while a response is being actively generated.
@@ -5841,6 +6361,21 @@ def _is_argon_working(page) -> bool:
                     return True
     except Exception:
         pass
+
+    dom_state = _inspect_conversation_render_state(page)
+    u_turns_cnt = int(dom_state.get("userTurns") or 0)
+    m_turns_cnt = int(dom_state.get("modelTurns") or 0)
+    status_complete = bool(dom_state.get("statusComplete"))
+
+    # Addendum A.1: If the conversation area has no rendered user turns and no model turns yet,
+    # the page is either a blank new chat or STILL LOADING its history from the server - NOT working.
+    if u_turns_cnt == 0 and m_turns_cnt == 0:
+        return False
+
+    # Addendum A.1: If the task status chip explicitly says "Complete" and there is no Stop button,
+    # Argon is NOT working.
+    if status_complete and int(dom_state.get("stopButtons") or 0) == 0:
+        return False
 
     try:
         # 2. Check if the newest assistant turn has already finished.
@@ -5886,32 +6421,26 @@ def _is_argon_working(page) -> bool:
         pass
 
     try:
-        # 3. Check for visible spinners in chat while conversation is loading.
-        # A `role=progressbar` is a loading indicator by definition, so its mere
-        # presence counts - it is often rendered without a size. This is checked
-        # ONLY after step 2 has ruled out a finished assistant turn, so a chat
-        # that already delivered its answer never counts as working.
-        try:
-            if page.locator("[role='progressbar']").count() > 0:
-                return True
-        except Exception:
-            pass
-        for sel in (".mat-progress-spinner", "[class*='spinner']", "[class*='loader']"):
-            loc = page.locator(sel)
-            for i in range(min(loc.count(), 3)):
-                if _safe_visible(loc.nth(i)):
-                    return True
+        # 3. Check for visible spinners ONLY when a user turn is present in the DOM
+        # and no completed assistant turn has settled yet.
+        if u_turns_cnt > 0:
+            for sel in ("[role='progressbar']", ".mat-progress-spinner", "[class*='spinner']", "[class*='loader']"):
+                loc = page.locator(sel)
+                for i in range(min(loc.count(), 3)):
+                    if _safe_visible(loc.nth(i)):
+                        return True
     except Exception:
         pass
 
     try:
-        # 4. Check RE_WORKING only if no completed assistant turn was found
-        text = page.locator("body").inner_text(timeout=4000) or ""
-        tail = text[-1200:]
-        if RE_WORKING.search(tail):
-            turns = _assistant_turns(page)
-            if not turns or not _element_is_after_last_user_turn(turns[-1]):
-                return True
+        # 4. Check RE_WORKING only if a user turn exists and no completed assistant turn was found
+        if u_turns_cnt > 0:
+            text = page.locator("body").inner_text(timeout=4000) or ""
+            tail = text[-1200:]
+            if RE_WORKING.search(tail):
+                turns = _assistant_turns(page)
+                if not turns or not _element_is_after_last_user_turn(turns[-1]):
+                    return True
     except Exception:
         pass
 
@@ -6527,13 +7056,22 @@ def _format_elapsed(seconds: float) -> str:
     return f"{mins} min {secs} s"
 
 
+APPEND_FOLLOWUP_MARKER = "[ADDENDUM TO RUNNING TASK"
+
+
 def _check_superseded_prompt(
     page,
     expected_prompt_text: str = "",
     expected_task_text: str = "",
     prev_state: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
-    """Return a conflict description when a newer, DIFFERENT prompt was sent into the same chat (D22)."""
+    """Return a conflict description when a newer, COMPETING prompt was sent into the same chat (D22, Addendum B).
+
+    Distinguishes a competing prompt from an `--append-followup` extension of the SAME
+    running task: any message carrying `APPEND_FOLLOWUP_MARKER`, the running task's own
+    label/task_id, or matching an entry in `prev_state['appended_followups']` is part
+    of this task and is NOT a supersede.
+    """
     last_user_raw = _last_user_message_text(page)
     if not last_user_raw:
         return None
@@ -6541,7 +7079,7 @@ def _check_superseded_prompt(
     u_hash = _prompt_hash(last_user_raw)
     u_prefix = u_norm[:160]
 
-    prev = prev_state if isinstance(prev_state, dict) else {}
+    prev = dict(prev_state) if isinstance(prev_state, dict) else {}
     exp_p = (expected_prompt_text or "").strip()
     exp_t = (expected_task_text or str(prev.get("task") or "")).strip()
     exp_p_hash = _prompt_hash(exp_p) if exp_p else str(prev.get("prompt_hash") or "")
@@ -6560,6 +7098,35 @@ def _check_superseded_prompt(
         return None
     if exp_t_norm and len(exp_t_norm) >= 20 and exp_t_norm[:120] in u_norm:
         return None
+
+    # Addendum B: Check if last_user_raw is an appended follow-up to this running task
+    low_u = u_norm.lower()
+    if (
+        APPEND_FOLLOWUP_MARKER.lower() in low_u
+        or "[addendum to the running task" in low_u
+        or "[appended follow-up" in low_u
+    ):
+        return None
+
+    task_label = _normalize_ws(str(prev.get("label") or "")).strip()
+    if task_label and len(task_label) >= 8 and task_label.lower() in low_u:
+        return None
+
+    appended_list = prev.get("appended_followups")
+    if isinstance(appended_list, list):
+        for item in appended_list:
+            if not isinstance(item, dict):
+                continue
+            a_hash = str(item.get("prompt_hash") or "")
+            a_raw_hash = str(item.get("raw_hash") or "")
+            a_pref = _normalize_ws(str(item.get("prefix") or ""))
+            a_raw_pref = _normalize_ws(str(item.get("raw_prefix") or ""))
+            if (a_hash and u_hash == a_hash) or (a_raw_hash and u_hash == a_raw_hash):
+                return None
+            if a_pref and len(a_pref) >= 16 and (a_pref[:100] in u_norm or u_norm[:100] in a_pref):
+                return None
+            if a_raw_pref and len(a_raw_pref) >= 16 and (a_raw_pref[:100] in u_norm or u_norm[:100] in a_raw_pref):
+                return None
 
     return (
         f"chat now has a different last user prompt ({u_prefix!r}) that superseded "
@@ -6617,8 +7184,17 @@ def _known_chat_ids_for_slot(slot: Optional[str]) -> set:
     return known
 
 
-def _wait_for_conversation_loaded(page, timeout: float = 15.0) -> None:
-    """Wait until the page has finished loading the conversation and earlier turns are rendered (E3.2)."""
+def _wait_for_conversation_loaded(
+    page,
+    timeout: float = 15.0,
+    require_turns: bool = False,
+) -> bool:
+    """Wait until the page has finished loading the conversation and earlier turns are rendered (E3.2, Addendum A.1).
+
+    When `require_turns=True` (an existing conversation being reopened or continued),
+    waits until the conversation's user/assistant turns are actually present in the DOM
+    and returns `True` only when the conversation has proven to have finished rendering.
+    """
     _wait_for_workspace(page, timeout=min(25.0, max(5.0, timeout)))
     try:
         page.wait_for_timeout(1800)
@@ -6628,36 +7204,20 @@ def _wait_for_conversation_loaded(page, timeout: float = 15.0) -> None:
     prev_snapshot = None
     stable_streak = 0
     while time.monotonic() < deadline:
-        try:
-            state = page.evaluate(
-                """() => {
-                    const ready = document.readyState === 'complete';
-                    const spinners = Array.from(
-                        document.querySelectorAll("mat-progress-spinner, .mat-progress-spinner, [role='progressbar'], .loading-spinner")
-                    ).filter(e => !!(e.offsetWidth || e.offsetHeight));
-                    const userTurns = document.querySelectorAll(
-                        "user-query, [data-test-id='user-query'], .user-query-text, .query-text, message-turn.user-query, div.user-query"
-                    ).length;
-                    const modelTurns = document.querySelectorAll(
-                        "model-response, [data-test-id='model-response'], .model-response-text, message-turn.model-response, div.model-response"
-                    ).length;
-                    return {
-                        ready,
-                        spinners: spinners.length,
-                        userTurns,
-                        modelTurns,
-                        url: String(location.href || '')
-                    };
-                }"""
-            )
-        except Exception:
-            state = None
-        if isinstance(state, dict) and state.get("ready") and int(state.get("spinners", 0)) == 0:
-            snap = (state.get("url"), state.get("userTurns"), state.get("modelTurns"))
+        state = _inspect_conversation_render_state(page)
+        u_cnt = int(state.get("userTurns") or 0)
+        m_cnt = int(state.get("modelTurns") or 0)
+        spin_cnt = int(state.get("spinners") or 0)
+        stop_cnt = int(state.get("stopButtons") or 0)
+        ready = bool(state.get("ready"))
+        turns_ok = (u_cnt > 0 or m_cnt > 0) if require_turns else True
+
+        if ready and turns_ok and (spin_cnt == 0 or stop_cnt > 0 or m_cnt > 0):
+            snap = (state.get("url"), u_cnt, m_cnt)
             if snap == prev_snapshot:
                 stable_streak += 1
                 if stable_streak >= 2:
-                    break
+                    return True
             else:
                 prev_snapshot = snap
                 stable_streak = 1
@@ -6665,6 +7225,11 @@ def _wait_for_conversation_loaded(page, timeout: float = 15.0) -> None:
             page.wait_for_timeout(900)
         except Exception:
             time.sleep(0.9)
+
+    final_state = _inspect_conversation_render_state(page)
+    if require_turns:
+        return bool(int(final_state.get("userTurns") or 0) > 0 or int(final_state.get("modelTurns") or 0) > 0)
+    return bool(final_state.get("ready")) and int(final_state.get("spinners") or 0) == 0
 
 
 def _conversation_emptiness_report(page, forbidden: Optional[set] = None) -> tuple[bool, str, int, int]:
@@ -7009,12 +7574,14 @@ def _carry_over_to_new_session(
     if deadline is None:
         deadline = time.monotonic() + 900.0
     co_step = 0
+    co_chip_captures = 0
     while time.monotonic() < deadline:
         try:
             new_chip = _new_delivery_chip(page, chips_before_co, responses_before_co)
             if new_chip is None:
                 new_chip = _generated_file_chip(page)
             if new_chip is not None:
+                co_chip_captures += 1
                 got = capture_generated_file(
                     page,
                     proj_root / "downloads",
@@ -7032,6 +7599,13 @@ def _carry_over_to_new_session(
                     )
                     print(f"[+] Captured the patch from the NEW session: {got}")
                     return got
+                if getattr(page, "_argon_chip_capture_exhausted", False) or co_chip_captures >= MAX_CHIP_DOWNLOAD_ATTEMPTS:
+                    co_fail_reason = str(getattr(page, "_argon_last_capture_failure_reason", "") or "chip download attempts exhausted")
+                    print(
+                        f"[!] Carry-over delivery chip rejected after bounded attempts ({co_fail_reason}); stopping carry-over loop.",
+                        file=sys.stderr,
+                    )
+                    return None
         except Exception:
             pass
         wait_s = _next_wait_interval(co_step)
@@ -7516,27 +8090,144 @@ def dispatch_to_argon(
     task_registry = TaskRegistry()
     delivery_ledger = DeliveryLedger()
 
-    send_progress = "none"
+    prior_ladder_entry = (task_state_store.get(proj_root, lane=lane) or task_state_store.get(proj_root)) or {}
+    prior_state_val = str(prior_ladder_entry.get("state") or "").strip().lower()
+    prior_task_hash = str(prior_ladder_entry.get("task_hash") or "")
+    current_task_hash = _prompt_hash(task) if task else prior_task_hash
+    is_same_unfinished_task = bool(
+        resume
+        or (
+            prior_ladder_entry
+            and prior_state_val not in ("applied", "delivered", "completed", "superseded", "")
+            and (not current_task_hash or not prior_task_hash or current_task_hash == prior_task_hash)
+        )
+    )
+    if force and not resume:
+        is_same_unfinished_task = False
+
+    ladder_phase = "delivery" if (
+        resume
+        or (
+            is_same_unfinished_task
+            and (
+                prior_state_val in ("sent", "waiting", "delivery_failed")
+                or str(prior_ladder_entry.get("send_progress") or "") in ("prompt_sent", "verified")
+            )
+        )
+    ) else "send"
+
+    if is_same_unfinished_task:
+        send_attempt = int(prior_ladder_entry.get("send_attempt") or 0)
+        delivery_attempt = int(prior_ladder_entry.get("delivery_attempt") or 0)
+    else:
+        send_attempt = 0
+        delivery_attempt = 0
+
+    if ladder_phase == "send":
+        send_attempt += 1
+        current_attempt = send_attempt
+    else:
+        delivery_attempt += 1
+        current_attempt = delivery_attempt
+
+    if current_attempt > MAX_LADDER_ATTEMPTS:
+        refused_slot = str(slot or prior_ladder_entry.get("slot") or "/u/0/")
+        refused_lane = str(lane or prior_ladder_entry.get("lane") or "new")
+        q_file_prev = str(prior_ladder_entry.get("quarantined_file") or "")
+        last_fail_prev = str(prior_ladder_entry.get("last_failure_reason") or prior_state_val or "previous attempts failed")
+        print("\n" + "!" * 78, file=sys.stderr)
+        print(
+            f"[ERROR] Bounded retry ladder exhausted for phase '{ladder_phase}' "
+            f"(attempt {current_attempt} of {MAX_LADDER_ATTEMPTS} refused)!",
+            file=sys.stderr,
+        )
+        print(
+            f"  Automated {ladder_phase} attempts 1..{MAX_LADDER_ATTEMPTS} have already run for this task "
+            f"(last reason: {last_fail_prev}).",
+            file=sys.stderr,
+        )
+        if q_file_prev:
+            print(f"  Quarantined delivery file kept at: {q_file_prev}", file=sys.stderr)
+            print(f'  Apply it by hand with: Open_Argon_Apply.bat -PatchFile "{q_file_prev}"', file=sys.stderr)
+        print(
+            "  A 4th automated attempt is strictly forbidden. Proceed to Step 4 (Manual Hand-Off):",
+            file=sys.stderr,
+        )
+        print(
+            f'    python "{SCRIPTS_DIR / "dispatch_argon.py"}" --project-path "{proj_root}" '
+            f"--manual-handoff --lane {refused_lane} --slot {refused_slot} --open-browser",
+            file=sys.stderr,
+        )
+        print("!" * 78 + "\n", file=sys.stderr)
+        return EXIT_PREFLIGHT_FAILED
+
+    print(
+        f"[+] Retry ladder: phase={ladder_phase}, attempt {current_attempt} of {MAX_LADDER_ATTEMPTS}"
+    )
+
+    send_progress = str(prior_ladder_entry.get("send_progress") or "none") if resume else "none"
+    task_state_store.set(
+        proj_root,
+        lane=lane,
+        phase=ladder_phase,
+        attempt=current_attempt,
+        send_attempt=send_attempt,
+        delivery_attempt=delivery_attempt,
+        max_attempts=MAX_LADDER_ATTEMPTS,
+        send_progress=send_progress,
+        task_hash=current_task_hash,
+    )
     if not resume:
-        task_state_store.set(proj_root, lane=lane, send_progress="none")
-        task_registry.update_running(proj_root, lane=lane, send_progress="none")
+        task_registry.update_running(
+            proj_root,
+            lane=lane,
+            send_progress="none",
+            phase=ladder_phase,
+            attempt=current_attempt,
+        )
 
     def _track_send_progress(p_val: str) -> None:
-        nonlocal send_progress
+        nonlocal send_progress, ladder_phase, delivery_attempt, current_attempt
         send_progress = p_val
-        task_state_store.set(proj_root, lane=lane, send_progress=p_val)
-        task_registry.update_running(proj_root, lane=lane, send_progress=p_val)
+        if p_val in ("prompt_sent", "verified") and ladder_phase == "send":
+            ladder_phase = "delivery"
+            if delivery_attempt == 0:
+                delivery_attempt = 1
+            current_attempt = delivery_attempt
+            print(
+                f"[+] Retry ladder: entering phase=delivery, attempt {current_attempt} of {MAX_LADDER_ATTEMPTS}"
+            )
+        task_state_store.set(
+            proj_root,
+            lane=lane,
+            send_progress=p_val,
+            phase=ladder_phase,
+            attempt=current_attempt,
+            send_attempt=send_attempt,
+            delivery_attempt=delivery_attempt,
+        )
+        task_registry.update_running(
+            proj_root,
+            lane=lane,
+            send_progress=p_val,
+            phase=ladder_phase,
+            attempt=current_attempt,
+        )
 
     def _emit_send_failure(step_name: str, shot_path_val: Optional[Path] = None, page_obj: Any = None) -> None:
         try:
             from manual_handoff import write_manual_handoff_pack
             from argon_pool_login import find_chrome_executable
             c_exe = find_chrome_executable()
-            p_dir = Path.home() / ".gemini" / "argon_profiles" / f"slot-{_slot_key(active_slot)}"
+            p_dir = _profile_dir_for_slot(pool_cfg.profile_dir, active_slot)
             cur_chat = ""
+            q_file_now = ""
+            fail_reason_now = step_name
             if page_obj is not None:
                 try:
                     cur_chat = str(getattr(page_obj, "url", "") or "")
+                    q_file_now = str(getattr(page_obj, "_argon_last_quarantined_path", "") or "")
+                    fail_reason_now = str(getattr(page_obj, "_argon_last_capture_failure_reason", "") or step_name)
                 except Exception:
                     cur_chat = ""
             md_p, _ = write_manual_handoff_pack(
@@ -7553,6 +8244,11 @@ def dispatch_to_argon(
                 last_screenshot=shot_path_val,
                 chrome_exe=c_exe,
                 profile_dir=p_dir,
+                phase=ladder_phase,
+                attempt=current_attempt,
+                max_attempts=MAX_LADDER_ATTEMPTS,
+                quarantined_file=q_file_now,
+                failure_reason=fail_reason_now,
             )
             print("\n[i] Manual hand-off summary:")
             print(f"    Account e-mail : {target_email or '(none / unconfigured)'}")
@@ -7581,24 +8277,61 @@ def dispatch_to_argon(
             file=sys.stderr,
         )
 
-    # D2.1, D2.2, D22.1: Before starting a new run, check whether a task is already running
-    # for this project (and lane, if specified). Refuse with EXIT_ALREADY_RUNNING (9) unless
-    # --resume or --force was explicitly passed.
+    # Addendum A.2: Reclaim any leftover `running` task records whose owning PID is dead
+    # BEFORE checking the ALREADY RUNNING guard so a failed earlier attempt never blocks retry step 2.
+    task_registry.reclaim_dead_tasks(proj_root, lane=lane)
+
     if not resume:
         existing_lane_state = task_state_store.get(proj_root, lane=lane) if lane else None
+        if isinstance(existing_lane_state, dict):
+            el_pid = int(existing_lane_state.get("pid") or 0)
+            el_state = str(existing_lane_state.get("state") or "").strip().lower()
+            el_prog = str(existing_lane_state.get("send_progress") or "none").strip().lower()
+            if el_pid and el_pid != os.getpid() and not _pid_alive(el_pid):
+                if el_state == "running" or el_prog not in ("prompt_sent", "verified"):
+                    task_state_store.set(
+                        proj_root,
+                        lane=lane,
+                        state="failed",
+                        end_reason=f"reclaimed leftover state={el_state!r} from dead pid {el_pid}",
+                    )
+                    existing_lane_state = task_state_store.get(proj_root, lane=lane)
+
         running_lanes = task_state_store.get_running_lanes(proj_root)
+        for rl_name, rl_data in list(running_lanes.items()):
+            rl_pid = int((rl_data or {}).get("pid") or 0)
+            rl_prog = str((rl_data or {}).get("send_progress") or "none").strip().lower()
+            if rl_pid and rl_pid != os.getpid() and not _pid_alive(rl_pid) and rl_prog not in ("prompt_sent", "verified"):
+                task_state_store.set(
+                    proj_root,
+                    lane=rl_name,
+                    state="failed",
+                    end_reason=f"reclaimed leftover running lane {rl_name!r} from dead pid {rl_pid}",
+                )
+                running_lanes.pop(rl_name, None)
+
         blocking_entry: Optional[Dict[str, Any]] = None
         if lane:
             if existing_lane_state and str(existing_lane_state.get("state") or "").strip().lower() in ("sent", "waiting"):
-                blocking_entry = existing_lane_state
+                b_pid_cand = int(existing_lane_state.get("pid") or 0)
+                if not b_pid_cand or b_pid_cand == os.getpid() or _pid_alive(b_pid_cand):
+                    blocking_entry = existing_lane_state
         elif running_lanes:
-            first_k = next(iter(running_lanes))
-            blocking_entry = running_lanes[first_k]
+            for _, rl_cand in running_lanes.items():
+                b_pid_cand = int((rl_cand or {}).get("pid") or 0)
+                if not b_pid_cand or b_pid_cand == os.getpid() or _pid_alive(b_pid_cand):
+                    blocking_entry = rl_cand
+                    break
 
         if blocking_entry is None:
             reg_active = task_registry.active_tasks_for_project(proj_root, lane=lane)
-            if reg_active and (reg_active[0].get("chat_id") or reg_active[0].get("chat_url")):
-                blocking_entry = reg_active[0]
+            for ra_item in reg_active:
+                ra_pid = int(ra_item.get("pid") or 0)
+                if ra_pid and ra_pid != os.getpid() and not _pid_alive(ra_pid):
+                    continue
+                if ra_item.get("chat_id") or ra_item.get("chat_url"):
+                    blocking_entry = ra_item
+                    break
 
         if blocking_entry is not None:
             b_slot = str(blocking_entry.get("slot") or "/u/0/")
@@ -7667,17 +8400,19 @@ def dispatch_to_argon(
     if resume_chat and not task and resume_entry:
         task = str(resume_entry.get("task") or "")
 
-    # If --resume sees a delivered file that is already on disk and valid,
-    # apply or report it directly without even needing a browser.
+    # If --resume sees a delivered file that is already on disk and passes BOTH
+    # _looks_like_patch and _patch_is_complete (Section 2.1.H), apply or report it directly.
     if resume_chat and resume_entry and resume_entry.get("delivered"):
         existing_delivery = Path(str(resume_entry["delivered"]))
-        if existing_delivery.is_file():
+        if existing_delivery.is_file() and not _is_quarantined_path(existing_delivery):
             try:
                 existing_text = existing_delivery.read_text(encoding="utf-8", errors="replace")
             except Exception:
                 existing_text = ""
-            if _looks_like_patch(existing_text):
-                print(f"[+] Resuming from already-captured patch file: {existing_delivery}")
+            looks_ok_r = _looks_like_patch(existing_text)
+            comp_ok_r = _patch_is_complete(existing_text)
+            if looks_ok_r and comp_ok_r:
+                print(f"[+] Resuming from already-captured complete patch file: {existing_delivery}")
                 saved_resume_notes = _save_notes(existing_text, proj_root)
                 if auto_apply:
                     ok = apply_delivered_patch(proj_root, existing_delivery)
@@ -7829,62 +8564,97 @@ def dispatch_to_argon(
     # Every pool slot gets its own browser profile directory, so two runs on
     # two different slots never fight over one Chrome profile. The slot lock
     # stops two runs from using the SAME slot at once.
+    from safe_browser import (
+        acquire_host_tab,
+        has_live_browser_host,
+        profile_has_signed_in_account,
+        release_host_tab,
+        repair_slot_cookie_db_only,
+        update_host_tab,
+        verify_account_index_in_preferences,
+    )
+
     slot_lock = SlotLock(active_slot, profile_dir=slot_profile)
     lock_acquired = slot_lock.acquire(slot_profile)
     temp_concurrent_profile: Optional[Path] = None
 
     context = None
+    page = None
+    host_tab_id: Optional[str] = None
+    attached_to_host = False
     try:
-        if not lock_acquired or _profile_is_busy(slot_profile):
-            print(
-                f"[+] Slot {active_slot} profile ({slot_profile}) already has an active run; "
-                f"cloning a concurrent profile directory for {active_slot} so this run continues without blocking."
-            )
-            concurrent_cand = slot_profile.parent / f"{slot_profile.name}-concurrent-{os.getpid()}"
-            src_for_clone = slot_profile if (slot_profile / "Default").is_dir() else base_profile
-            cloned_prof = _copy_profile(src_for_clone, concurrent_cand, allow_busy=True)
-            if cloned_prof is not None:
-                temp_concurrent_profile = cloned_prof
-                slot_profile = cloned_prof
-
         profile_dir = slot_profile
         try:
-            needs_seed = not (slot_profile.is_dir() and (slot_profile / "Default").is_dir()) or (
-                _has_cookie_db(base_profile) and not _has_cookie_db(slot_profile)
-            )
-            seeded_ok = True
-            if needs_seed:
+            if not (slot_profile.is_dir() and (slot_profile / "Default").is_dir()):
                 print(f"[+] Preparing a browser profile for slot {active_slot}: {slot_profile}")
                 seeded_ok = _seed_profile(base_profile, slot_profile)
+            elif not _has_cookie_db(slot_profile):
+                if profile_has_signed_in_account(slot_profile):
+                    print(
+                        f"[+] Slot profile {slot_profile} holds a registered account; "
+                        "repairing SQLite cookie DB in-place without replacing profile."
+                    )
+                    repair_slot_cookie_db_only(base_profile, slot_profile)
+                    seeded_ok = True
+                elif _has_cookie_db(base_profile):
+                    print(f"[+] Seeding initial cookie DB for slot {active_slot}: {slot_profile}")
+                    seeded_ok = _seed_profile(base_profile, slot_profile)
+                else:
+                    seeded_ok = True
+            else:
+                seeded_ok = True
 
             if seeded_ok and slot_profile.is_dir() and (slot_profile / "Default").is_dir():
                 profile_dir = slot_profile
             elif not (base_profile / "Default").is_dir():
                 profile_dir = slot_profile
             else:
-                if _profile_is_busy(base_profile):
-                    print(
-                        f"[!] Could not prepare slot profile for {active_slot} because the master profile "
-                        f"({base_profile}) is busy, and the shared profile cannot be used while busy.",
-                        file=sys.stderr,
-                    )
-                    return EXIT_SLOT_BUSY
-                print(
-                    f"[!] Could not prepare a separate profile for slot {active_slot}; "
-                    f"using the shared profile ({base_profile}) because it is currently free.",
-                    file=sys.stderr,
-                )
-                profile_dir = base_profile
+                profile_dir = slot_profile
         except Exception as exc:
             print(f"[!] Could not prepare the slot profile: {exc}", file=sys.stderr)
-            if _profile_is_busy(base_profile):
-                return EXIT_SLOT_BUSY
-            profile_dir = base_profile
+            profile_dir = slot_profile
+
+        # Section 2.3.C: When using a shared multi-account profile, verify the account index
+        # in Default/Preferences (`account_info`) so the tab targets the exact `/u/<index>/` account.
+        if not _profile_is_isolated_slot(profile_dir):
+            expected_acct_idx = pool_cfg.get_account_index(active_slot)
+            ok_idx, found_idx, all_pref_emails = verify_account_index_in_preferences(
+                profile_dir,
+                target_email or "",
+                expected_index=expected_acct_idx,
+            )
+            eff_idx = found_idx if found_idx is not None else expected_acct_idx
+            if found_idx is not None:
+                pool_cfg.set_account_index(active_slot, found_idx)
+            print(
+                f"[+] Shared profile account index for slot {active_slot} ({target_email or 'account'}): "
+                f"/u/{eff_idx}/ (verified_in_preferences={ok_idx}, registered_accounts={len(all_pref_emails)})"
+            )
+            target_url = re.sub(
+                r"(gemini\.google\.com)/u/\d+/",
+                f"\\1/u/{eff_idx}/",
+                target_url,
+                flags=re.IGNORECASE,
+            )
 
         slot_lock.update_profile_dir(profile_dir)
         chrome_exe = find_chrome_executable()
 
-        with sync_playwright() as p:
+        def _close_active_browser_in_with() -> None:
+            nonlocal context, page, host_tab_id, attached_to_host
+            if context is None:
+                return
+            try:
+                if attached_to_host and host_tab_id:
+                    release_host_tab(context, page, profile_dir, tab_id=host_tab_id)
+                else:
+                    _close_browser_safely(context, profile_dir)
+            except Exception:
+                pass
+            context = None
+            page = None
+
+        with sync_playwright() as p, _PlaywrightSafeCloseGuard(_close_active_browser_in_with):
             launch_kwargs: dict[str, Any] = {
                 "user_data_dir": str(profile_dir),
                 "headless": headless,
@@ -7892,37 +8662,68 @@ def dispatch_to_argon(
                 "ignore_default_args": ["--enable-automation"],
                 "no_viewport": True,
             }
-            if chrome_exe:
-                print(f"[+] Launching installed Google Chrome binary: {chrome_exe}")
-            try:
-                context = _launch_with_fallback(p, launch_kwargs, chrome_exe, profile_dir)
-            except BaseException as exc:
-                if not isinstance(exc, Exception):
-                    raise
-                busy_err = (
-                    "existing browser session" in str(exc).lower()
-                    or "profile is already in use" in str(exc).lower()
-                    or "already in use by another browser" in str(exc).lower()
-                )
-                if busy_err:
+
+            # Section 2.3.A & 2.3.B: Attach to (or start) the profile's single CDP browser host
+            # and open a dedicated tab for this task so N tasks share 1 browser process.
+            context, page, host_tab_id, attached_to_host = acquire_host_tab(
+                playwright_instance=p,
+                profile_dir=profile_dir,
+                slot=active_slot,
+                project_path=proj_root,
+                lane=lane or "single",
+                chrome_exe=chrome_exe,
+                headless=headless,
+                account_email=target_email or "",
+            )
+
+            if context is None or page is None:
+                # Fallback when CDP host is unavailable: if profile is busy with a non-host browser,
+                # clone a concurrent profile directory so this run still does not block.
+                if (not lock_acquired or _profile_is_busy(profile_dir)) and not has_live_browser_host(profile_dir):
                     print(
-                        f"[!] Profile {profile_dir} for slot {active_slot} is busy. "
-                        f"Refusing to hijack the running browser.",
+                        f"[+] Profile ({profile_dir}) is held by a non-host browser; "
+                        f"cloning a concurrent profile directory for {active_slot} as fallback."
+                    )
+                    concurrent_cand = profile_dir.parent / f"{profile_dir.name}-concurrent-{os.getpid()}"
+                    src_for_clone = profile_dir if (profile_dir / "Default").is_dir() else base_profile
+                    cloned_prof = _copy_profile(src_for_clone, concurrent_cand, allow_busy=True)
+                    if cloned_prof is not None:
+                        temp_concurrent_profile = cloned_prof
+                        profile_dir = cloned_prof
+                        launch_kwargs["user_data_dir"] = str(profile_dir)
+                        slot_lock.update_profile_dir(profile_dir)
+
+                if chrome_exe:
+                    print(f"[+] Launching installed Google Chrome binary (fallback mode): {chrome_exe}")
+                try:
+                    context = _launch_with_fallback(p, launch_kwargs, chrome_exe, profile_dir)
+                except BaseException as exc:
+                    if not isinstance(exc, Exception):
+                        raise
+                    busy_err = (
+                        "existing browser session" in str(exc).lower()
+                        or "profile is already in use" in str(exc).lower()
+                        or "already in use by another browser" in str(exc).lower()
+                    )
+                    if busy_err:
+                        print(
+                            f"[!] Profile {profile_dir} for slot {active_slot} is busy. "
+                            f"Refusing to hijack the running browser.",
+                            file=sys.stderr,
+                        )
+                        return EXIT_SLOT_BUSY
+                    print(
+                        "[ERROR] Could not start a browser on the selected profile.",
                         file=sys.stderr,
                     )
-                    return EXIT_SLOT_BUSY
-                print(
-                    "[ERROR] Could not start a browser on the selected profile.",
-                    file=sys.stderr,
-                )
-                print(f"  {str(exc).splitlines()[0]}", file=sys.stderr)
-                print(
-                    "  Close every other window that uses the Argon profile and try again.",
-                    file=sys.stderr,
-                )
-                return EXIT_BROWSER_LAUNCH_FAILED
+                    print(f"  {str(exc).splitlines()[0]}", file=sys.stderr)
+                    print(
+                        "  Close every other window that uses the Argon profile and try again.",
+                        file=sys.stderr,
+                    )
+                    return EXIT_BROWSER_LAUNCH_FAILED
 
-            page = context.pages[0] if context.pages else context.new_page()
+                page = context.pages[0] if context.pages else context.new_page()
 
             # Argon delivers apply_changes.ps1 as an attached file. Capture the
             # browser download only when it passes URL and .ps1 validation.
@@ -8172,6 +8973,54 @@ def dispatch_to_argon(
                     _print_run_failure_summary(ev_fc)
                     return EXIT_PREFLIGHT_FAILED
 
+            # Addendum A.1: Wait for an existing conversation to finish rendering its turns
+            # in the DOM before deciding whether Argon is working or whether the prompt is a duplicate.
+            # "Still loading" (empty conversation area with a progressbar) must NEVER be read as "working".
+            if is_continuation or resume_chat:
+                conv_ready = _wait_for_conversation_loaded(page, timeout=30.0, require_turns=True)
+                if not conv_ready:
+                    print(
+                        "[!] Existing conversation has not finished rendering its message history yet; "
+                        "reloading once and waiting for turns to appear in the DOM...",
+                        file=sys.stderr,
+                    )
+                    try:
+                        page.reload(wait_until="domcontentloaded", timeout=60000)
+                    except Exception:
+                        pass
+                    conv_ready = _wait_for_conversation_loaded(page, timeout=25.0, require_turns=True)
+                if not conv_ready and is_continuation and not resume_chat:
+                    loading_shot = _take_step_screenshot(
+                        page,
+                        proj_root,
+                        "preflight_failure.png",
+                        step_label="conversation_still_loading",
+                        state_label="Conversation page did not finish loading turns into the DOM",
+                        lane=lane,
+                    )
+                    load_reason = (
+                        f"Conversation {getattr(page, 'url', target_url)} could not be proven to have finished "
+                        "loading (0 turns rendered in DOM; 'still loading' is not 'working' and not guessed)."
+                    )
+                    print(f"\n[ERROR] {load_reason}\n        Screenshot: {loading_shot}", file=sys.stderr)
+                    task_state_store.set(
+                        proj_root,
+                        lane=lane,
+                        state="failed",
+                        end_reason=load_reason,
+                        pid=os.getpid(),
+                        last_screenshot=str(loading_shot or ""),
+                    )
+                    task_registry.register_done(
+                        proj_root,
+                        lane=lane,
+                        slot=active_slot,
+                        status="failed",
+                        screenshot_path=str(loading_shot or ""),
+                        end_reason=load_reason,
+                    )
+                    return EXIT_PREFLIGHT_FAILED
+
             # Rule 1.1 & 1.2 + D22: Before attaching the zip or sending, check whether
             # this prompt is already the last user message in the conversation
             # or whether this chat already has an unfinished running task.
@@ -8192,8 +9041,17 @@ def dispatch_to_argon(
                 )
                 print(
                     f"        Screenshot: {live_working_shot}\n"
-                    f"        Use --resume to wait for the running answer, or --force to supersede it explicitly.",
+                    f"        Use --resume to wait for the running answer, --append-followup <file.md> to extend it, "
+                    f"or --force to supersede it explicitly.",
                     file=sys.stderr,
+                )
+                task_registry.register_done(
+                    proj_root,
+                    lane=lane,
+                    slot=active_slot,
+                    status="failed",
+                    screenshot_path=str(live_working_shot or ""),
+                    end_reason="refused to start because conversation already has Argon actively working",
                 )
                 return EXIT_ALREADY_RUNNING
 
@@ -8752,6 +9610,15 @@ def dispatch_to_argon(
                     chat_id=chat_id,
                     chat_url=effective_chat_url,
                 )
+                if attached_to_host and host_tab_id:
+                    update_host_tab(
+                        profile_dir,
+                        host_tab_id,
+                        chat_id=chat_id,
+                        chat_url=effective_chat_url,
+                        page_url=effective_chat_url,
+                        account=target_email or "",
+                    )
                 print(f"[+] Remembered the session for this project: {effective_chat_url}")
                 if chat_title:
                     print(f"    conversation name : {chat_title}")
@@ -9096,6 +9963,29 @@ def dispatch_to_argon(
                                 lane=lane,
                             )
                             print(f"[+] Captured the generated patch file: {captured}")
+                            break
+                        if getattr(page, "_argon_chip_capture_exhausted", False):
+                            cap_fail_reason = str(
+                                getattr(page, "_argon_last_capture_failure_reason", "")
+                                or "delivery chip failed validation after bounded attempts"
+                            )
+                            q_path_str = str(getattr(page, "_argon_last_quarantined_path", "") or "")
+                            run_failed_reason = cap_fail_reason
+                            task_state.set(
+                                proj_root,
+                                lane=lane,
+                                state="delivery_failed",
+                                phase="delivery",
+                                attempt=current_attempt,
+                                delivery_attempt=delivery_attempt,
+                                quarantined_file=q_path_str,
+                                last_failure_reason=cap_fail_reason,
+                            )
+                            print(
+                                f"[!] Stopping wait loop: delivery chip reached the {MAX_CHIP_DOWNLOAD_ATTEMPTS}-attempt cap "
+                                f"({cap_fail_reason}).",
+                                file=sys.stderr,
+                            )
                             break
 
                     working = _is_argon_working(page)
@@ -9483,10 +10373,17 @@ def dispatch_to_argon(
                     ),
                 )
                 final_state_name = "superseded" if "superseded" in reason.lower() else "failed"
+                q_file_final = str(getattr(page, "_argon_last_quarantined_path", "") or "")
                 task_state.set(
                     proj_root,
                     lane=lane,
                     state=final_state_name,
+                    phase=ladder_phase,
+                    attempt=current_attempt,
+                    send_attempt=send_attempt,
+                    delivery_attempt=delivery_attempt,
+                    quarantined_file=q_file_final,
+                    last_failure_reason=reason,
                     chat_title=live_title,
                     chat_url=live_url,
                     slot=active_slot,
@@ -9570,13 +10467,54 @@ def dispatch_to_argon(
                     return EXIT_SUCCESS if ok else EXIT_FAILURE
 
                 _print_run_failure_summary(diag_ev)
+                _emit_send_failure("delivery_failed", failed_shot, page_obj=page)
                 print(f"[!] Neither a delivered file nor a PowerShell patch block was detected ({reason}).")
-                print(f"    If Argon delivered a file, run: Open_Argon_Apply.bat  (searches {Path.home() / 'Downloads'})")
+                if q_file_final:
+                    print(f'    Quarantined delivery file kept at: {q_file_final}')
+                    print(f'    Inspect or apply it by hand with: Open_Argon_Apply.bat -PatchFile "{q_file_final}"')
+                else:
+                    print(f"    If Argon delivered a file, run: Open_Argon_Apply.bat  (searches {Path.home() / 'Downloads'})")
                 return EXIT_FAILURE
     finally:
+        # Addendum A.2: Guarantee that any run exiting for ANY reason (except deliberate
+        # waiting-at-deadline handoff for --resume) never leaves its own TaskRegistry or
+        # TaskState record stuck in `running`.
+        try:
+            active_for_this_pid = [
+                e
+                for e in task_registry.active_tasks_for_project(proj_root, lane=lane)
+                if int(e.get("pid") or 0) in (0, os.getpid())
+            ]
+            if active_for_this_pid and not locals().get("still_working_at_deadline", False):
+                exit_reason_final = str(
+                    locals().get("run_failed_reason")
+                    or "run exited before completion (terminal cleanup in finally)"
+                )
+                task_registry.register_done(
+                    proj_root,
+                    lane=lane,
+                    slot=active_slot,
+                    status="failed",
+                    end_reason=exit_reason_final,
+                )
+            cur_ts = task_state_store.get(proj_root, lane=lane) or {}
+            if (
+                isinstance(cur_ts, dict)
+                and str(cur_ts.get("state") or "").strip().lower() == "running"
+                and int(cur_ts.get("pid") or 0) in (0, os.getpid())
+            ):
+                task_state_store.set(
+                    proj_root,
+                    lane=lane,
+                    state="failed",
+                    end_reason="run exited before prompt was sent",
+                    pid=os.getpid(),
+                )
+        except Exception:
+            pass
         if context is not None:
             try:
-                context.close()
+                _close_browser_safely(context, profile_dir)
             except Exception:
                 pass
             context = None
@@ -9586,7 +10524,7 @@ def dispatch_to_argon(
                 shutil.rmtree(temp_concurrent_profile, ignore_errors=True)
             except Exception:
                 pass
-        print("[+] Browser closed and the slot lock released.")
+        print("[+] Browser session preserved and the slot lock released.")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -9786,12 +10724,235 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="List all currently running and stale tasks in ~/.gemini/argon_tasks.json with per-slot load counts.",
     )
     parser.add_argument(
+        "--close-browser",
+        action="store_true",
+        help="Safely close the browser of --slot (all its tabs) with session/cookies intact.",
+    )
+    parser.add_argument(
+        "--close-tab",
+        nargs="?",
+        const="__USE_TAB_ARG__",
+        default=None,
+        metavar="TAB_ID",
+        help="Close one tab in the browser of --slot (use --tab <tab-id> or --close-tab <tab-id>), leaving the browser and other tabs running.",
+    )
+    parser.add_argument(
+        "--tab",
+        default=None,
+        metavar="TAB_ID",
+        help="Tab identifier (tab_id, target_id, chat_id, or index) for --close-tab.",
+    )
+    parser.add_argument(
+        "--list-browsers",
+        action="store_true",
+        help="List every running browser host, its profile, endpoint, open tabs, and the task that owns each tab.",
+    )
+    parser.add_argument(
+        "--shared-profile",
+        action="store_true",
+        help="Opt-in: run this slot as a tab inside the shared multi-account browser profile instead of an isolated slot profile.",
+    )
+    parser.add_argument(
+        "--append-followup",
+        default=None,
+        metavar="FILE_OR_TEXT",
+        help="Send an additional follow-up message (from a .md/.txt file or inline text) into a currently running task's conversation without superseding it (or as an ordinary follow-up if no task is running).",
+    )
+    parser.add_argument(
         "--max-verify-rounds",
         type=int,
         default=1,
         help=argparse.SUPPRESS,
     )
     return parser
+
+
+def append_followup_to_running_task(
+    append_arg: str,
+    project_path: str = ".",
+    lane: Optional[str] = None,
+    slot: Optional[str] = None,
+    mode: str = "gemini",
+    headless: bool = False,
+    auto_apply: bool = False,
+    manual_setup: bool = False,
+    target_files: Optional[List[str]] = None,
+    output_zip: str = "argon_context.zip",
+    verify_timeout: int = 900,
+    verify_cmd: Optional[str] = None,
+    skip_verify: bool = False,
+    deadline_seconds: int = 1800,
+) -> int:
+    """Send an additional follow-up message into a currently running task's conversation
+    without superseding it, or fall back to an ordinary follow-up if no task is running (Addendum B).
+    """
+    from playwright.sync_api import sync_playwright
+    from safe_browser import acquire_host_tab, release_host_tab
+
+    proj_root = Path(project_path).resolve()
+    raw_arg = (append_arg or "").strip()
+    if not raw_arg:
+        print("[!] Error: --append-followup requires a file path or non-empty text.", file=sys.stderr)
+        return EXIT_PREFLIGHT_FAILED
+
+    cand_file = Path(raw_arg)
+    if not cand_file.is_absolute():
+        cand_in_proj = proj_root / raw_arg
+        if cand_in_proj.is_file():
+            cand_file = cand_in_proj
+    if cand_file.is_file():
+        source_file = str(cand_file.resolve())
+        append_text = cand_file.read_text(encoding="utf-8", errors="replace").strip()
+    else:
+        source_file = "(inline text)"
+        append_text = raw_arg
+
+    if not append_text:
+        print(f"[!] Error: Follow-up file {source_file} is empty.", file=sys.stderr)
+        return EXIT_PREFLIGHT_FAILED
+
+    task_state_store = TaskState()
+    task_registry = TaskRegistry()
+    session_store = SessionStore()
+    pool_cfg = PoolConfig()
+
+    task_registry.reclaim_dead_tasks(proj_root, lane=lane)
+
+    ts_entry = (task_state_store.get(proj_root, lane=lane) if lane else None) or task_state_store.get(proj_root) or {}
+    reg_entries = task_registry.active_tasks_for_project(proj_root, lane=lane)
+    reg_entry = reg_entries[0] if reg_entries else {}
+
+    ts_state = str(ts_entry.get("state") or "").strip().lower()
+    chat_url = str(ts_entry.get("chat_url") or reg_entry.get("chat_url") or "").strip()
+    chat_id = str(ts_entry.get("chat_id") or reg_entry.get("chat_id") or _extract_chat_id(chat_url) or "").strip()
+    is_task_active = bool(
+        chat_url
+        and (
+            ts_state in ("sent", "waiting", "running")
+            or bool(reg_entry)
+        )
+    )
+
+    if not is_task_active:
+        eff_lane = lane or "followup"
+        print(
+            f"[+] No currently running task found for {proj_root} (lane={eff_lane}); "
+            "executing --append-followup as an ordinary follow-up dispatch."
+        )
+        return dispatch_to_argon(
+            task=append_text,
+            project_path=str(proj_root),
+            mode=mode,
+            slot=slot,
+            headless=headless,
+            auto_apply=auto_apply,
+            manual_setup=manual_setup,
+            target_files=target_files,
+            output_zip=output_zip,
+            new_session=False,
+            resume=False,
+            verify_timeout=verify_timeout,
+            verify_cmd=verify_cmd,
+            skip_verify=skip_verify,
+            lane=eff_lane,
+            deadline_seconds=deadline_seconds,
+        )
+
+    eff_lane = str(lane or ts_entry.get("lane") or reg_entry.get("lane") or "followup")
+    eff_slot = normalize_slot(slot or ts_entry.get("slot") or reg_entry.get("slot") or pool_cfg.active_slot())
+    acct_obj = pool_cfg.get_by_slot(eff_slot) or {}
+    eff_email = str(ts_entry.get("email") or reg_entry.get("account") or acct_obj.get("email") or "")
+    running_task_id = str(reg_entry.get("task_id") or f"{proj_root.name}:{eff_lane}:{eff_slot.strip('/')}")
+    running_label = str(reg_entry.get("label") or ts_entry.get("task") or "running-task").splitlines()[0][:120]
+    running_pid = int(reg_entry.get("pid") or ts_entry.get("pid") or 0)
+
+    prof_dir_str = str(ts_entry.get("profile_dir") or "")
+    profile_dir = Path(prof_dir_str) if prof_dir_str else _profile_dir_for_slot(pool_cfg.profile_dir, eff_slot)
+    isolated = _profile_is_isolated_slot(profile_dir)
+    norm_chat_url = _normalize_gemini_chat_url(chat_url, isolated_profile=isolated)
+
+    marker_header = f"{APPEND_FOLLOWUP_MARKER} | task_id={running_task_id} | label={running_label}]"
+    formatted_message = f"{marker_header}\n\n{append_text}"
+    now_str = time.strftime("%Y-%m-%d %H:%M:%S")
+
+    append_record = {
+        "timestamp": now_str,
+        "source_file": source_file,
+        "task_id": running_task_id,
+        "label": running_label,
+        "text": append_text,
+        "prompt_hash": _prompt_hash(formatted_message),
+        "raw_hash": _prompt_hash(append_text),
+        "prefix": _normalize_ws(formatted_message)[:160],
+        "raw_prefix": _normalize_ws(append_text)[:160],
+    }
+
+    existing_appends = list(ts_entry.get("appended_followups") or [])
+    existing_appends.append(append_record)
+    orig_task_text = str(ts_entry.get("task") or "")
+    updated_task_text = (
+        f"{orig_task_text}\n\n--- APPENDED FOLLOW-UP ({now_str}) ---\n{append_text}"
+        if orig_task_text
+        else append_text
+    )
+
+    # Record in TaskState and TaskRegistry BEFORE sending so the running loop immediately
+    # recognizes the appended prompt as part of its own task (Addendum B.2).
+    task_state_store.set(
+        proj_root,
+        lane=eff_lane,
+        task=updated_task_text,
+        appended_followups=existing_appends,
+        last_appended_at=now_str,
+    )
+    task_registry.update_running(
+        proj_root,
+        lane=eff_lane,
+        appended_followups=existing_appends,
+        last_appended_at=now_str,
+    )
+
+    chrome_exe = find_chrome_executable()
+    sent_in_browser = False
+    with sync_playwright() as p:
+        ctx, pg, tab_id, attached = acquire_host_tab(
+            playwright_instance=p,
+            profile_dir=profile_dir,
+            slot=eff_slot,
+            project_path=proj_root,
+            lane=f"{eff_lane}-append",
+            chrome_exe=chrome_exe,
+            headless=headless,
+            account_email=eff_email,
+        )
+        try:
+            if ctx is not None and pg is not None:
+                pg.goto(norm_chat_url, wait_until="domcontentloaded", timeout=60000)
+                _wait_for_conversation_loaded(pg, timeout=25.0, require_turns=False)
+                comp = _find_composer(pg)
+                if comp is not None:
+                    _type_and_send(pg, comp, formatted_message)
+                    pg.wait_for_timeout(2000)
+                    sent_in_browser = True
+        except Exception as exc:
+            print(f"[!] Warning while sending appended follow-up in browser tab: {exc}", file=sys.stderr)
+        finally:
+            if ctx is not None:
+                release_host_tab(ctx, pg, profile_dir, tab_id=tab_id)
+
+    print("=" * 78)
+    print("  APPENDED FOLLOW-UP TO RUNNING TASK")
+    print("=" * 78)
+    print(f"  Project        : {proj_root}")
+    print(f"  Conversation   : {norm_chat_url} (chat_id={chat_id or 'active'})")
+    print(f"  Account / Slot : {eff_slot} ({eff_email or 'pool account'})")
+    print(f"  Extended Task  : {running_task_id} (label={running_label!r}, pid={running_pid or 'active'})")
+    print(f"  Source         : {source_file} ({len(append_text)} chars)")
+    print(f"  Browser Action : {'sent in existing browser host tab and closed tab' if sent_in_browser else 'recorded in TaskState/TaskRegistry for active conversation'}")
+    print("  Supersede Guard: NOT superseded (recorded in appended_followups; single delivery will cover both)")
+    print(f"  Appended Text  : { _normalize_ws(append_text)[:200] }")
+    print("=" * 78)
+    return EXIT_SUCCESS
 
 
 def select_account_slot(
@@ -10030,6 +11191,43 @@ def main(argv: Optional[List[str]] = None) -> int:
     _make_console_utf8_safe()
     parser = build_arg_parser()
     args = parser.parse_args(argv)
+
+    if getattr(args, "shared_profile", False):
+        os.environ["ARGON_SHARED_PROFILE"] = "1"
+
+    if getattr(args, "close_browser", False):
+        from safe_browser import close_browser_cli
+
+        return close_browser_cli(slot=args.slot, project_path=args.project_path)
+
+    if getattr(args, "close_tab", None) is not None:
+        from safe_browser import close_tab_cli
+
+        eff_tab = args.tab if args.close_tab == "__USE_TAB_ARG__" else (args.close_tab or args.tab or "")
+        return close_tab_cli(tab_id=str(eff_tab), slot=args.slot, project_path=args.project_path)
+
+    if getattr(args, "list_browsers", False):
+        from safe_browser import list_browsers_cli
+
+        return list_browsers_cli(project_path=args.project_path)
+
+    if getattr(args, "append_followup", None) is not None:
+        return append_followup_to_running_task(
+            append_arg=str(args.append_followup),
+            project_path=args.project_path,
+            lane=args.lane,
+            slot=args.slot,
+            mode=args.mode,
+            headless=args.headless,
+            auto_apply=args.auto_apply,
+            manual_setup=args.manual_setup,
+            target_files=args.files,
+            output_zip=args.output_zip,
+            verify_timeout=args.verify_timeout,
+            verify_cmd=args.verify_cmd,
+            skip_verify=args.skip_verify,
+            deadline_seconds=args.deadline_seconds,
+        )
 
     if getattr(args, "manual_handoff", False):
         from manual_handoff import run_manual_handoff_cli

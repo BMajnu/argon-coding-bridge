@@ -112,6 +112,11 @@ def write_manual_handoff_pack(
     session_folder: Optional[Path] = None,
     delivery_folder: Optional[Path] = None,
     timestamp: Optional[str] = None,
+    phase: str = "send",
+    attempt: int = 0,
+    max_attempts: int = 3,
+    quarantined_file: Optional[str] = None,
+    failure_reason: str = "",
 ) -> Tuple[Path, Path]:
     """Write manual_handoff.md and handoff.json into .argon_backup/handoff/<timestamp>/."""
     proj_root = Path(proj_root).resolve()
@@ -187,8 +192,11 @@ def write_manual_handoff_pack(
         f"- **Progress Status:** `{send_progress}`",
         f"- **Description:** {progress_words}",
         "",
-        "## 8. Where It Failed",
+        "## 8. Where It Failed & Retry Ladder State",
+        f"- **Ladder Phase:** `{phase}` (attempt `{attempt}` of `{max_attempts}`)",
         f"- **Failing Step:** `{failed_step}`",
+        f"- **Failure Reason:** `{failure_reason or failed_step}`",
+        f"- **Quarantined Patch Path:** `{quarantined_file or '(none)'}`",
         f"- **Last Step Screenshot:** `{shot_str}`",
         "",
         "## 9. What Is Still Missing",
@@ -229,7 +237,12 @@ def write_manual_handoff_pack(
         "delivery_folder": str(eff_delivery_dir),
         "send_progress": send_progress,
         "send_progress_words": progress_words,
+        "phase": phase,
+        "attempt": attempt,
+        "max_attempts": max_attempts,
         "failed_step": failed_step,
+        "failure_reason": failure_reason or failed_step,
+        "quarantined_file": quarantined_file or "",
         "last_screenshot": shot_str,
         "missing_actions": missing_actions,
         "commands": commands,
@@ -335,6 +348,10 @@ def run_manual_handoff_cli(
 
     send_progress = str(task_entry.get("send_progress") or "none")
     failed_step = str(task_entry.get("failed_step") or task_entry.get("state") or "manual_request")
+    phase = str(task_entry.get("phase") or ("delivery" if send_progress in ("prompt_sent", "verified") else "send"))
+    attempt = int(task_entry.get("attempt") or task_entry.get("delivery_attempt") or task_entry.get("send_attempt") or 0)
+    quarantined_file = str(task_entry.get("quarantined_file") or "")
+    failure_reason = str(task_entry.get("last_failure_reason") or "")
 
     last_screenshot = None
     if task_entry.get("last_screenshot"):
@@ -365,6 +382,10 @@ def run_manual_handoff_cli(
         last_screenshot=last_screenshot,
         chrome_exe=chrome_exe,
         profile_dir=profile_dir,
+        phase=phase,
+        attempt=attempt,
+        quarantined_file=quarantined_file,
+        failure_reason=failure_reason,
     )
 
     if open_browser:

@@ -65,15 +65,34 @@ out which one is better and which good parts of the two can be combined.
   with its image reader.** The terminal text is only a summary; the screenshot
   is the measured evidence. Never decide from the terminal text alone.
 
-### 5. The bounded retry ladder
+### 5. The bounded retry ladder (send AND delivery phases)
 
-The send phase is strictly bounded to three automated attempts and then the manual hand-off:
-1. Normal attempt.
-2. Same state once more, but look at the screenshot and error first.
-3. Find the real cause, change the script or process, try again.
-4. Stop retrying and hand over to the user (open page and leave browser open, or provide full hand-over pack).
+Both the **send phase** and the **delivery phase** are strictly bounded to three automated attempts and then the manual hand-off:
+1. Normal attempt (`attempt 1 of 3`).
+2. Same state once more (`attempt 2 of 3`), after reading the screenshot and exact failure reason first.
+3. Find the real cause, change the script or process, record the fix, and try once more (`attempt 3 of 3`).
+4. Stop retrying and hand over to the user (`--manual-handoff --open-browser`, or provide the full hand-over pack and kept quarantine path).
 
-Never a fourth automated attempt, never an open loop.
+Never a fourth automated attempt (the dispatcher tracks `phase` and `attempt` in `TaskState` and refuses attempt 4), and never re-run `--resume` in an open loop on a failed delivery.
+
+### 6. Never kill a slot browser with `taskkill /F`
+
+**Never kill the browser of a slot profile with `taskkill /F`.** A hard kill destroys the
+Chrome cookie database and logs the account out. Close it with
+`python dispatch_argon.py --project-path . --close-browser --slot /u/N/` - it closes
+gracefully and, if a kill is unavoidable, snapshots and restores the cookies.
+To close only one tab while leaving the browser and other tabs running, use
+`python dispatch_argon.py --project-path . --close-tab --slot /u/N/ --tab <tab-id>`, and
+inspect running browser hosts with `python dispatch_argon.py --project-path . --list-browsers`.
+
+### 7. Extending a running task (`--append-followup`)
+
+> **A running task can be extended.** To add a requirement to a task that is already
+> running, send it with `--append-followup`. The running task is not stopped, and the single
+> delivery contains both the original and the added requirement.
+
+Command:
+`python dispatch_argon.py --project-path . --append-followup "<file.md>" --lane <lane> --slot /u/N/`
 
 ---
 
@@ -123,23 +142,27 @@ Command:  `python "./skills/argon-coding-bridge/scripts/dispatch_argon.py" --pro
 Why:  a new task belongs in a new conversation, on a different account, so the
       two runs never collide.
 
-### The bounded retry ladder (send failures)
+### The bounded retry ladder (send failures AND delivery failures)
 
-When a SEND fails (the run could not put the prompt into Gemini: ZIP upload failed,
-paste failed, send failed, Task-mode or 4 Argon pre-flight failed, or the run stopped
-before the prompt was delivered), the agent MUST execute the bounded ladder.
-**Never loop. There are exactly three automated attempts, then the manual hand-off. A fourth automated attempt is strictly forbidden.**
+When EITHER a **SEND** fails (ZIP upload failed, paste failed, send failed, Task-mode or
+4 Argon pre-flight failed, or the run stopped before the prompt was delivered) OR a
+**DELIVERY** fails (the delivery chip could not be downloaded after 3 per-chip attempts,
+the downloaded file failed `_looks_like_patch` or `_patch_is_complete` and was quarantined
+in `.argon_quarantine/`, or the response finished without a usable patch), the agent MUST
+execute the bounded ladder. A delivery failure is handled by this ladder, **NEVER** by
+re-running `--resume` in a loop.
+**Never loop. The tool counts the attempts (`attempt 1 of 3`, `attempt 2 of 3`, `attempt 3 of 3`) in `TaskState` for the current phase (`send` or `delivery`) and refuses a fourth automated attempt.**
 
-1. **Step 1 - The normal attempt:** Run the dispatch exactly as specified in the workflow.
-2. **Step 2 - The SAME state, once more, but LOOK first:**
-   If step 1 fails, change nothing: same account, same chat, same lane, same command.
-   Before running again, read the step screenshot printed by the dispatcher (`.argon_backup/shots/<NN>-<step>.png`) with your image reader, along with the exit code and error text. Transient issues (stale focus, unsettled model chip, slow page load) clear on this attempt.
-3. **Step 3 - Find the REAL cause, change the script or process, try again:**
-   If step 2 fails as well, find the actual root cause and modify the script or process (`dispatch_argon.py`, pre-flight, packaging, upload path, or driving command). Record the fix with `record_fix.py` on a `fixes/<scope-slug>` branch, then run the third (and final automated) attempt.
-4. **Step 4 - The manual hand-off (the agent stops retrying):**
+1. **Step 1 - The normal attempt (`attempt 1 of 3`):** Run the dispatch (or initial delivery capture) as specified in the workflow.
+2. **Step 2 - The SAME state, once more, but LOOK first (`attempt 2 of 3`):**
+   If step 1 fails, change nothing: same account, same chat, same lane.
+   Before running again, read the step screenshot (`.argon_backup/shots/<NN>-<step>.png`) with your image reader, along with the printed failure reason and (for delivery failures) the quarantined file path in `.argon_quarantine/`. Transient issues clear on this second attempt.
+3. **Step 3 - Find the REAL cause, change the script or process, try again (`attempt 3 of 3`):**
+   If step 2 fails as well, inspect the exact check that failed (named in the `[REFUSED]` / quarantine output) and the kept file in `.argon_quarantine/`, fix the root cause in the script or process (`dispatch_argon.py`, validator, capture path, or driving command), record the fix with `record_fix.py` on a `fixes/<scope-slug>` branch, and run the third (and final automated) attempt.
+4. **Step 4 - The manual hand-off (the agent stops retrying; attempt 4 is refused by the tool):**
    Stop automating and hand the task over to the user.
-   - **Step 4a - Open the page and leave the browser open:** Open the target conversation in that slot's real Chrome profile (`~/.gemini/argon_profiles/slot-uN/`) with `python dispatch_argon.py --project-path . --manual-handoff --lane <lane> --slot <slot> --open-browser`. LEAVE THE BROWSER OPEN. Tell the user how far the run got (`send_progress`), provide the last step screenshot path as evidence, and list the exact missing steps so the user can finish by hand.
-   - **Step 4b - The complete hand-over pack:** If needed or requested, deliver the full hand-over pack (`manual_handoff.md` and `handoff.json` in `.argon_backup/handoff/<timestamp>/`) containing: account e-mail, dispatch prompt file path, chat link, prompt text, ZIP path, and instructions to send manually.
+   - **Step 4a - Open the page and leave the browser open:** Open the target conversation in that slot's real Chrome profile (`~/.gemini/argon_profiles/slot-uN/`) with `python dispatch_argon.py --project-path . --manual-handoff --lane <lane> --slot <slot> --open-browser`. LEAVE THE BROWSER OPEN. Tell the user the ladder phase (`send` or `delivery`), how far the run got (`send_progress`), the exact check that failed, any quarantined patch path (`Open_Argon_Apply.bat -PatchFile <path>`), and the last step screenshot path.
+   - **Step 4b - The complete hand-over pack:** Deliver the full hand-over pack (`manual_handoff.md` and `handoff.json` in `.argon_backup/handoff/<timestamp>/`) containing: account e-mail, dispatch prompt file path, chat link, prompt text, ZIP path, ladder phase/attempt, quarantined patch path (if any), and instructions to finish or apply manually.
 
 | Lane | When the hand-off happens | What must be handed over |
 |---|---|---|
@@ -198,19 +221,20 @@ Why:  releases the task in `~/.gemini/argon_tasks.json` so the next round sees
 | **The answer is a chat-style reply instead of work** | The prompt went out in Chat mode. | Open a new chat (`--new-session`), switch it to Task mode, check the `4 Argon` chip in `.argon_backup/shots/<NN>-preflight.png`, and resend. |
 | **Gemini says the archive is unreadable / binary data** | Binary files (fonts, images, media, or non-UTF-8 data) were included in the archive. | The packager must exclude every binary file by extension and 8 KB NUL/UTF-8 content check and enforce the archive cap; re-run `package_context.py` to rebuild `argon_context.zip`. |
 | **The prompt landed in an old conversation** | The new chat was not verified empty after loading. | The run must verify after the conversation loads that there are zero user messages and zero assistant turns and report the `chat_id` it used; re-run with `--new-session`. |
-| **Old delivery downloaded again** | A previous round's `apply_changes.ps1` chip remains in the conversation DOM and a capture path did not check `DeliveryLedger` or opened a chip before the last user message. | `DeliveryLedger` (`~/.gemini/argon_delivery_ledger.json`) and `_element_is_after_last_user_turn` refuse known SHA-256 digests and chips prior to the last user turn; keep waiting with `--resume` until the new turn's chip appears. |
+| **Old delivery downloaded again** | A previous round's `apply_changes.ps1` chip was downloaded and matched a digest in `DeliveryLedger` or an existing patch. | `_is_leftover_delivery` refuses the duplicate, **keeps** the rejected file in `.argon_quarantine/<timestamp>_apply_changes.ps1` at a printed absolute path (never deleting it), names the exact duplicate SHA-256 check that failed, and stops capturing that chip. Follow the bounded 3-attempt retry ladder (not an open `--resume` loop). |
 | **No download after the task finished** | Argon finished answering inline or the viewer toolbar button did not trigger before timeout. | Read `.argon_backup/shots/<NN>-delivered.png` or `failed.png`; if a chip is visible in the newest turn, run `--resume` to capture it or download `apply_changes.ps1` from the viewer toolbar and run `Open_Argon_Apply.bat`. |
 | **Browser opens again and again** | A retry loop re-opened the preview or re-dispatched without checking `TaskState` / `DeliveryLedger`. | Single-capture mode exits immediately after one valid toolbar download. Use `--list-tasks` to inspect active runs. |
 | **A task is already running on this account (`EXIT_ALREADY_RUNNING = 9`)** | `TaskState` or `TaskRegistry` shows an in-flight `sent` or `waiting` task for this exact project/lane. | Read the printed screenshot path with your image reader; run `--resume` to wait for the running task, or pass `--force` to explicitly mark the old task `superseded` and start fresh. |
 | **Account is quota-limited (`EXIT_QUOTA_LIMITED = 5`)** | The account hit its Gemini 4 Argon usage limit or `'4 Argon'` is `aria-disabled` in the model picker. | The bridge automatically marks the slot `quota_limited` in `accounts_pool.json` and rotates to the next free pool account. Add more accounts via `Open_Argon_Login.bat` (Import Box / Load from `.txt`) if all slots are exhausted. |
 | **Model chip says something else than Argon** | Before send: the picker did not switch to `4 Argon`. After send: the chip naturally reverts to the account default (e.g. `Flash`). | Before send, pre-flight waits up to 45 s for the chip and refuses to send if it is not `4 Argon`. After send, check the answer evidence (`_verify_argon_answer_evidence`), not the post-send chip. |
 | **Account is busy with running tasks** | Another task is already active on that slot in `TaskRegistry` or Chrome is open on the slot profile. | Never block: a follow-up uses the account that holds the chat and says so in one line; a new task picks a free account or falls back to the least-loaded account and prints the reason. |
-| **Delivery is truncated or 0 bytes** | The browser handed over a 0-byte download or an incomplete script missing `[SUCCESS]` / balanced `@'...'@` blocks. | `_validate_and_save_download` stages downloads and rejects `< 64`-byte files without overwriting good patches, and `_patch_is_complete` verifies payload parsing. Re-run with `--resume` to re-capture from the viewer toolbar. |
+| **Delivery is truncated or 0 bytes** | The browser handed over an incomplete script or a file that failed `_looks_like_patch` / `_patch_is_complete`. | Rejected files are **kept** in `.argon_quarantine/` at a printed absolute path (never deleted), the terminal names the file, its size, and the exact check that failed (`[REFUSED] file=... label=... offset=... reason=...`), and per-chip downloads are capped at 3 attempts. Follow the bounded 3-attempt delivery ladder (or apply a valid quarantined file with `Open_Argon_Apply.bat -PatchFile <path>`) - do **not** run `--resume` in a loop. |
 | **Second prompt superseded an unfinished task** | Another prompt was sent into the same conversation while the earlier task was still `sent` or `waiting`. | `_check_superseded_prompt` detects the newer user message in the DOM, marks the earlier task `superseded` in `TaskState` and `TaskRegistry`, and stops waiting immediately. |
 | **New session opened a foreign conversation** | Navigating to `/u/0/app` restored the account's previous chat from another project. | `_start_fresh_chat` waits for the conversation to finish loading, clicks the sidebar **New chat** button, verifies zero user/assistant turns and that the URL chat ID is not in `_known_chat_ids_for_slot`, and reports the chat ID if it cannot prove the chat is empty. |
 | **Send failed on first attempt (Step 1)** | Transient browser, network, or UI race condition (stale composer focus, unsettled model chip, page still loading). | Read the step screenshot (`.argon_backup/shots/<NN>-<step>.png`), exit code, and error text. Re-try ONCE more in the EXACT SAME state (same account, same chat, same lane, same command) without changing anything (Step 2). |
 | **Send failed twice in same state (Step 2)** | Concrete bug or limitation in dispatcher script, process, packaging, or command. | Find the REAL cause (not symptoms). Change the script or process (`dispatch_argon.py`, pre-flight, packaging, command), record fix with `record_fix.py` on a `fixes/<scope-slug>` branch, and run the 3rd (and final automated) attempt (Step 3). |
-| **Send failed three times (Step 3)** | Bounded retry ladder exhausted (maximum 3 automated attempts reached). | Stop automated retrying immediately. Perform manual hand-off (Step 4): run `dispatch_argon.py --manual-handoff --open-browser` to leave Chrome open with recorded progress, or deliver the complete hand-off pack (`manual_handoff.md`). Never execute a 4th automated attempt. |
+| **Send or delivery failed three times (Step 3)** | Bounded retry ladder exhausted (maximum 3 automated attempts reached in `send` or `delivery` phase; the tool refuses a 4th attempt). | Stop automated retrying immediately. Perform manual hand-off (Step 4): run `dispatch_argon.py --manual-handoff --open-browser` to leave Chrome open with recorded progress and quarantined file path, or deliver the complete hand-off pack (`manual_handoff.md`). Never execute a 4th automated attempt. |
+| **Browser stuck or needs to be closed (`taskkill /F` logs account out)** | Killing Chrome with `taskkill /F` prevents `Browser.close` from flushing `Default/Network/Cookies` and destroys the signed-in session. | **Never** run `taskkill /F` on a slot profile. Close a slot browser safely with `python dispatch_argon.py --project-path . --close-browser --slot /u/N/` (or close one tab with `--close-tab --slot /u/N/ --tab <tab-id>` and inspect hosts with `--list-browsers`). |
 
 ---
 

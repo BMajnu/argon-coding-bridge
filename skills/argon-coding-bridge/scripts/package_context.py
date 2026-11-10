@@ -262,7 +262,21 @@ def is_generated_artefact(rel_path: Path) -> bool:
     ):
         return True
     parts = {p.lower() for p in rel_path.parts}
-    return bool(parts & {".argon_backup", "downloads", "__pycache__"})
+    if parts & {".argon_backup", "downloads", "__pycache__", "scratch"}:
+        return True
+    # Stale manual backup trees inside the project (e.g. .penflow_backup_*,
+    # .argon_backup/manual-*, scratch/r4cmp, scratch/pre_r4_backup). They hold
+    # OUTDATED copies of the very files the patch targets, so packing them
+    # wastes archive space and risks Argon patching a backup copy instead of
+    # the live file.
+    for part in parts:
+        if part.startswith(".penflow_backup") or part.startswith(".argon_backup"):
+            return True
+        if part.endswith(".backup") and part.startswith("."):
+            return True
+        if part in {"backup", "backups", "r4cmp", "pre_r4_backup"}:
+            return True
+    return False
 
 
 def get_git_files(repo_path: str):
@@ -785,7 +799,7 @@ def package_context(
                 d
                 for d in dirs
                 if d.lower() not in _DEFAULT_EXCLUDED_DIRS_LOWER
-                and d.lower() not in {".argon_backup", "downloads", "__pycache__"}
+                and d.lower() not in {".argon_backup", "downloads", "__pycache__", "scratch"}
             )
             for file in sorted(files):
                 p = Path(root) / file
@@ -880,7 +894,10 @@ def package_context(
     except OSError:
         pass
 
-    with zipfile.ZipFile(tmp_zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+    # ZIP_STORED, not DEFLATED: Gemini reads every member of the archive as
+    # plain text, so the members must not be compressed. Every archive that has
+    # actually been consumed by Argon in this project uses compress_type=0.
+    with zipfile.ZipFile(tmp_zip_path, "w", zipfile.ZIP_STORED) as zf:
         for rel in selected_files:
             full = proj_root / rel
             zf.write(full, arcname=str(rel))

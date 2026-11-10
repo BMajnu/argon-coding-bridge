@@ -84,13 +84,42 @@ def sanitize_signin_url(url: str, isolated_profile: bool = True) -> str:
     return cleaned
 
 
-def reset_slot_profile_accounts(profile_dir: Union[str, Path], clear_cookies: bool = False) -> None:
+def reset_slot_profile_accounts(
+    profile_dir: Union[str, Path],
+    clear_cookies: bool = False,
+    allow_destructive_reset: bool = False,
+) -> None:
     """Reset the stored account list (and optionally cookie DB) of a slot profile on disk.
 
-    Must run BEFORE Chrome starts on `profile_dir` so Chrome does not load the
-    seeded account from `Default/Preferences` into memory and overwrite disk on exit.
+    Section 2.2.D & 2.3.C:
+    - Never reachable from an ordinary run without explicit `allow_destructive_reset=True`
+      (or `ARGON_ALLOW_SESSION_RESET=1`).
+    - Never resets a shared multi-account profile (`not is_isolated_slot_profile(prof)`).
+    - Always snapshots `Default/Network/Cookies` and `Default/Preferences` before touching disk.
     """
     prof = Path(profile_dir).expanduser().resolve()
+    try:
+        from safe_browser import profile_has_signed_in_account, snapshot_profile_session
+
+        snapshot_profile_session(prof)
+        has_acct = profile_has_signed_in_account(prof)
+    except Exception:
+        has_acct = _has_cookie_db(prof)
+
+    if not is_isolated_slot_profile(prof):
+        logger.info("Skipping account reset on shared multi-account profile %s (additive mode).", prof)
+        return
+
+    explicit_allowed = bool(
+        allow_destructive_reset or os.environ.get("ARGON_ALLOW_SESSION_RESET") == "1"
+    )
+    if not explicit_allowed and has_acct:
+        logger.info(
+            "Preserving existing signed-in session in slot profile %s (destructive reset is gated).",
+            prof,
+        )
+        return
+
     pref = prof / "Default" / "Preferences"
     if pref.is_file():
         try:
@@ -116,7 +145,7 @@ def reset_slot_profile_accounts(profile_dir: Union[str, Path], clear_cookies: bo
                 tmp.replace(pref)
         except Exception:
             pass
-    if clear_cookies:
+    if clear_cookies and explicit_allowed:
         for rel in ("Default/Network/Cookies", "Default/Cookies"):
             base_cookie = prof / rel
             for suffix in ("", "-journal", "-wal", "-shm"):
@@ -361,10 +390,24 @@ def copy_sqlite_databases(src_root: Path, dst_root: Path) -> bool:
 
 
 def seed_slot_profile(base_profile: Union[str, Path], target_profile: Union[str, Path]) -> bool:
-    """Seed a per-slot profile directory from the master profile when the master is free."""
+    """Seed a per-slot profile directory from the master profile when the master is free.
+
+    Section 2.2.E: Never `rmtree` or overwrite a slot profile that already holds a
+    registered account in `Default/Preferences` (`account_info` / `signin.accounts`);
+    repair only the SQLite cookie DB if it is missing.
+    """
     base = Path(base_profile).expanduser().resolve()
     target = Path(target_profile).expanduser().resolve()
     if target.is_dir() and (target / "Default").is_dir():
+        try:
+            from safe_browser import profile_has_signed_in_account, repair_slot_cookie_db_only
+
+            if profile_has_signed_in_account(target):
+                if not _has_cookie_db(target):
+                    repair_slot_cookie_db_only(base, target)
+                return True
+        except Exception:
+            pass
         if not _has_cookie_db(base) or _has_cookie_db(target):
             return True
     if not base.is_dir() or not (base / "Default").is_dir():
@@ -387,6 +430,14 @@ def seed_slot_profile(base_profile: Union[str, Path], target_profile: Union[str,
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
         if target.exists():
+            try:
+                from safe_browser import profile_has_signed_in_account, repair_slot_cookie_db_only
+
+                if profile_has_signed_in_account(target):
+                    repair_slot_cookie_db_only(base, target)
+                    return True
+            except Exception:
+                pass
             shutil.rmtree(target, ignore_errors=True)
         shutil.copytree(
             base,
@@ -490,9 +541,45 @@ class PoolConfig:
     def accounts(self) -> List[Dict[str, Any]]:
         return self.data.setdefault("accounts", [])
 
-    def profile_dir_for_slot(self, slot: Optional[Union[str, int]] = None) -> Path:
-        """Return the per-slot browser profile directory (~/.gemini/argon_profiles/slot-uN)."""
+    def is_shared_profile_slot(self, slot: Optional[Union[str, int]] = None) -> bool:
+        """Return True when `slot` is configured to run inside the shared multi-account profile (Section 2.3.C)."""
+        if os.environ.get("ARGON_SHARED_PROFILE") == "1":
+            return True
+        if bool(self.data.get("shared_profile")) or str(self.data.get("profile_mode") or "").lower() == "shared":
+            return True
         target_slot = normalize_slot(slot) if slot is not None and str(slot).strip() else self.active_slot()
+        acc = self.get_by_slot(target_slot)
+        if isinstance(acc, dict):
+            if bool(acc.get("shared_profile")) or str(acc.get("profile_mode") or "").lower() == "shared":
+                return True
+        return False
+
+    def get_account_index(self, slot: Optional[Union[str, int]] = None) -> int:
+        """Return the Gemini `/u/<index>/` account index owned by `slot` in its profile (Section 2.3.C)."""
+        target_slot = normalize_slot(slot) if slot is not None and str(slot).strip() else self.active_slot()
+        acc = self.get_by_slot(target_slot)
+        if isinstance(acc, dict) and isinstance(acc.get("account_index"), int):
+            return int(acc["account_index"])
+        if not self.is_shared_profile_slot(target_slot):
+            return 0
+        s_num = slot_number(target_slot)
+        return s_num if s_num is not None else 0
+
+    def set_account_index(self, slot: Union[str, int], account_index: int) -> None:
+        """Record the verified `Default/Preferences` (`account_info`) index owned by `slot`."""
+        acc = self.get_by_slot(slot)
+        if isinstance(acc, dict):
+            acc["account_index"] = int(account_index)
+            self.save()
+
+    def profile_dir_for_slot(self, slot: Optional[Union[str, int]] = None) -> Path:
+        """Return the browser profile directory for `slot` (per-slot by default, or shared when opted in)."""
+        target_slot = normalize_slot(slot) if slot is not None and str(slot).strip() else self.active_slot()
+        acc = self.get_by_slot(target_slot)
+        if isinstance(acc, dict) and acc.get("profile_dir"):
+            return Path(str(acc["profile_dir"])).expanduser().resolve()
+        if self.is_shared_profile_slot(target_slot):
+            return self.profile_dir
         return profile_dir_for_slot(self.profile_dir, target_slot)
 
     def active_slot(self) -> str:
@@ -1034,22 +1121,29 @@ class GoogleLogin:
         self._playwright: Any = None
         self.context: Any = None
 
-    def switch_to_slot_profile(self, slot: Union[str, int], reset_accounts: bool = False) -> Path:
-        """Switch this GoogleLogin instance to the given slot's isolated profile directory."""
+    def switch_to_slot_profile(
+        self,
+        slot: Union[str, int],
+        reset_accounts: bool = False,
+        allow_destructive_reset: bool = False,
+    ) -> Path:
+        """Switch this GoogleLogin instance to the given slot's profile directory safely."""
         norm = normalize_slot(slot)
         target_dir = self.pool_config.profile_dir_for_slot(norm)
         base_dir = self.pool_config.profile_dir
         if not (target_dir.is_dir() and (target_dir / "Default").is_dir()):
             if base_dir.is_dir() and (base_dir / "Default").is_dir() and target_dir.resolve() != base_dir.resolve():
                 seed_slot_profile(base_dir, target_dir)
-        if self.context is not None and (reset_accounts or self.profile_dir.resolve() != target_dir.resolve()):
+        if self.context is not None and self.profile_dir.resolve() != target_dir.resolve():
             self.close()
         self.profile_dir = target_dir
-        if reset_accounts:
-            reset_slot_profile_accounts(target_dir, clear_cookies=True)
+        if reset_accounts and allow_destructive_reset and is_isolated_slot_profile(target_dir):
+            if self.context is not None:
+                self.close()
+            reset_slot_profile_accounts(target_dir, clear_cookies=True, allow_destructive_reset=True)
         self.start()
-        if reset_accounts:
-            self._clear_google_session()
+        if reset_accounts and allow_destructive_reset and is_isolated_slot_profile(target_dir):
+            self._clear_google_session(allow_destructive_reset=True)
         return target_dir
 
     def __enter__(self) -> "GoogleLogin":
@@ -1097,12 +1191,17 @@ class GoogleLogin:
         return self.context
 
     def close(self) -> None:
-        """Close the Playwright browser context and stop Playwright cleanly."""
+        """Close the Playwright browser context safely (flushing cookies before stopping driver)."""
         if self.context is not None:
             try:
-                self.context.close()
+                from safe_browser import close_browser_safely
+
+                close_browser_safely(context=self.context, profile_dir=self.profile_dir)
             except Exception:
-                pass
+                try:
+                    self.context.close()
+                except Exception:
+                    pass
             self.context = None
         if self._playwright is not None:
             try:
@@ -1170,55 +1269,84 @@ class GoogleLogin:
 
         return has_auth_cookie
 
-    def _reset_profile_accounts(self) -> None:
-        """Forget the accounts this profile used to hold.
+    def _reset_profile_accounts(self, allow_destructive_reset: bool = False) -> None:
+        """Gated account reset (Section 2.2.D & 2.3.C).
 
-        A slot profile must hold exactly ONE account. The profile it was
-        seeded from can still carry the previous account's account-list
-        (Preferences) - and Google keeps THAT account active, so a fresh
-        sign-in is only "added" and Gemini still shows the guest page. Clearing
-        the list before the browser starts makes the account we sign in the
-        only one.
+        Never reachable from an ordinary run without `allow_destructive_reset=True`
+        (or `ARGON_ALLOW_SESSION_RESET=1`), never resets a shared multi-account profile,
+        and always snapshots cookies and Preferences before touching disk.
         """
+        try:
+            from safe_browser import snapshot_profile_session
+
+            snapshot_profile_session(self.profile_dir)
+        except Exception:
+            pass
+        if not is_isolated_slot_profile(self.profile_dir):
+            return
+        if not (allow_destructive_reset or os.environ.get("ARGON_ALLOW_SESSION_RESET") == "1"):
+            return
         was_running = self.context is not None
         if was_running:
             self.close()
-        reset_slot_profile_accounts(self.profile_dir, clear_cookies=True)
+        reset_slot_profile_accounts(
+            self.profile_dir,
+            clear_cookies=True,
+            allow_destructive_reset=True,
+        )
         if was_running:
             self.start()
 
-    def _clear_google_session(self) -> None:
-        """Drop every cookie so the next sign-in becomes the ACTIVE session.
+    def _clear_google_session(self, allow_destructive_reset: bool = False) -> None:
+        """Gated cookie clear (Section 2.2.D & 2.3.C).
 
-        Without this the jar keeps the seeded account's SID next to the new
-        one, and Google keeps honouring the old (dead or
-        verification-pending) session.
+        Snapshots the profile session first and refuses to clear cookies during
+        ordinary runs or on shared multi-account profiles.
         """
+        try:
+            from safe_browser import snapshot_profile_session
+
+            snapshot_profile_session(self.profile_dir)
+        except Exception:
+            pass
+        if not is_isolated_slot_profile(self.profile_dir):
+            return
+        if not (allow_destructive_reset or os.environ.get("ARGON_ALLOW_SESSION_RESET") == "1"):
+            return
         try:
             ctx = self.start()
             ctx.clear_cookies()
         except Exception:
             pass
 
-    def verify_session(self) -> bool:
-        """Check that this profile really holds a LIVE Google session.
+    def verify_session(
+        self,
+        expected_email: Optional[str] = None,
+        expected_index: Optional[int] = None,
+    ) -> bool:
+        """Check that this profile holds a LIVE Google session and verify its index in `Default/Preferences`."""
+        isolated = is_isolated_slot_profile(self.profile_dir)
+        target_idx = 0 if isolated else (expected_index if expected_index is not None else 0)
+        try:
+            from safe_browser import snapshot_profile_session, verify_account_index_in_preferences
 
-        The presence of the auth cookies is NOT enough: a copied or rotated
-        cookie jar keeps SID / SSID / __Secure-1PSID around while Google has
-        already invalidated the session. Opening Gemini then shows the
-        anonymous guest page ("Sign in to save activity", model Flash-Lite),
-        which looks like a working browser but is not signed in.
+            ok_pref, found_idx, _ = verify_account_index_in_preferences(
+                self.profile_dir,
+                expected_email or "",
+                expected_index=(0 if isolated else expected_index),
+            )
+            if found_idx is not None:
+                target_idx = 0 if isolated else found_idx
+        except Exception:
+            pass
 
-        The profile holds exactly ONE account and /u/N/ is an index into the
-        account list of THIS browser, so the check opens /u/0/.
-        """
         try:
             page = self._active_page()
         except Exception:
             return False
         try:
             page.goto(
-                "https://gemini.google.com/u/0/app",
+                f"https://gemini.google.com/u/{target_idx}/app",
                 wait_until="domcontentloaded",
                 timeout=60000,
             )
@@ -1244,33 +1372,41 @@ class GoogleLogin:
                 return False
         except Exception:
             pass
-        # "Where should we start?" is normal copy on a signed-in Gemini home
-        # page - only the guest sidebar item counts.
         if "sign in to save activity" in body or "sign in or create an account" in body:
             return False
 
-        # Verify account is registered in profile Preferences (account_info)
+        # Verify account is registered in profile Preferences (account_info) at expected index
         try:
             pref_file = self.profile_dir / "Default" / "Preferences"
             if pref_file.is_file():
                 pref_data = json.loads(pref_file.read_text(encoding="utf-8", errors="replace"))
                 acc_info = pref_data.get("account_info")
-                # If account_info is an empty list or dict, registration at index 0 failed
                 if acc_info is not None:
                     if isinstance(acc_info, (list, dict)) and not acc_info:
-                        logger.warning("Default/Preferences has empty account_info; account is not registered at index 0.")
+                        logger.warning(
+                            "Default/Preferences has empty account_info; account is not registered at index %s.",
+                            target_idx,
+                        )
                         return False
         except Exception as exc:
             logger.warning("Could not check account_info in Preferences: %s", exc)
 
+        verified_ok = "sign in to save activity" not in body and "sign in or create an account" not in body
         try:
             if page.locator(
                 "a[aria-label*='Google Account'], button[aria-label*='Google Account']"
             ).count() > 0:
-                return True
+                verified_ok = True
         except Exception:
             pass
-        return "sign in to save activity" not in body and "sign in or create an account" not in body
+        if verified_ok:
+            try:
+                from safe_browser import snapshot_profile_session
+
+                snapshot_profile_session(self.profile_dir)
+            except Exception:
+                pass
+        return verified_ok
 
     def _detect_challenge(self, page: Any) -> Optional[str]:
         """
@@ -1383,20 +1519,24 @@ class GoogleLogin:
                 except Exception:
                     pass
 
-        if self.context is None and is_isolated_slot_profile(self.profile_dir):
-            reset_slot_profile_accounts(self.profile_dir, clear_cookies=True)
+        try:
+            from safe_browser import snapshot_profile_session
+
+            snapshot_profile_session(self.profile_dir)
+        except Exception:
+            pass
         page = self._active_page()
 
         try:
-            signin_url = build_signin_url(isolated_profile=is_isolated_slot_profile(self.profile_dir))
+            isolated_prof = is_isolated_slot_profile(self.profile_dir)
+            signin_url = build_signin_url(isolated_profile=isolated_prof)
             _emit(f"Opening Google sign-in page ({signin_url})...")
             page.goto(signin_url, wait_until="domcontentloaded", timeout=45000)
             page.wait_for_timeout(800)
             cur_url = (page.url or "").lower()
             if "/signin/rejected" in cur_url or "authuser=" in cur_url:
-                _emit("Detected rejected or authuser-bound sign-in URL; resetting session and retrying without authuser...")
-                self._clear_google_session()
-                page.goto(sanitize_signin_url(signin_url, isolated_profile=True), wait_until="domcontentloaded", timeout=45000)
+                _emit("Detected rejected or authuser-bound sign-in URL; retrying sanitized sign-in URL without clearing session cookies...")
+                page.goto(sanitize_signin_url(signin_url, isolated_profile=isolated_prof), wait_until="domcontentloaded", timeout=45000)
                 page.wait_for_timeout(800)
 
             # If Google displays an account chooser first, click "Use another account"
@@ -1559,7 +1699,7 @@ class GoogleLogin:
             # Final check if signed in and verified in profile
             self._dismiss_post_login_prompts(page)
             if self.is_signed_in(page):
-                if not self.verify_session():
+                if not self.verify_session(expected_email=email):
                     return LoginResult(
                         status=STATUS_FAILED,
                         detail=f"Sign-in completed but account registration verification failed for {email} (shows guest page or missing Preferences account_info).",
@@ -1645,14 +1785,7 @@ class GoogleLogin:
                             slot=slot,
                         )
                     else:
-                        # A slot profile holds exactly ONE account. The profile it was
-                        # seeded from can still carry the previous account's session and
-                        # a pending "verify it's you" challenge, and Google then keeps
-                        # THAT account active - the new sign-in is only "added", so
-                        # Gemini keeps showing the guest page. Reset Preferences and
-                        # cookies BEFORE starting Chrome so the account we sign in
-                        # becomes the active one at index 0.
-                        self.switch_to_slot_profile(slot, reset_accounts=True)
+                        self.switch_to_slot_profile(slot, reset_accounts=False)
                         res = self.login(
                             email=email,
                             password=password,
@@ -1661,16 +1794,23 @@ class GoogleLogin:
                             on_status=on_status,
                         )
                         res.slot = slot
-                        # The sign-in can succeed while the session is still not usable
-                        # (a stale cookie jar, a guest page). Do not report success until
-                        # the session really works.
-                        if res.status == STATUS_OK and not self.verify_session():
+                        expected_idx = 0 if is_isolated_slot_profile(slot_profile) else slot_number(slot)
+                        if res.status == STATUS_OK and not self.verify_session(expected_email=email, expected_index=expected_idx):
                             res.status = STATUS_FAILED
                             res.detail = (
                                 (res.detail + " | " if res.detail else "")
                                 + "the profile still shows Gemini's guest page - "
                                   "the session is not usable"
                             )
+                        elif res.status == STATUS_OK:
+                            try:
+                                from safe_browser import verify_account_index_in_preferences
+
+                                _, found_idx, _ = verify_account_index_in_preferences(slot_profile, email)
+                                if found_idx is not None:
+                                    self.pool_config.set_account_index(slot, found_idx)
+                            except Exception:
+                                pass
                 else:
                     self.start()
                     res = self.login(
@@ -1681,6 +1821,15 @@ class GoogleLogin:
                         on_status=on_status,
                     )
                     res.slot = slot
+                    if res.status == STATUS_OK:
+                        try:
+                            from safe_browser import verify_account_index_in_preferences
+
+                            _, found_idx, _ = verify_account_index_in_preferences(self.profile_dir, email)
+                            if found_idx is not None:
+                                self.pool_config.set_account_index(slot, found_idx)
+                        except Exception:
+                            pass
 
             status_map = {
                 STATUS_OK: "active",
