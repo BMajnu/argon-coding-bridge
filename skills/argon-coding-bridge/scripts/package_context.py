@@ -95,10 +95,12 @@ DEFAULT_EXCLUDED_EXTS = {
 }
 
 BINARY_CHECK_BYTES = 8192
-DEFAULT_MAX_ARCHIVE_MB = 20
-DEFAULT_MAX_ARCHIVE_ENTRIES = 400
-
-
+# The caps are the packager's DEFAULT for every caller, including the dual dispatch
+# (scripts/dual_dispatch.py calls package_context() without passing them). A large
+# workspace truncated at 400 entries lost whole crates from the archive, so the defaults
+# are raised: the archive stays bounded, but it now carries the whole related codebase.
+DEFAULT_MAX_ARCHIVE_MB = 100
+DEFAULT_MAX_ARCHIVE_ENTRIES = 6000
 def is_binary_file(path: Path, sample_bytes: int = BINARY_CHECK_BYTES) -> tuple[bool, str]:
     """Return (True, reason) when `path` is binary by extension or content (E1).
 
@@ -685,11 +687,12 @@ def _compose_task_brief(
     ]
     if cap_excluded_files:
         excl_lines.extend([
-            f"{h3} ARCHIVE CAP REACHED ({len(cap_excluded_files)} file(s) omitted by {max_entries}-entry / {max_archive_mb} MB cap)",
+            f"{h3} ARCHIVE IS INCOMPLETE - HARD CAP REACHED ({len(cap_excluded_files)} file(s) omitted by {max_entries}-entry / {max_archive_mb} MB cap)",
             "",
-            "The archive reached its hard cap, so the packager kept the largest, most relevant",
-            "source files and left out the following files (if you need any of them, name it",
-            "explicitly and do not guess):",
+            "WARNING: This archive is INCOMPLETE because the project exceeded the hard archive cap",
+            f"({max_archive_mb} MB / {max_entries} entries). The packager kept the highest-priority source",
+            "files up to the 100 MB maximum and omitted every file listed below. Do NOT guess the",
+            "contents of any omitted file - if your task touches one of them, name it and stop:",
             "",
         ])
         for rel_str, reason in cap_excluded_files:
@@ -724,7 +727,7 @@ def package_context(
     output_zip: str,
     task_description: str = "",
     target_files=None,
-    max_size_mb: int = 20,
+    max_size_mb: int = DEFAULT_MAX_ARCHIVE_MB,
     max_archive_mb: int = DEFAULT_MAX_ARCHIVE_MB,
     max_entries: int = DEFAULT_MAX_ARCHIVE_ENTRIES,
 ):
@@ -940,24 +943,21 @@ $TargetRoot = '{proj_root}'
   changed and why, the reference to the attached file, and how to verify.
 - An inline code block is a fallback used only when file delivery is unavailable.
 
-### 2. SURGICAL EDITS ONLY (ZERO UI REGRESSION):
+### 2. SURGICAL EDITS ONLY (ZERO UI REGRESSION & LINEAR ORDINAL REPLACEMENT):
    - Do NOT rewrite or restructure entire files unless creating a brand new file.
    - Do NOT change existing UI styling, component hierarchies, or CSS rules unless explicitly commanded above.
-   - For edits in existing files, use safe substring replacements (`$content.Replace(...)`) with an error throw if not found.
+   - NEVER call `.NET String.Replace(String, String)` or `String.Contains(String)` on a large file or multi-kilobyte needle: on Windows PowerShell 5.1 (.NET Framework) they are O(file x needle) and hang for 25+ minutes on 500 KB files.
+   - Instead, locate each target block with an ordinal index search (`$idx = $content.IndexOf($oldTarget, [System.StringComparison]::Ordinal)`) and rebuild the string with `[System.Text.StringBuilder]`.
    - Use single-quoted Here-Strings (`@' ... '@`) so JS/TS template literals (`${{var}}`) are preserved.
    - Write files using UTF-8 without BOM: `[System.Text.UTF8Encoding]::new($false)`.
 
-### 3. BACK UP BEFORE WRITING, AND APPLY EVERYTHING IN ONE RUN
-   - Back up every file you overwrite into `.argon_backup/<yyyyMMdd_HHmmss>/<relative path>`.
-   - Print one `[Patched] <relative path>` line per changed file and a final
-     `[SUCCESS] N file(s) patched.` summary line.
-   - Abort with `throw` before touching anything if a target block is not found, so a partial apply
-     can never happen.
+### 3. TWO-PHASE PRE-FLIGHT AND WRITE (A PARTIAL APPLY MUST NEVER HAPPEN)
+   - Phase 1 (Pre-flight loop): Read every target file and verify EVERY `$oldTarget` block of EVERY file with `$content.IndexOf($oldTarget, [System.StringComparison]::Ordinal) -lt 0` BEFORE any file is backed up or written. Abort with `throw` if any target block is missing so the project stays untouched.
+   - Phase 2 (Write loop): Back up every file you overwrite into `.argon_backup/<yyyyMMdd_HHmmss>/<relative path>`, apply the replacements with `IndexOf` + `StringBuilder`, write UTF-8 without BOM, and print one `[Patched] <relative path>` line per changed file and a final `[SUCCESS] N file(s) patched.` summary line.
 
 ### 4. VERIFY YOUR WORK (REQUIRED)
-   - After writing each file, re-read it from disk and assert that the intended new content is present.
-   - Print `[Verified] <relative path>` for every file that matches and `[FAILED VERIFY] <relative path>`
-     (exiting non-zero) if any file does not match.
+   - After writing each file, re-read it from disk and assert with `$verify.IndexOf($newReplacement, [System.StringComparison]::Ordinal) -ge 0` that the intended new content is present.
+   - Print `[Verified] <relative path>` for every file that matches and `[FAILED VERIFY] <relative path>` (exiting non-zero) if any file does not match.
 
 ### 5. RECORD WHAT YOU FOUND (REQUIRED)
    - Append a trailing comment block at the very end of `apply_changes.ps1` after the last write.
@@ -1029,9 +1029,9 @@ if __name__ == "__main__":
     parser.add_argument("--output-zip", default="argon_context.zip", help="Output zip filename")
     parser.add_argument("--task", default="", help="Task description or goal")
     parser.add_argument("--files", nargs="*", default=None, help="Specific target files/patterns")
-    parser.add_argument("--max-size-mb", type=int, default=20, help="Max single file size in MB (default: 20)")
-    parser.add_argument("--max-archive-mb", type=int, default=DEFAULT_MAX_ARCHIVE_MB, help="Max total archive size in MB (default: 20)")
-    parser.add_argument("--max-entries", type=int, default=DEFAULT_MAX_ARCHIVE_ENTRIES, help="Max total archive entries (default: 400)")
+    parser.add_argument("--max-size-mb", type=int, default=DEFAULT_MAX_ARCHIVE_MB, help="Max single file size in MB (default: 100)")
+    parser.add_argument("--max-archive-mb", type=int, default=DEFAULT_MAX_ARCHIVE_MB, help="Max total archive size in MB (default: 100)")
+    parser.add_argument("--max-entries", type=int, default=DEFAULT_MAX_ARCHIVE_ENTRIES, help="Max total archive entries (default: 6000)")
     args = parser.parse_args()
 
     package_context(

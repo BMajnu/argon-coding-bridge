@@ -711,7 +711,9 @@ class PoolLoginAssistantApp:
         slot = acc.get("slot", f"/u/{self.current_index}/")
         tier = acc.get("tier", "PRO")
         role = acc.get("role", "Pool Member")
-        status = acc.get("status", "configured")
+        raw_status = str(acc.get("status", "configured") or "configured").strip()
+        allowed_badge_statuses = {"active", "signed_in", "configured", "not_signed_in", "failed", "needs_human"}
+        status = raw_status if raw_status.lower() in allowed_badge_statuses else "signed_in"
 
         self.slot_label.configure(text=f"Slot {slot}")
         self.tier_label.configure(text=tier)

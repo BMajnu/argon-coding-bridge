@@ -10,8 +10,8 @@ Bridge **any local AI coding agent** with **Gemini 4 Argon** running in Gemini W
 ## Why Use This?
 - **Massive Reasoning Multiplier**: Delegate heavy, multi-file architectural refactoring, complex bug diagnosis, and deep code synthesis to Gemini 4 Argon while continuing your main workflow locally.
 - **Zero UI Regression Guarantee**: Strict surgical instructions prevent Gemini from rewriting whole files or altering existing CSS, Tailwind, Flutter widgets, or HTML layouts.
-- **Strict Dependency & GitIgnore Filtering**: Accurately compresses only authentic source code, stripping `node_modules`, `vendor`, `build`, `.gradle`, `Pods`, `.next`, binaries, and private secrets (`.env*`).
-- **PowerShell Exact Replacement Patch**: Changes are delivered in a clean script using `$content.Replace()` with safety checks, single-quoted Here-Strings (`@' ... '@`), and automatic backups with rollback.
+- **Strict Dependency & GitIgnore Filtering (Up to 100 MB, Zero Code Compromise)**: Accurately packages the complete related codebase up to **100 MB** (`DEFAULT_MAX_ARCHIVE_MB = 100`, `DEFAULT_MAX_ARCHIVE_ENTRIES = 6000`), stripping `node_modules`, `vendor`, `build`, `.gradle`, `Pods`, `.next`, binaries, and private secrets (`.env*`) while never compromising on source code size.
+- **Linear Ordinal PowerShell Patch (`IndexOf` + `StringBuilder`)**: Changes are delivered in a two-phase script that validates every target block across every file before writing anything, backs up touched files, and applies replacements via `[System.StringComparison]::Ordinal` `IndexOf` + `[System.Text.StringBuilder]` (never `.NET String.Replace` / `String.Contains` on large needles, which hangs for 25+ minutes on 500 KB files).
 - **Session Continuity**: A follow-up task on the same project continues in the SAME Gemini conversation, so the earlier codebase understanding, decisions and ideas stay available.
 - **Self-Verification**: The delivered patch re-reads every file it writes and prints `[Verified] <path>`, so Argon proves its own work instead of merely claiming success.
 
@@ -22,13 +22,12 @@ Bridge **any local AI coding agent** with **Gemini 4 Argon** running in Gemini W
 These rules are how the agent that drives this bridge works. They are not
 suggestions.
 
-### 1. Dispatch preparation is quick, and the archive is complete
+### 1. Dispatch preparation is quick, and the archive is complete (Up to 100 MB, No Compromise on Code Size)
 
 The agent focuses on the USER'S PROMPT and the intent behind it.
 
-- It works out which codebase can be related to the user's problem and puts
-  **the whole of it** into the zip. The file set is never smaller than that.
-  A few extra files are fine - a narrow archive is not.
+- **Premium 100 MB Archive Rule**: The package size may be up to **100 MB** (`DEFAULT_MAX_ARCHIVE_MB = 100`, `DEFAULT_MAX_ARCHIVE_ENTRIES = 6000`) and never more. The maximum code size is always tried, with **no compromise on code size**: a large codebase or many files may be sent whenever needed, and necessary information or source files must never be reduced. If the 100 MB hard cap is ever reached, `TASK_BRIEF.md` states plainly that the archive is incomplete and lists every omitted file.
+- The upload timeout window scales automatically with the archive byte size (`_upload_timeout_for_archive()`, with a 600 s floor and ~900 s for a 100 MB archive) so a large archive is never cut off mid-upload.
 - The analysis that settles the subject finishes in **seconds to a few
   minutes**. It never turns into a long analysis phase, and the agent does not
   keep analysing after the subject is clear.
@@ -65,15 +64,22 @@ out which one is better and which good parts of the two can be combined.
   with its image reader.** The terminal text is only a summary; the screenshot
   is the measured evidence. Never decide from the terminal text alone.
 
-### 5. The bounded retry ladder (send AND delivery phases)
+### 5. Per-step rule verification & workflow flexibility (Rule 7)
 
-Both the **send phase** and the **delivery phase** are strictly bounded to three automated attempts and then the manual hand-off:
-1. Normal attempt (`attempt 1 of 3`).
-2. Same state once more (`attempt 2 of 3`), after reading the screenshot and exact failure reason first.
-3. Find the real cause, change the script or process, record the fix, and try once more (`attempt 3 of 3`).
-4. Stop retrying and hand over to the user (`--manual-handoff --open-browser`, or provide the full hand-over pack and kept quarantine path).
+- **Re-read each step's rules before finishing**: Before any workflow step (packaging, brief preparation, dispatch/send, capture/download, or patch acceptance/apply) finishes, its own specific rules must be read again carefully and verified.
+- **Mandatory self-verification on file-send, file-download, and patch-accept**:
+  1. **File-send (`attach_zip` & `_execute_composer_send_sequence`)**: Verifies before every send that the archive is <= 100 MB, contains `TASK_BRIEF.md` and `API_INDEX.md`, contains zero credentials or binaries, that Task mode and `4 Argon` (never Flash) are active, and clicks Send the moment the upload finishes.
+  2. **File-download (`capture_generated_file` & `_validate_and_save_download`)**: Verifies every time that the patch comes from the viewer's **Download** button (never the truncated preview), is non-empty, and is not a leftover digest in `DeliveryLedger`.
+  3. **Patch-accept (`refuse_invalid_patch`, `_looks_like_patch`, `_patch_is_complete`, `Run-ArgonPatch.ps1`)**: Verifies every time before and after running that all here-strings are balanced, no raw control bytes or unbalanced braces were introduced, every target block was pre-flight checked in Phase 1 before writing in Phase 2, and every written file was re-read from disk.
+- **Flexible by design**: Step ordering (`_execute_composer_send_sequence`), archive caps (`--max-archive-mb`, `--max-entries`, `--max-size-mb`), per-agent state paths (`ARGON_TASK_STATE_PATH`), slot selection (`--slot`, `--second-slot`), and verification commands (`--verify-cmd`, `--skip-verify`) remain configurable per run without modifying core code.
 
-Never a fourth automated attempt (the dispatcher tracks `phase` and `attempt` in `TaskState` and refuses attempt 4), and never re-run `--resume` in an open loop on a failed delivery.
+### 6. The retry ladder & immediate manual hand-off on every attempt (Rule 8)
+
+Both the **send phase** and the **delivery phase** retry at most two or three times (`MAX_LADDER_ATTEMPTS = 3`), and **every single attempt (`attempt 1`, `attempt 2`, `attempt 3`) writes and prints the manual hand-off pack (`manual_handoff.md`, prompt file path, and `argon_context.zip` location) upfront** so a human can click and send by hand in the open browser at any moment without waiting for retries to finish:
+1. Normal attempt (`attempt 1 of 3`) — writes the manual hand-off pack (`dispatch_prompt.md` + `argon_context.zip` path) immediately and runs the unified send sequence.
+2. Same state once more (`attempt 2 of 3`) — updates the manual hand-off pack, reads the step screenshot and exact failure reason, and retries.
+3. Root-cause fix attempt (`attempt 3 of 3`) — updates the manual hand-off pack, fixes the underlying cause, records the fix, and runs the final automatic retry.
+4. **Self-executed manual send fallback**: If the automatic attempts still fail, the bridge performs the manual send **itself** in the browser using the exact same composer, scaled upload wait, and hard Flash model guard, and then waits for the delivery as usual.
 
 ### 6. Never kill a slot browser with `taskkill /F`
 
@@ -148,26 +154,18 @@ When EITHER a **SEND** fails (ZIP upload failed, paste failed, send failed, Task
 4 Argon pre-flight failed, or the run stopped before the prompt was delivered) OR a
 **DELIVERY** fails (the delivery chip could not be downloaded after 3 per-chip attempts,
 the downloaded file failed `_looks_like_patch` or `_patch_is_complete` and was quarantined
-in `.argon_quarantine/`, or the response finished without a usable patch), the agent MUST
-execute the bounded ladder. A delivery failure is handled by this ladder, **NEVER** by
-re-running `--resume` in a loop.
-**Never loop. The tool counts the attempts (`attempt 1 of 3`, `attempt 2 of 3`, `attempt 3 of 3`) in `TaskState` for the current phase (`send` or `delivery`) and refuses a fourth automated attempt.**
+in `.argon_quarantine/`, or the response finished without a usable patch), the agent follows
+the bounded ladder (`MAX_LADDER_ATTEMPTS = 3`):
 
-1. **Step 1 - The normal attempt (`attempt 1 of 3`):** Run the dispatch (or initial delivery capture) as specified in the workflow.
-2. **Step 2 - The SAME state, once more, but LOOK first (`attempt 2 of 3`):**
-   If step 1 fails, change nothing: same account, same chat, same lane.
-   Before running again, read the step screenshot (`.argon_backup/shots/<NN>-<step>.png`) with your image reader, along with the printed failure reason and (for delivery failures) the quarantined file path in `.argon_quarantine/`. Transient issues clear on this second attempt.
-3. **Step 3 - Find the REAL cause, change the script or process, try again (`attempt 3 of 3`):**
-   If step 2 fails as well, inspect the exact check that failed (named in the `[REFUSED]` / quarantine output) and the kept file in `.argon_quarantine/`, fix the root cause in the script or process (`dispatch_argon.py`, validator, capture path, or driving command), record the fix with `record_fix.py` on a `fixes/<scope-slug>` branch, and run the third (and final automated) attempt.
-4. **Step 4 - The manual hand-off (the agent stops retrying; attempt 4 is refused by the tool):**
-   Stop automating and hand the task over to the user.
-   - **Step 4a - Open the page and leave the browser open:** Open the target conversation in that slot's real Chrome profile (`~/.gemini/argon_profiles/slot-uN/`) with `python dispatch_argon.py --project-path . --manual-handoff --lane <lane> --slot <slot> --open-browser`. LEAVE THE BROWSER OPEN. Tell the user the ladder phase (`send` or `delivery`), how far the run got (`send_progress`), the exact check that failed, any quarantined patch path (`Open_Argon_Apply.bat -PatchFile <path>`), and the last step screenshot path.
-   - **Step 4b - The complete hand-over pack:** Deliver the full hand-over pack (`manual_handoff.md` and `handoff.json` in `.argon_backup/handoff/<timestamp>/`) containing: account e-mail, dispatch prompt file path, chat link, prompt text, ZIP path, ladder phase/attempt, quarantined patch path (if any), and instructions to finish or apply manually.
+1. **Step 1 - Attempt 1 (`attempt 1 of 3`) + Upfront Manual Hand-Off Pack:** The dispatcher writes `manual_handoff.md` and `handoff.json` (with the prompt file path and `argon_context.zip` path) on attempt 1 so the operator can send by hand at any moment.
+2. **Step 2 - Attempt 2 (`attempt 2 of 3`) + Updated Manual Hand-Off Pack:** Read the step screenshot (`.argon_backup/shots/<NN>-<step>.png`) and exact failure reason, keep the manual hand-off pack updated, and retry once in the same state.
+3. **Step 3 - Attempt 3 (`attempt 3 of 3`) + Root-Cause Fix:** Inspect the exact check that failed and any kept file in `.argon_quarantine/`, fix the root cause in the script or process, record the fix with `record_fix.py` on a `fixes/<scope-slug>` branch, and run attempt 3.
+4. **Step 4 - Self-Executed Manual Send Fallback:** If automatic attempts 1..3 still fail to send, the bridge performs the manual send **itself** in the open browser (using the same composer, the same scaled upload wait, and the same hard Flash guard) and waits for the delivery, while keeping the manual hand-off pack and browser available for the operator.
 
-| Lane | When the hand-off happens | What must be handed over |
+| Lane | When the hand-off pack is written | What is handed over on EVERY attempt |
 |---|---|---|
-| **follow-up** | Step 4a or 4b | account e-mail, chat link, prompt, ZIP, dispatch file, progress, screenshot path |
-| **new** | Step 4a or 4b | the same set - the new lane has no chat to continue, so nothing is missing from it |
+| **follow-up** | Attempts 1, 2, 3, and self-manual fallback | account e-mail, chat link, prompt file, ZIP path, progress, screenshot path |
+| **new** | Attempts 1, 2, 3, and self-manual fallback | the same complete set so a human can click and send in the browser at any moment |
 
 ### Step 6 - Compare and apply
 Command:  `python "./skills/argon-coding-bridge/scripts/compare_argon_patches.py" --followup-patch "downloads/followup/apply_changes.ps1" --new-patch "downloads/new/apply_changes.ps1" --merge --pick new --apply`
@@ -192,26 +190,25 @@ Why:  releases the task in `~/.gemini/argon_tasks.json` so the next round sees
 ### The rules that belong in this workflow
 
 1. **The follow-up always goes to the account that holds the chat** - never
-   rotated. Even when that account is already busy with two tasks, that chat
+   rotated. Even when that account is already busy with multiple tasks, that chat
    lives there, so USE it and say so in one line. Do not refuse, do not block:
    the work needs that conversation.
-2. **A new task prefers an account that is not busy.** When several accounts
-   are free, pick one of those. When the only free slot is busy, or when no
-   account is free, the run continues on the least loaded account and PRINTS
-   the reason. **Never refuse to work because an account is busy.**
-3. **At most two concurrent tasks per account** - that is the limit, not a
-   wall. A third task on the same account should be avoided, not blocked.
+2. **A new task skips an account ONLY when that account already runs the maximum number of tasks (`MAX_TASKS_PER_SLOT = 2`).** There are no other account skip rules or usage-limit shutoffs of any kind. When all accounts are at capacity, the run continues on the least-loaded account and prints the reason.
+3. **Never send a task on the Flash model (Hard Flash Guard).** Before every send (both on a new chat and on a follow-up), the dispatcher reads the model chip; if it is not `4 Argon`, it selects `4 Argon` again, and if it still is not `4 Argon`, it aborts the send immediately.
 4. **Never send a prompt in Chat mode.** If the mode cannot be proven, the
    agent opens a NEW chat, switches it to Task, and checks the chip before it
    sends. If a follow-up is refused with `mode = Task : UNKNOWN`, inspect the
    conversation: if the user confirms it is a Task-mode conversation, record it with
    `python ./skills/argon-coding-bridge/scripts/dispatch_argon.py --project-path . --record-workspace-mode <chat-id> --mode task`
    and retry. Never record a mode that has not been confirmed.
-5. **Show the brief before it is sent.** The agent summarizes what it understood
+5. **Before each step finishes, re-read that step's own rules**; the file-send,
+   file-download, and patch-accept steps verify their own rules every time before
+   they run, and the workflow stays flexible for project-specific needs.
+6. **Show the brief before it is sent.** The agent summarizes what it understood
    and waits for user approval.
-6. **Record what you fixed.** When fixing defects, record debugging notes with
+7. **Record what you fixed.** When fixing defects, record debugging notes with
    `record_fix.py` and commit on a dedicated `fixes/<scope-slug>` branch.
-7. **Read the step screenshot before every decision.** The terminal line is a
+8. **Read the step screenshot before every decision.** The terminal line is a
    summary; the screenshot is the evidence.
 
 ### Troubleshooting Table (Symptom -> Root Cause -> Action)
@@ -219,21 +216,20 @@ Why:  releases the task in `~/.gemini/argon_tasks.json` so the next round sees
 | Symptom | Root Cause | Action |
 |---|---|---|
 | **The answer is a chat-style reply instead of work** | The prompt went out in Chat mode. | Open a new chat (`--new-session`), switch it to Task mode, check the `4 Argon` chip in `.argon_backup/shots/<NN>-preflight.png`, and resend. |
-| **Gemini says the archive is unreadable / binary data** | Binary files (fonts, images, media, or non-UTF-8 data) were included in the archive. | The packager must exclude every binary file by extension and 8 KB NUL/UTF-8 content check and enforce the archive cap; re-run `package_context.py` to rebuild `argon_context.zip`. |
+| **Gemini says the archive is unreadable / binary data** | Binary files (fonts, images, media, or non-UTF-8 data) were included in the archive. | The packager must exclude every binary file by extension and 8 KB NUL/UTF-8 content check and enforce the 100 MB archive cap; re-run `package_context.py` to rebuild `argon_context.zip`. |
 | **The prompt landed in an old conversation** | The new chat was not verified empty after loading. | The run must verify after the conversation loads that there are zero user messages and zero assistant turns and report the `chat_id` it used; re-run with `--new-session`. |
-| **Old delivery downloaded again** | A previous round's `apply_changes.ps1` chip was downloaded and matched a digest in `DeliveryLedger` or an existing patch. | `_is_leftover_delivery` refuses the duplicate, **keeps** the rejected file in `.argon_quarantine/<timestamp>_apply_changes.ps1` at a printed absolute path (never deleting it), names the exact duplicate SHA-256 check that failed, and stops capturing that chip. Follow the bounded 3-attempt retry ladder (not an open `--resume` loop). |
+| **Old delivery downloaded again** | A previous round's `apply_changes.ps1` chip was downloaded and matched a digest in `DeliveryLedger` or an existing patch. | `_is_leftover_delivery` refuses the duplicate, **keeps** the rejected file in `.argon_quarantine/<timestamp>_apply_changes.ps1` at a printed absolute path (never deleting it), names the exact duplicate SHA-256 check that failed, and stops capturing that chip. Follow the bounded retry ladder. |
 | **No download after the task finished** | Argon finished answering inline or the viewer toolbar button did not trigger before timeout. | Read `.argon_backup/shots/<NN>-delivered.png` or `failed.png`; if a chip is visible in the newest turn, run `--resume` to capture it or download `apply_changes.ps1` from the viewer toolbar and run `Open_Argon_Apply.bat`. |
 | **Browser opens again and again** | A retry loop re-opened the preview or re-dispatched without checking `TaskState` / `DeliveryLedger`. | Single-capture mode exits immediately after one valid toolbar download. Use `--list-tasks` to inspect active runs. |
 | **A task is already running on this account (`EXIT_ALREADY_RUNNING = 9`)** | `TaskState` or `TaskRegistry` shows an in-flight `sent` or `waiting` task for this exact project/lane. | Read the printed screenshot path with your image reader; run `--resume` to wait for the running task, or pass `--force` to explicitly mark the old task `superseded` and start fresh. |
-| **Account is quota-limited (`EXIT_QUOTA_LIMITED = 5`)** | The account hit its Gemini 4 Argon usage limit or `'4 Argon'` is `aria-disabled` in the model picker. | The bridge automatically marks the slot `quota_limited` in `accounts_pool.json` and rotates to the next free pool account. Add more accounts via `Open_Argon_Login.bat` (Import Box / Load from `.txt`) if all slots are exhausted. |
-| **Model chip says something else than Argon** | Before send: the picker did not switch to `4 Argon`. After send: the chip naturally reverts to the account default (e.g. `Flash`). | Before send, pre-flight waits up to 45 s for the chip and refuses to send if it is not `4 Argon`. After send, check the answer evidence (`_verify_argon_answer_evidence`), not the post-send chip. |
-| **Account is busy with running tasks** | Another task is already active on that slot in `TaskRegistry` or Chrome is open on the slot profile. | Never block: a follow-up uses the account that holds the chat and says so in one line; a new task picks a free account or falls back to the least-loaded account and prints the reason. |
-| **Delivery is truncated or 0 bytes** | The browser handed over an incomplete script or a file that failed `_looks_like_patch` / `_patch_is_complete`. | Rejected files are **kept** in `.argon_quarantine/` at a printed absolute path (never deleted), the terminal names the file, its size, and the exact check that failed (`[REFUSED] file=... label=... offset=... reason=...`), and per-chip downloads are capped at 3 attempts. Follow the bounded 3-attempt delivery ladder (or apply a valid quarantined file with `Open_Argon_Apply.bat -PatchFile <path>`) - do **not** run `--resume` in a loop. |
+| **Model chip says Flash or something else than Argon** | After a message is sent, Gemini reverts the composer chip to the account default (often `Flash`). | The hard Flash guard (`ensure_argon_model` + `enforce_no_flash_before_send`) checks the chip before every send (new chat and follow-up), re-selects `4 Argon`, and aborts the send if `4 Argon` cannot be confirmed so a task never goes out on Flash. |
+| **Account is busy with running tasks** | Another task is already active on that slot in `TaskRegistry` or Chrome is open on the slot profile. | A follow-up always uses the account that holds the chat even if busy; a new task skips an account only when it already runs `MAX_TASKS_PER_SLOT` (2) tasks, falling back to the least-loaded account without blocking. |
+| **Delivery is truncated or 0 bytes** | The browser handed over an incomplete script or a file that failed `_looks_like_patch` / `_patch_is_complete`. | Rejected files are **kept** in `.argon_quarantine/` at a printed absolute path (never deleted), the terminal names the file, its size, and the exact check that failed (`[REFUSED] file=... label=... offset=... reason=...`), and per-chip downloads are capped at 3 attempts. |
 | **Second prompt superseded an unfinished task** | Another prompt was sent into the same conversation while the earlier task was still `sent` or `waiting`. | `_check_superseded_prompt` detects the newer user message in the DOM, marks the earlier task `superseded` in `TaskState` and `TaskRegistry`, and stops waiting immediately. |
 | **New session opened a foreign conversation** | Navigating to `/u/0/app` restored the account's previous chat from another project. | `_start_fresh_chat` waits for the conversation to finish loading, clicks the sidebar **New chat** button, verifies zero user/assistant turns and that the URL chat ID is not in `_known_chat_ids_for_slot`, and reports the chat ID if it cannot prove the chat is empty. |
-| **Send failed on first attempt (Step 1)** | Transient browser, network, or UI race condition (stale composer focus, unsettled model chip, page still loading). | Read the step screenshot (`.argon_backup/shots/<NN>-<step>.png`), exit code, and error text. Re-try ONCE more in the EXACT SAME state (same account, same chat, same lane, same command) without changing anything (Step 2). |
-| **Send failed twice in same state (Step 2)** | Concrete bug or limitation in dispatcher script, process, packaging, or command. | Find the REAL cause (not symptoms). Change the script or process (`dispatch_argon.py`, pre-flight, packaging, command), record fix with `record_fix.py` on a `fixes/<scope-slug>` branch, and run the 3rd (and final automated) attempt (Step 3). |
-| **Send or delivery failed three times (Step 3)** | Bounded retry ladder exhausted (maximum 3 automated attempts reached in `send` or `delivery` phase; the tool refuses a 4th attempt). | Stop automated retrying immediately. Perform manual hand-off (Step 4): run `dispatch_argon.py --manual-handoff --open-browser` to leave Chrome open with recorded progress and quarantined file path, or deliver the complete hand-off pack (`manual_handoff.md`). Never execute a 4th automated attempt. |
+| **Send failed on first attempt (Step 1)** | Transient browser, network, or UI race condition (stale composer focus, unsettled model chip, page still loading). | The manual hand-off pack (`manual_handoff.md` + prompt & ZIP paths) is already written on attempt 1. Read the step screenshot (`.argon_backup/shots/<NN>-<step>.png`) and retry once in the same state (Step 2) or send manually in the browser. |
+| **Send failed twice in same state (Step 2)** | Concrete bug or limitation in dispatcher script, process, packaging, or command. | Find the REAL cause, update the script or process, record the fix with `record_fix.py` on a `fixes/<scope-slug>` branch, and run attempt 3 (with the updated manual hand-off pack). |
+| **Automatic send attempts exhausted (Step 3 -> Step 4)** | All 3 automatic attempts did not complete the send. | The bridge automatically performs the manual send **itself** in the browser (using the same composer, scaled upload wait, and hard Flash guard) while keeping the manual hand-off pack available. |
 | **Browser stuck or needs to be closed (`taskkill /F` logs account out)** | Killing Chrome with `taskkill /F` prevents `Browser.close` from flushing `Default/Network/Cookies` and destroys the signed-in session. | **Never** run `taskkill /F` on a slot profile. Close a slot browser safely with `python dispatch_argon.py --project-path . --close-browser --slot /u/N/` (or close one tab with `--close-tab --slot /u/N/ --tab <tab-id>` and inspect hosts with `--list-browsers`). |
 
 ---
@@ -330,8 +326,8 @@ python "./skills/argon-coding-bridge/scripts/package_context.py" --task "Explain
 - Strictly respects `.gitignore`.
 - Filters out all dependency and build packages (`node_modules`, `vendor`, `.dart_tool`, `Pods`, `.gradle`, `venv`, `dist`, `build`, etc.).
 - Strips secrets (`.env*`, `*.pem`, `*.key`, `*credentials*.json`).
-- Allows files up to 15MB (safely accommodates large code/schema/JSON data files).
-- Injects `TASK_BRIEF.md` containing the project overview into the zip.
+- Supports archives up to **100 MB** (`DEFAULT_MAX_ARCHIVE_MB = 100`, `DEFAULT_MAX_ARCHIVE_ENTRIES = 6000`) and always tries the maximum code size with no compromise on code size.
+- Injects `TASK_BRIEF.md` and `API_INDEX.md` containing the complete declaration index into the zip.
 
 ---
 
@@ -371,9 +367,10 @@ set in a single run from any working directory:
 $TargetRoot = '<ABSOLUTE_PROJECT_PATH>'
 ```
 
-- For edits in existing files, use safe exact substring replacements ($content.Replace) and throw an error if the snippet is not found:
+- For edits in existing files, NEVER use `.NET String.Replace(String, String)` or `String.Contains(String)` on large files or multi-kilobyte needles (on Windows PowerShell 5.1 they are `O(file x needle)` and hung for 25 minutes on a 500 KB file, whereas ordinal `IndexOf` + `StringBuilder` takes 0.0 seconds). Use a two-phase script: Phase 1 checks every target block of every file with `[System.StringComparison]::Ordinal` BEFORE any file is written, and Phase 2 backs up, applies with `StringBuilder`, writes UTF-8 no-BOM, and verifies:
   ```powershell
-  $path = Join-Path $TargetRoot "relative/path/to/file.ext"
+  $relPath = "relative/path/to/file.ext"
+  $path = Join-Path $TargetRoot $relPath
   $content = [System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8)
   $oldTarget = @'
 // EXACT existing lines
@@ -381,19 +378,30 @@ $TargetRoot = '<ABSOLUTE_PROJECT_PATH>'
   $newReplacement = @'
 // Updated replacement lines
 '@
-  if (-not $content.Contains($oldTarget)) { throw "Target block not found in $path. Aborting." }
+  # Phase 1 (Pre-flight loop across ALL files before any file is written):
+  $idx = $content.IndexOf($oldTarget, [System.StringComparison]::Ordinal)
+  if ($idx -lt 0) { throw "Target block not found in $relPath. Aborting before any file is written." }
+
+  # Phase 2 (Backup, linear StringBuilder replacement, UTF-8 no-BOM write, and re-read verify loop):
   $backupSession = Join-Path (Join-Path $TargetRoot '.argon_backup') (Get-Date -Format 'yyyyMMdd_HHmmss')
   $backupDest = Join-Path $backupSession $relPath
   $backupParent = [System.IO.Path]::GetDirectoryName($backupDest)
   if ($backupParent -and -not (Test-Path $backupParent)) { New-Item -ItemType Directory -Path $backupParent -Force | Out-Null }
   Copy-Item -LiteralPath $path -Destination $backupDest -Force
-  $content = $content.Replace($oldTarget, $newReplacement)
+  $idx = $content.IndexOf($oldTarget, [System.StringComparison]::Ordinal)
+  if ($idx -lt 0) { throw "Target block not found in $relPath. Aborting before any file is written." }
+  $sb = [System.Text.StringBuilder]::new($content.Length + $newReplacement.Length)
+  [void]$sb.Append($content, 0, $idx)
+  [void]$sb.Append($newReplacement)
+  [void]$sb.Append($content, $idx + $oldTarget.Length, $content.Length - $idx - $oldTarget.Length)
+  $content = $sb.ToString()
   [System.IO.File]::WriteAllText($path, $content, [System.Text.UTF8Encoding]::new($false))
   $verify = [System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8)
-  if (-not $verify.Contains($newReplacement)) { Write-Host "[FAILED VERIFY] $relPath" -ForegroundColor Red; exit 1 }
+  if ($verify.IndexOf($newReplacement, [System.StringComparison]::Ordinal) -lt 0) { Write-Host "[FAILED VERIFY] $relPath" -ForegroundColor Red; exit 1 }
   Write-Host "[Verified] $relPath" -ForegroundColor Cyan
-  Write-Host "[Patched] relative/path/to/file.ext" -ForegroundColor Green
+  Write-Host "[Patched] $relPath" -ForegroundColor Green
   ```
+- Always run the Phase 1 pre-flight check across EVERY target block of EVERY file before the Phase 2 write loop touches any file on disk.
 - Back up every file before overwriting it into `.argon_backup/<yyyyMMdd_HHmmss>/<relative path>`.
 - Use single-quoted Here-Strings (`@' ... '@`) so `${variable}` template literals are not corrupted.
 - Write files using UTF-8 without BOM: `[System.Text.UTF8Encoding]::new($false)`.
@@ -401,25 +409,24 @@ $TargetRoot = '<ABSOLUTE_PROJECT_PATH>'
 
 ---
 
-## Step 3: Configure the Workspace, Then Dispatch
+## Step 3: Configure the Workspace and Execute the Unified Send Order
 
 The workspace must be configured **before** the prompt is sent. A prompt sent in Chat mode, on the
-wrong model, or **without the zip attached** makes Gemini answer *"argon_context.zip did not come
-through with your message"* and wastes the whole round trip.
+Flash model, or **without the zip attached** wastes the round trip.
 
 > **The UI language follows the signed-in Google account.** This pool renders Gemini in Bangla, so
 > English-only text selectors silently miss. Both labels are given below.
 
-### Gemini Web — `https://gemini.google.com/u/<slot>/app`
+### Gemini Web — `https://gemini.google.com/u/<slot>/app` (New Send Order — Rule 5)
 
 | # | Action | Bangla label | English |
 | --- | --- | --- | --- |
-| 1 | Switch the mode toggle to Task | `টাস্ক` | Task (`চ্যাট` = Chat) |
-| 2 | Model dropdown | `4 Argon (Complex tasks)` | 4 Argon |
-| 3 | Attach the context | `+ Gemini-কে ডিজাইসো করুন` | Upload to Gemini -> `argon_context.zip` |
-| 4 | Send the prompt | — | — |
+| 1 | Find the prompt box, switch to Task mode, and select `4 Argon` | `টাস্ক` + `4 Argon (Complex tasks)` | Task (`চ্যাট` = Chat) + 4 Argon |
+| 2 | Paste the prompt into the composer | — | Paste via clipboard (`Control+V`) |
+| 3 | Attach the context archive | `+ Gemini-কে ডিজাইসো করুন` | Upload `argon_context.zip` and wait for upload spinner to clear |
+| 4 | Click Send the moment upload finishes | `পাঠান` | Immediately click Send (after verifying the hard Flash guard) |
 
-Chat mode cannot do this work — Task mode is mandatory.
+Chat mode cannot do this work — Task mode and `4 Argon` are mandatory.
 
 ### Google AI Studio was removed
 
@@ -431,45 +438,35 @@ Task mode + `4 Argon`) is the only workspace.
 
 ### The dispatcher enforces this for you
 
-`scripts/dispatch_argon.py` performs all of the above and **verifies** every step before sending:
+`scripts/dispatch_argon.py` performs the unified send sequence (`_execute_composer_send_sequence`) and **verifies** every step:
 
 ```bash
 python "./skills/argon-coding-bridge/scripts/argon_pool_login.py" --all --wait-minutes 6   # sign the pool in
 python "./skills/argon-coding-bridge/scripts/dispatch_argon.py" --task "Describe the change" --project-path . --slot /u/0/ --auto-apply
 ```
 
-- Task mode active and the `4 Argon` model selected (Gemini Web)
-- the zip really attached to the composer
+- 1st step: find the composer, verify Task mode active and the `4 Argon` model selected
+- 2nd step: paste the surgical prompt into the composer
+- 3rd step: attach `argon_context.zip` and wait until its upload spinner clears (using an upload window scaled to the archive's byte size)
+- 4th step: the moment the upload finishes, verify the hard Flash guard and click Send immediately
 
-**If any check fails the prompt is NOT sent.** The run exits with code `3`, prints the bilingual
-checklist above, and writes a screenshot to `.argon_backup/preflight_failure.png` in the project. Fix
-the workspace by hand and re-run with `--manual-setup` to skip only the mode/model clicks — the
-dispatcher still attaches the zip and sends the prompt.
+**If any check fails the prompt is NOT sent.** Fix the workspace or let the retry ladder / self-executed manual send fallback handle it.
 
-### The model double check (the most important guard)
+### The Hard Flash Guard (Rule 6 — A Task Must Never Go Out on Flash)
 
-Sending a task to **Flash** instead of **4 Argon** is the worst failure this bridge can have: the
-work is lost and the quota is wasted. So the model is verified twice, and against the only signal
-that cannot lie - the **model chip** next to the composer, which shows the model that will really
-answer:
+Sending a task to **Flash** instead of **4 Argon** is strictly forbidden: the task always runs on the **Argon** model, never on Flash, and a hard safety guard aborts the send if Argon cannot be selected:
 
-1. **Before the send** - `ensure_argon_model()` reads the chip. If it does not name Argon, the model
-   picker is opened and `_inspect_option_in_picker()` inspects the `4 Argon` option:
-   - If `4 Argon` is **present but disabled** (`aria-disabled="true"` or `disabled`), the bridge reads
-     which account is signed in, reports `"this account has no Argon available"`, marks the slot
-     `quota_limited` in `accounts_pool.json`, and returns exit code `5` (`EXIT_QUOTA_LIMITED`) so the
-     dispatcher immediately **rotates to the next pool account** instead of stopping.
-   - If `4 Argon` is **missing** (the picker did not open) and the chip still does not read Argon
-     after repeated attempts, **the prompt is not sent** and the run stops with exit code `3`.
-2. **After the send** - the chip is read once more, and a warning is printed if the UI fell back to
-   another model.
+1. **Before every send (both new chats and follow-ups)** - Because Gemini reverts the model chip to the account default (often `Flash`) after a message is sent, `ensure_argon_model()` and `enforce_no_flash_before_send()` inspect the **model chip** next to the composer on both new chats and follow-ups:
+   - If the chip reads `Flash` or anything other than `4 Argon`, the model picker is opened and `_inspect_option_in_picker()` selects `4 Argon`.
+   - If `4 Argon` is **disabled** (`aria-disabled="true"` or `disabled`) or **missing** and the chip still does not read `4 Argon` after retries, **the hard guard aborts the send immediately (`EXIT_PREFLIGHT_FAILED = 3`)** so nothing is ever sent on Flash, and a new task rotates to the next available pool account.
+2. **After the send** - the chip is read once more for diagnostic logging.
 
 The chip's own text is what counts. "4 Argon" being *visible* on the page proves nothing: the open
 model picker lists every model at once, so `4 Argon` can be on screen while `3.8 Flash` is the
 checked one - that false positive is what sent real tasks to Flash, so it was removed.
 
-A follow-up in an existing conversation gets the same treatment: an existing chat can drop back to
-Flash at any time, so the chip is re-read before every prompt, not only on the first one.
+A follow-up in an existing conversation gets the exact same hard guard: an existing chat reverts to
+Flash after a turn, so the chip is verified and switched back to `4 Argon` before every follow-up send.
 
 ### Three guards that keep the round trip honest
 
@@ -524,16 +521,14 @@ After the patch is applied, the bridge runs the project's own build/lint command
 build`, `make`, ... - detected from the project root, or given with
 `--verify-cmd`).
 
-That check costs **no quota at all** - it never talks to Gemini. When it passes,
+That check runs locally and never talks to Gemini. When it passes,
 the run reports `Project verification: <cmd> -> clean`. When it fails, the errors
 are printed and recorded in the task state and in the notes file, and the run ends
 with exit code `8`.
 
 **The agent that drove the bridge fixes those errors itself.** Lint problems,
-a lost brace, a wrong import - they are small and local, and fixing them costs
-nothing. The bridge deliberately does NOT send a follow-up to Argon for them,
-because every extra Gemini round burns the owner's hourly, weekly and monthly
-quota.
+a lost brace, a wrong import - they are small and local, and fixing them locally is
+immediate. The bridge deliberately does NOT send a follow-up to Argon for them.
 
 **Ask Argon again only for a genuinely major or difficult task** - a redesign, a
 migration, something that needs real reasoning. That decision belongs to the
@@ -706,25 +701,24 @@ Gemini has created the chat, and prints the URL it will continue in.
 
 ---
 
-### Quota rotation: when an account hits its limit, the next one takes over
+### Pool slot selection: busy-task rotation for new tasks, session affinity for follow-ups
 
-Google limits each account's Gemini usage on a rolling 3-4 hour window. When the window is
-exhausted, Gemini shows a **limited** state and never answers. The dispatcher detects that state
-instead of waiting for an answer that will never come, marks the account as `quota_limited` in
-`config/accounts_pool.json`, and automatically continues with the **next** account in the pool.
+The pool is tried in slot order (`/u/0/`, `/u/1/`, ...) starting from `--slot` (or the project's
+stored session slot in `~/.gemini/argon_sessions.json`, falling back to `active_slot`), wrapping
+around:
+
+- **Follow-up tasks**: Always use the account slot that owns the conversation, even when that
+  account already has multiple tasks running.
+- **New tasks**: Skip an account only when it is already running the maximum number of concurrent
+  tasks (`MAX_TASKS_PER_SLOT = 2`). No account is ever shut down or skipped for any other status.
 
 ```bash
-# Tries the accounts in pool order and moves on when one is rate limited:
+# Picks an available slot under MAX_TASKS_PER_SLOT and rotates if a slot fails pre-flight:
 python "./skills/argon-coding-bridge/scripts/dispatch_argon.py" --task "Describe the change" --project-path .
 
 # Limit how many accounts are tried:
 python "./skills/argon-coding-bridge/scripts/dispatch_argon.py" --task "..." --project-path . --max-accounts 3
 ```
-
-The pool is tried in slot order (`/u/0/`, `/u/1/`, ...) starting from `--slot` (or the project's
-stored session slot in `~/.gemini/argon_sessions.json`, falling back to `active_slot`), wrapping
-around. Healthy accounts are tried first, followed by accounts marked `quota_limited` so a limit
-that clears on its own needs no manual intervention.
 
 ---
 

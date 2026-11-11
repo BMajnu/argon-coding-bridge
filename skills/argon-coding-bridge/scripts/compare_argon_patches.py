@@ -202,7 +202,7 @@ def parse_patch_script(patch_text: str) -> Dict[str, Any]:
                 _add_block(f_path, old_body, body, is_new=False)
             else:
                 after_slice = patch_text[item["end"] : item["end"] + 1200]
-                if "WriteAllText" in after_slice and ".Replace(" not in after_slice[:300]:
+                if "WriteAllText" in after_slice and ".Replace(" not in after_slice[:300] and ".IndexOf(" not in after_slice[:300]:
                     _add_block(f_path, "", body, is_new=True)
             i += 1
             continue
@@ -222,7 +222,7 @@ def parse_patch_script(patch_text: str) -> Dict[str, Any]:
                 continue
 
         after_slice = patch_text[item["end"] : item["end"] + 800]
-        if "WriteAllText" in after_slice and ".Replace(" not in after_slice[:250]:
+        if "WriteAllText" in after_slice and ".Replace(" not in after_slice[:250] and ".IndexOf(" not in after_slice[:250]:
             _add_block(f_path, "", body, is_new=True)
         i += 1
 
@@ -763,18 +763,19 @@ def build_merged_patch(
                 ps_lines.append(f"$new_{f_idx}_{b_idx} = {OPEN_SQ}")
                 ps_lines.append(blk["new_text"])
                 ps_lines.append(CLOSE_SQ)
-                ps_lines.append(f"if (-not $content_{f_idx}.Contains($old_{f_idx}_{b_idx})) {{")
-                ps_lines.append(f"    $oldCrlf = ($old_{f_idx}_{b_idx} -replace \"`r?`n\", \"`r`n\")")
-                ps_lines.append(f"    $oldLf   = ($old_{f_idx}_{b_idx} -replace \"`r?`n\", \"`n\")")
-                ps_lines.append(f"    if ($content_{f_idx}.Contains($oldCrlf)) {{")
+                ps_lines.append(f"$idx = $content_{f_idx}.IndexOf($old_{f_idx}_{b_idx}, [System.StringComparison]::Ordinal)")
+                ps_lines.append("if ($idx -lt 0) {")
+                ps_lines.append(f"    $oldCrlf = $old_{f_idx}_{b_idx}.Replace(\"`r`n\", \"`n\").Replace(\"`n\", \"`r`n\")")
+                ps_lines.append(f"    $oldLf   = $old_{f_idx}_{b_idx}.Replace(\"`r`n\", \"`n\")")
+                ps_lines.append(f"    if ($content_{f_idx}.IndexOf($oldCrlf, [System.StringComparison]::Ordinal) -ge 0) {{")
                 ps_lines.append(f"        $old_{f_idx}_{b_idx} = $oldCrlf")
-                ps_lines.append(f"        $new_{f_idx}_{b_idx} = ($new_{f_idx}_{b_idx} -replace \"`r?`n\", \"`r`n\")")
-                ps_lines.append(f"    }} elseif ($content_{f_idx}.Contains($oldLf)) {{")
+                ps_lines.append(f"        $new_{f_idx}_{b_idx} = $new_{f_idx}_{b_idx}.Replace(\"`r`n\", \"`n\").Replace(\"`n\", \"`r`n\")")
+                ps_lines.append(f"    }} elseif ($content_{f_idx}.IndexOf($oldLf, [System.StringComparison]::Ordinal) -ge 0) {{")
                 ps_lines.append(f"        $old_{f_idx}_{b_idx} = $oldLf")
-                ps_lines.append(f"        $new_{f_idx}_{b_idx} = ($new_{f_idx}_{b_idx} -replace \"`r?`n\", \"`n\")")
+                ps_lines.append(f"        $new_{f_idx}_{b_idx} = $new_{f_idx}_{b_idx}.Replace(\"`r`n\", \"`n\")")
                 ps_lines.append("    }")
                 ps_lines.append("}")
-                ps_lines.append(f"if (-not $content_{f_idx}.Contains($old_{f_idx}_{b_idx})) {{")
+                ps_lines.append(f"if ($content_{f_idx}.IndexOf($old_{f_idx}_{b_idx}, [System.StringComparison]::Ordinal) -lt 0) {{")
                 ps_lines.append(
                     f"    throw \"Target block #{b_idx} not found in $relPath_{f_idx}. Aborting before any file is written.\""
                 )
@@ -784,6 +785,7 @@ def build_merged_patch(
     ps_lines.append("# --- PHASE 2: BACK UP, APPLY, AND VERIFY EVERY FILE ---")
     for f_idx, rel_file in enumerate(file_list, start=1):
         blocks = selected_per_file[rel_file]
+        new_file_blocks = [b for b in blocks if b["is_new_file"]]
         ps_lines.append(f"$relPath = $relPath_{f_idx}")
         ps_lines.append(f"$path = $path_{f_idx}")
         ps_lines.append("if (Test-Path -LiteralPath $path) {")
@@ -800,8 +802,6 @@ def build_merged_patch(
         ps_lines.append("}")
 
         if new_file_blocks:
-            # The whole file is written, so the accumulated content IS the new
-            # content. It must never be overwritten by a later block.
             ps_lines.append(f"$content = $content_{f_idx}")
             written_blocks = [1]
         else:
@@ -809,10 +809,15 @@ def build_merged_patch(
             for b_idx, blk in enumerate(blocks, start=1):
                 ps_lines.append(f"$oldTarget = $old_{f_idx}_{b_idx}")
                 ps_lines.append(f"$newReplacement = $new_{f_idx}_{b_idx}")
-                ps_lines.append("if (-not $content.Contains($oldTarget)) {")
+                ps_lines.append("$idx = $content.IndexOf($oldTarget, [System.StringComparison]::Ordinal)")
+                ps_lines.append("if ($idx -lt 0) {")
                 ps_lines.append("    throw \"Target block not found in $relPath. Aborting before any file is written.\"")
                 ps_lines.append("}")
-                ps_lines.append("$content = $content.Replace($oldTarget, $newReplacement)")
+                ps_lines.append("$sb = [System.Text.StringBuilder]::new($content.Length + $newReplacement.Length)")
+                ps_lines.append("[void]$sb.Append($content, 0, $idx)")
+                ps_lines.append("[void]$sb.Append($newReplacement)")
+                ps_lines.append("[void]$sb.Append($content, $idx + $oldTarget.Length, $content.Length - $idx - $oldTarget.Length)")
+                ps_lines.append("$content = $sb.ToString()")
             written_blocks = list(range(1, len(blocks) + 1))
 
         ps_lines.append("[System.IO.File]::WriteAllText($path, $content, $utf8NoBom)")
@@ -820,7 +825,7 @@ def build_merged_patch(
         ps_lines.append("$patchedCount++")
         ps_lines.append("$verifyContent = [System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8)")
         for b_idx in written_blocks:
-            ps_lines.append(f"if (-not $verifyContent.Contains($new_{f_idx}_{b_idx})) {{")
+            ps_lines.append(f"if ($verifyContent.IndexOf($new_{f_idx}_{b_idx}, [System.StringComparison]::Ordinal) -lt 0) {{")
             ps_lines.append("    Write-Host \"[FAILED VERIFY] $relPath\" -ForegroundColor Red")
             ps_lines.append("    exit 1")
             ps_lines.append("}")

@@ -42,20 +42,17 @@ Open the repository root (where `skills/argon-coding-bridge/SKILL.md` lives) or 
 
 ---
 
-## 🛠️ Key Capabilities
-
-1. **Smart Dependency & GitIgnore Filtering:**
+1. **Smart Dependency & GitIgnore Filtering (Up to 100 MB, Zero Code Compromise):**
    - Filters `node_modules`, `vendor`, `build`, `.gradle`, `Pods`, `.dart_tool`, `venv`, and binary media.
    - Strips private secrets (`.env*`, `*.pem`, `*.key`, `*credentials*.json`).
-   - Allows genuine large source code files up to 15 MB.
+   - Supports archives up to **100 MB** (`DEFAULT_MAX_ARCHIVE_MB = 100`, `DEFAULT_MAX_ARCHIVE_ENTRIES = 6000`) and always tries the maximum code size with no compromise on source code.
 
-2. **Zero-UI-Regression Guardrails:**
+2. **Zero-UI-Regression Guardrails & Linear Ordinal Patching:**
    - Enforces strict surgical editing so Gemini 4 Argon never wipes existing CSS, Tailwind styling, Flutter widgets, or HTML structures.
-   - Instructs Argon to output safe `$content.Replace()` calls that throw an error if the snippet is not found.
+   - Instructs Argon to output a two-phase PowerShell patch that validates every target block before writing any file and applies replacements in linear time using `[System.StringComparison]::Ordinal` `IndexOf` + `[System.Text.StringBuilder]` (never `.NET String.Replace` on large needles).
 
 3. **Single-Quoted Here-Strings & UTF-8 without BOM:**
    - Uses `@' ... '@` so PowerShell never mangles JavaScript/TypeScript `${variable}` template literals.
-   - Writes clean cross-platform UTF-8 files using `[System.Text.UTF8Encoding]::new($false)`.
 
 4. **Automated Backups & Rollback:**
    - `Apply-ArgonPatch.ps1` snapshots modified files to `.argon_backup/` before editing.
@@ -212,23 +209,13 @@ sharing a single Chrome `--user-data-dir` would cause the second launch to eithe
 
 ---
 
-## 🔁 Quota Rotation & Choosing the Next Account
+## 🔁 Account Pool Selection & Busy-Slot Rotation
 
-Google limits each account's Gemini usage on a rolling **3-4 hour window**. When that window is
-exhausted, Gemini shows a *limited* state (the Bangla marker is `সীমাবদ্ধ`) and never answers.
+The pool distributes concurrent tasks across configured Google Pro accounts while preserving conversation continuity:
 
-- **How the next account is chosen:** `main()` orders the pool in slot order (`/u/0/`, `/u/1/`, …)
-  starting from `--slot` (or the project's stored session slot in `~/.gemini/argon_sessions.json`,
-  falling back to `active_slot`) and wrapping around. Accounts that are not marked `quota_limited`
-  are tried first in wrap-around order, followed by `quota_limited` accounts as fallbacks in case
-  their rolling window has reset.
-- **Rotation on quota limit (exit code `5`):** When `_detect_quota_limit()` sees `সীমাবদ্ধ` or an
-  English quota marker, the dispatcher marks the slot `quota_limited` in
-  `skills/argon-coding-bridge/config/accounts_pool.json` and advances to the next account in the pool.
-- **Rotation on busy slot (exit code `7`):** When a slot is locked by another parallel run, the
-  dispatcher announces that the slot is busy and automatically advances to the next free slot in the
-  pool. If no slot in the pool is free, it reports `[!] Every account slot in the pool is currently busy.`
-  and exits with code `7`.
+- **Follow-up tasks:** Always use the account slot that owns the existing conversation in `~/.gemini/argon_sessions.json`, even when that slot already has multiple tasks running.
+- **New tasks:** `_pool_slots_in_order()` orders the pool in slot order (`/u/0/`, `/u/1/`, …) starting from `--slot` (or `active_slot`) and wrapping around. A new task skips a slot **only** when that slot is already running the maximum number of tasks (`MAX_TASKS_PER_SLOT = 2`).
+- **Rotation on busy slot (exit code `7`):** When a slot is busy on a new task, the dispatcher advances to the next available slot in the pool.
 - **`--max-accounts N`:** Caps how many pool accounts are tried in a single invocation (`0` = all).
 
 ```powershell
@@ -245,11 +232,12 @@ python .\skills\argon-coding-bridge\scripts\dispatch_argon.py `
 | `0` | Success (patch delivered and optionally applied) |
 | `1` | General failure or timeout waiting for patch |
 | `2` | Account not signed in |
-| `3` | Workspace pre-flight verification failed (prompt was not sent) |
+| `3` | Workspace pre-flight verification failed or Flash guard aborted send (prompt was not sent) |
 | `4` | Browser window was closed while waiting (`TargetClosedError`) |
-| `5` | Account usage limit reached (`quota_limited` / `সীমাবদ্ধ`) |
 | `6` | Browser failed to launch |
 | `7` | Requested slot (or every slot in the pool) is busy |
+| `8` | Local build/lint verification failed |
+| `9` | Task already running for this project/lane |
 
 ---
 

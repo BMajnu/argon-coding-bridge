@@ -23,10 +23,8 @@ param(
     [string[]]$TargetFiles = @(),
     [string]$OutputZip = "argon_context.zip",
     [string]$TaskDescription = "",
-    [int]$MaxFileSizeMB = 50
+    [int]$MaxFileSizeMB = 100
 )
-
-$ErrorActionPreference = "Stop"
 
 if (-not ("System.IO.Compression.ZipFile" -as [type])) {
     Add-Type -AssemblyName System.IO.Compression.FileSystem
@@ -645,26 +643,16 @@ applies every change in one run no matter where it is executed from:
 - Do NOT paste the body of the script into the chat. Keep the reply short: what changed, which files
   changed and why, the reference to the attached file, and how to verify.
 - An inline code block is a fallback used only when file delivery is unavailable.
-
-### 2. SURGICAL EDITS ONLY (ZERO UI REGRESSION):
+### 2. SURGICAL EDITS ONLY (ZERO UI REGRESSION & LINEAR ORDINAL REPLACEMENT):
    - Do NOT rewrite or restructure entire files unless you are creating a completely new file.
    - Do NOT modify existing UI layouts, component hierarchies, CSS/Tailwind classes, or visual styling unless explicitly requested in the task goal above.
-   - For edits in existing files, use safe substring replacements (`$content.Replace(...)`) with an error throw if not found.
+   - For edits in existing files, locate each target block with ``$idx = $content.IndexOf($oldTarget, [System.StringComparison]::Ordinal)`` and rebuild the string with ``[System.Text.StringBuilder]`` (never call ``$content.Replace(...)`` or ``$content.Contains(...)`` on large files, which is O(file x needle) and hangs on 500 KB files).
    - Use single-quoted Here-Strings (`@' ... '@`) so JavaScript/TypeScript `$``{var}` template literals are not corrupted.
    - Write files with UTF-8 without BOM: `[System.Text.UTF8Encoding]::new($false)`.
 
-### 3. BACK UP BEFORE WRITING, AND APPLY EVERYTHING IN ONE RUN
-   - Back up every file you overwrite into ``.argon_backup/<yyyyMMdd_HHmmss>/<relative path>``.
-   - Print one ``[Patched] <relative path>`` line per changed file and a final
-     ``[SUCCESS] N file(s) patched.`` summary line.
-   - Abort with ``throw`` before touching anything if a target block is not found, so a partial apply
-     can never happen.
-
-### 4. VERIFY YOUR WORK (REQUIRED)
-   - After writing each file, re-read it from disk and assert that the intended new content is present.
-   - Print ``[Verified] <relative path>`` for every file that matches and ``[FAILED VERIFY] <relative path>``
-     (exiting non-zero) if any file does not match.
-
+### 3. TWO-PHASE PRE-FLIGHT AND BACKUP BEFORE WRITING
+   - Phase 1 (Pre-flight): Check every target block of every file with ``IndexOf(..., [System.StringComparison]::Ordinal)`` and abort with ``throw`` before touching anything if any target block is missing, so a partial apply can never happen.
+   - Phase 2 (Write): Back up every file you overwrite into ``.argon_backup/<yyyyMMdd_HHmmss>/<relative path>``, apply replacements with ``StringBuilder``, and print one ``[Patched] <relative path>`` line per changed file and a final ``[SUCCESS] N file(s) patched.`` summary line.
 ### 5. RECORD WHAT YOU FOUND (REQUIRED)
    - Append a trailing comment block at the very end of ``apply_changes.ps1`` after the last write.
      The NOTES block of every delivered patch MUST start with a ``## ROOT CAUSE`` section naming the

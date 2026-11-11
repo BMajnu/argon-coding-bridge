@@ -17,14 +17,14 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 PROGRESS_DESCRIPTIONS = {
-    "none": "Nothing was sent yet. The browser or pre-flight stopped before attaching context.",
-    "zip_attached": "The context archive (ZIP) is attached in the composer.",
-    "prompt_pasted": "The prompt text is in the composer.",
-    "prompt_sent": "The prompt was submitted to Gemini.",
+    "none": "Manual hand-off pack prepared upfront before send (prompt and ZIP ready for manual or automated send).",
+    "prompt_pasted": "The model was verified as 4 Argon and the prompt text is pasted in the composer.",
+    "zip_attached": "The prompt is in the composer and the context archive (ZIP) upload has completed.",
+    "prompt_sent": "The prompt and context archive were submitted to Gemini 4 Argon.",
     "verified": "The prompt was verified to have landed in the conversation.",
 }
 
-PROGRESS_ORDER = ("none", "zip_attached", "prompt_pasted", "prompt_sent", "verified")
+PROGRESS_ORDER = ("none", "prompt_pasted", "zip_attached", "prompt_sent", "verified")
 
 
 def format_progress_in_words(progress: str) -> str:
@@ -37,23 +37,24 @@ def compute_missing_actions(send_progress: str, zip_path: Path, prompt_path: Pat
     if p == "none":
         return [
             f"1. Open the conversation link in Google Chrome ({chat_url}).",
-            "2. Verify Task mode is active and '4 Argon (Complex tasks)' model is selected.",
-            f"3. Attach the context archive: {zip_path.resolve()}",
-            f"4. Copy the full prompt from {prompt_path.resolve()} and paste into the composer.",
-            "5. Submit the prompt (press Enter / Control+Enter or click the Send button).",
+            "2. Verify Task mode is active and '4 Argon (Complex tasks)' model is selected (never Flash).",
+            f"3. Copy the full prompt from {prompt_path.resolve()} and paste into the composer.",
+            f"4. Attach the context archive: {zip_path.resolve()}",
+            "5. The moment the upload spinner finishes, click the Send button immediately.",
             "6. Wait for Argon to generate apply_changes.ps1 and download it via the toolbar Download button.",
-        ]
-    elif p == "zip_attached":
-        return [
-            f"1. Open the conversation link in Google Chrome ({chat_url}).",
-            f"2. Context ZIP is already attached. Copy the prompt from {prompt_path.resolve()} and paste into composer.",
-            "3. Submit the prompt (press Enter / Control+Enter or click Send).",
-            "4. Wait for Argon to generate apply_changes.ps1 and download it via toolbar.",
         ]
     elif p == "prompt_pasted":
         return [
-            f"1. Focus the composer in Chrome ({chat_url}) where the ZIP is attached and prompt is pasted.",
-            "2. Click the Send button or press Enter / Control+Enter.",
+            f"1. Open the conversation link in Google Chrome ({chat_url}) where the prompt is already pasted.",
+            "2. Confirm the model chip still reads '4 Argon' (never Flash).",
+            f"3. Attach the context archive: {zip_path.resolve()}",
+            "4. The moment the upload finishes, click the Send button immediately.",
+            "5. Wait for Argon to generate apply_changes.ps1 and download it via toolbar.",
+        ]
+    elif p == "zip_attached":
+        return [
+            f"1. Focus the composer in Chrome ({chat_url}) where the prompt is pasted and the ZIP upload has finished.",
+            "2. Confirm the model chip reads '4 Argon' (never Flash) and click the Send button immediately.",
             "3. Wait for Argon to generate apply_changes.ps1 and download it via toolbar.",
         ]
     elif p == "prompt_sent":
@@ -67,7 +68,6 @@ def compute_missing_actions(send_progress: str, zip_path: Path, prompt_path: Pat
             f"1. Prompt was already verified in the conversation ({chat_url}).",
             "2. Wait for the generated apply_changes.ps1 download or run with --resume.",
         ]
-
 
 def compute_manual_commands(
     proj_root: Path,

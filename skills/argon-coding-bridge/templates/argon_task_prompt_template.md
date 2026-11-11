@@ -94,8 +94,8 @@ The delivered `apply_changes.ps1` is a single, self-contained PowerShell script 
    Copy-Item -LiteralPath $path -Destination $backupDest -Force
    ```
 
-3. **EXACT SUBSTRING REPLACEMENT (NO FULL-FILE REWRITE):**
-   For modifications inside existing files, use safe exact substring replacements and throw an error if the snippet is not found:
+3. **LINEAR ORDINAL SUBSTRING REPLACEMENT (NEVER `.Replace` OR `.Contains` ON LARGE NEEDLES):**
+   On Windows PowerShell 5.1 (.NET Framework), `String.Replace(String, String)` and `String.Contains(String)` are `O(file x needle)`: on a 500 KB file with multi-kilobyte needles, a 55-block patch hung for **25 minutes** (CPU 501 s, 485 MB RAM) before being killed, whereas linear ordinal search + `StringBuilder` applies the same 55 blocks in **0.0 seconds**. With 100 MB archives and full-codebase context, files and needles are large, so you MUST use `[System.StringComparison]::Ordinal` index search + `[System.Text.StringBuilder]` and separate the script into two loops (Phase 1 pre-flight check loop across ALL files before any write, then Phase 2 backup + write + verify loop):
 
    ```powershell
    $relPath = 'src/path/to/file.ext'
@@ -107,19 +107,26 @@ The delivered `apply_changes.ps1` is a single, self-contained PowerShell script 
    $newReplacement = @'
    // Updated replacement lines
    '@
-   if (-not $content.Contains($oldTarget)) {
+   $idx = $content.IndexOf($oldTarget, [System.StringComparison]::Ordinal)
+   if ($idx -lt 0) {
        throw "Target block not found in $relPath. Aborting before any file is written."
    }
    ```
 
-4. **VALIDATE FIRST, APPLY AFTER (A PARTIAL APPLY MUST NEVER HAPPEN):**
-   Abort with `throw` BEFORE touching anything if a target block is not found. Read and verify EVERY target block first; only after all of them are confirmed do you start writing files. A failed check must leave the project untouched.
+4. **VALIDATE FIRST, APPLY AFTER (TWO SEPARATE LOOPS — A PARTIAL APPLY MUST NEVER HAPPEN):**
+    Phase 1 MUST read every target file and check EVERY `$oldTarget` block of EVERY file using `$content.IndexOf($oldTarget, [System.StringComparison]::Ordinal)` BEFORE the first file is backed up or written. A missing target aborts with `throw` while the project on disk is still 100% untouched (never check-and-write inside a single per-file loop).
 
-5. **WRITE + REPORT PER FILE:**
-   Write the patched content back with UTF-8 without BOM, then print exactly one progress line per changed file:
+5. **WRITE + REPORT PER FILE (LINEAR `StringBuilder` REBUILD):**
+   In Phase 2, after all pre-flight checks have passed and the file has been backed up to `.argon_backup/<yyyyMMdd_HHmmss>/<relPath>`, replace each target block in linear time and write UTF-8 without BOM:
 
    ```powershell
-   $content = $content.Replace($oldTarget, $newReplacement)
+   $idx = $content.IndexOf($oldTarget, [System.StringComparison]::Ordinal)
+   if ($idx -lt 0) { throw "Target block not found in $relPath. Aborting before any file is written." }
+   $sb = [System.Text.StringBuilder]::new($content.Length + $newReplacement.Length)
+   [void]$sb.Append($content, 0, $idx)
+   [void]$sb.Append($newReplacement)
+   [void]$sb.Append($content, $idx + $oldTarget.Length, $content.Length - $idx - $oldTarget.Length)
+   $content = $sb.ToString()
    [System.IO.File]::WriteAllText($path, $content, $utf8NoBom)
    Write-Host "[Patched] $relPath" -ForegroundColor Green
    ```
@@ -140,8 +147,7 @@ The delivered `apply_changes.ps1` is a single, self-contained PowerShell script 
 
 ### ✅ VERIFY YOUR WORK (REQUIRED)
 The patch is applied by RUNNING your script, so the script must prove that it worked:
-1. After writing each file, re-read it from disk and assert that the new content is really
-   there.
+1. After writing each file, re-read it from disk (`$verify = [System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8)`) and assert with `$verify.IndexOf($newReplacement, [System.StringComparison]::Ordinal) -ge 0` that the new content is really there.
 2. Print `[Verified] <relative path>` for every file that now matches, and
    `[FAILED VERIFY] <relative path>` for every file that does not.
 3. If any verification fails, exit with a non-zero code so the run is reported as failed.

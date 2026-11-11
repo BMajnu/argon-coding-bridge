@@ -13,9 +13,9 @@ Workflow:
    Gemini Web is the ONLY workspace: Google AI Studio was removed because it
    consistently fails on agentic work.
 5. Verifies an account is signed in (if not, directs the user to login_pool_accounts.py),
-   rotates across pool accounts if quota is exhausted, uploads argon_context.zip, submits
-   the prompt, extracts the returned PowerShell patch (apply_changes.ps1), and optionally
-   applies it automatically.
+   rotates across pool accounts when a slot is busy, selects the 4 Argon model, pastes the
+   prompt, attaches argon_context.zip, clicks send the moment the upload finishes, extracts
+   the returned PowerShell patch (apply_changes.ps1), and optionally applies it automatically.
 
 Pre-flight gate (the important part):
    The workspace is configured and VERIFIED before anything is sent -
@@ -72,7 +72,15 @@ SESSION_STORE_PATH = Path.home() / ".gemini" / "argon_sessions.json"
 
 # Per-project task state: which conversation the current task is in and how far
 # it got, so a run can be resumed after the browser was closed.
-TASK_STATE_PATH = Path.home() / ".gemini" / "argon_task_state.json"
+#
+# The state file is keyed by the project root only, so two agents that work on the same
+# repository SHARE it: the second run inherits the first run's chat id and lane records,
+# and the two runs then close each other's slot browsers. Set ARGON_TASK_STATE_PATH to
+# give a run its own state file when it must run beside another one on the same project.
+TASK_STATE_PATH = Path(
+    os.environ.get("ARGON_TASK_STATE_PATH")
+    or (Path.home() / ".gemini" / "argon_task_state.json")
+)
 TASK_REGISTRY_PATH = Path.home() / ".gemini" / "argon_tasks.json"
 DELIVERY_LEDGER_PATH = Path.home() / ".gemini" / "argon_delivery_ledger.json"
 TASK_STATE_VERSION = "1.1.0"
@@ -87,7 +95,6 @@ MAX_TASKS_PER_SLOT = 2
 #   2 = not signed in
 #   3 = pre-flight failed
 #   4 = browser closed
-#   5 = usage limit reached (quota_limited)
 #   6 = browser launch failed
 #   7 = slot busy
 #   8 = build/lint verification failed after all verification rounds
@@ -97,7 +104,6 @@ EXIT_FAILURE = 1
 EXIT_NOT_SIGNED_IN = 2
 EXIT_PREFLIGHT_FAILED = 3
 EXIT_BROWSER_CLOSED = 4
-EXIT_QUOTA_LIMITED = 5
 EXIT_BROWSER_LAUNCH_FAILED = 6
 EXIT_SLOT_BUSY = 7
 EXIT_BUILD_FAILED = 8
@@ -953,7 +959,7 @@ def verify_written_files_structure(
 
     That means the patch dropped or added a brace - the exact defect that made
     a delivered Rust patch fail to compile. It is reported here so the agent
-    can fix it locally; it costs no quota.
+    can fix it locally without another round trip.
     """
     issues: List[Dict[str, Any]] = []
     after_files = _snapshot_project_files(project_path)
@@ -1044,7 +1050,7 @@ def apply_delivered_patch(project_path: Path, patch_path: Path) -> bool:
     if structure_issues:
         print(
             "[!] The patch broke the structure of a file - a brace, parenthesis or "
-            "bracket was lost. Nothing was rolled back; fix it locally (it costs no quota):",
+            "bracket was lost. Nothing was rolled back; fix it locally:",
             file=sys.stderr,
         )
         for issue in structure_issues:
@@ -2567,13 +2573,12 @@ def _looks_like_patch(candidate: str) -> _PatchCheckResult:
         return _PatchCheckResult(False, "missing $TargetRoot = '<absolute-path>' assignment")
     if not any(
         k in candidate
-        for k in ("WriteAllText", "Set-Content", "Copy-Item", "Write-Host", ".Replace(")
+        for k in ("WriteAllText", "Set-Content", "Copy-Item", "Write-Host", ".Replace(", ".IndexOf(", "StringBuilder")
     ):
         return _PatchCheckResult(
             False,
-            "missing PowerShell patch operations (WriteAllText, Set-Content, Copy-Item, Write-Host, .Replace)",
+            "missing PowerShell patch operations (WriteAllText, Set-Content, Copy-Item, Write-Host, .IndexOf, StringBuilder, .Replace)",
         )
-
     _, _, outside_herestrings = _parse_herestring_blocks(candidate)
     for line_no, raw in enumerate(outside_herestrings.splitlines(), 1):
         s = raw.strip()
@@ -3572,7 +3577,6 @@ class TaskState:
                     if other_st in ("sent", "waiting", "delivered", "applied") and new_state in (
                         "preflight_failed",
                         "not_signed_in",
-                        "quota_limited",
                         "failed",
                     ):
                         sibling_protected = True
@@ -4413,57 +4417,13 @@ RE_DOWNLOAD = re.compile(
 RE_THINK_HIGH = re.compile(r"(^|\b)(high|উচ্চ|হাই)(\b|$)", re.IGNORECASE)
 RE_PLUS = re.compile(r"^\s*\+\s*$")
 RE_THINKING = re.compile(r"(thinking|চিন্তা|reasoning)", re.IGNORECASE)
-
-# Gemini shows a "limited" state when the signed-in account reaches its usage
-# window (the 3-4 hour limit). The dispatcher must then move on to the next
-# pool account instead of waiting for an answer that will never come.
-QUOTA_MARKERS = (
-    "সীমাবদ্ধ",
-    "siecabddh",
-    "you've reached your limit",
-    "you have reached your limit",
-    "reached the limit",
-    "too many requests",
-    "rate limit",
-    "quota exceeded",
-    "upgrade to pro",
-    "upgrade to google ai",
-    "temporarily unavailable",
+RE_FLASH = re.compile(
+    r"(?:^|\b)(?:3\.8\s*flash|2\.5\s*flash|2\.0\s*flash|gemini[\s\-_]*flash|flash|ফ্ল্যাশ)(?:\b|$)",
+    re.IGNORECASE,
 )
 
-
-def _detect_quota_limit(page) -> Optional[str]:
-    """Return a description when the account has hit its usage limit."""
-    try:
-        text = page.locator("body").inner_text(timeout=5000) or ""
-    except Exception:
-        text = ""
-    low = text.lower()
-    for marker in QUOTA_MARKERS:
-        if marker.lower() in low:
-            return marker
-    # The model picker marks a limited model entry.
-    try:
-        limited = page.evaluate(
-            """() => {
-                const out = [];
-                document.querySelectorAll("[role=menuitem],[role=option],mat-option,li")
-                  .forEach(e => {
-                    if (!(e.offsetWidth || e.offsetHeight)) return;
-                    const t = (e.innerText || '').trim();
-                    if (t && t.length < 40 && /(limited|সীমাবদ্ধ)/i.test(t)) out.push(t);
-                  });
-                return out.slice(0, 3);
-            }"""
-        )
-        if limited:
-            return limited[0]
-    except Exception:
-        pass
-    return None
 # The Material segmented control marks the active segment on its PARENT.
 RE_SEGMENT_SELECTED = re.compile(r"gem-segmented-button-selected", re.IGNORECASE)
-
 
 def _click_matching(page, pattern, prefer_menu: bool = True) -> bool:
     """Click the first visible element whose text matches `pattern`.
@@ -4768,7 +4728,7 @@ def _model_name(el) -> str:
 
 
 def _chip_is_argon(el) -> bool:
-    """True when this chip shows the Argon model.
+    """True when this chip shows the Argon model and NEVER Flash (Rule 6).
 
     Only the chip's OWN model name counts. A chip that says "Flash" is not
     Argon, no matter what else the page says.
@@ -4778,7 +4738,19 @@ def _chip_is_argon(el) -> bool:
     name = _model_name(el)
     if not name:
         return False
+    if RE_FLASH.search(name):
+        return False
     return bool(RE_ARGON.search(name))
+
+
+def _chip_is_flash(el) -> bool:
+    """True when the model chip shows a Flash model (Rule 6 hard guard)."""
+    if el is None:
+        return False
+    name = _model_name(el)
+    if not name:
+        return False
+    return bool(RE_FLASH.search(name))
 
 
 def _argon_visible(page) -> bool:
@@ -4791,16 +4763,13 @@ def _argon_visible(page) -> bool:
     positive sent real tasks to Flash, so it must not happen again.
 
     Therefore:
-      1. the chip has to name Argon, or
+      1. the chip has to name Argon (and not Flash), or
       2. the open picker has to have Argon as the CHECKED entry.
     """
-    # 1. The model chip - the ground truth.
     chip = _model_chip(page)
     if chip is not None and _chip_is_argon(chip):
         return True
 
-    # 2. A selected option that names Argon (the picker is open and Argon is
-    #    the checked entry).
     try:
         opts = page.locator(
             "[role='option'][aria-selected='true'], [role='menuitem'][aria-checked='true'], "
@@ -4811,65 +4780,14 @@ def _argon_visible(page) -> bool:
             if not _safe_visible(el):
                 continue
             try:
-                if RE_ARGON.search(el.inner_text(timeout=400) or ""):
+                txt = el.inner_text(timeout=400) or ""
+                if RE_ARGON.search(txt) and not RE_FLASH.search(txt):
                     return True
             except Exception:
                 continue
     except Exception:
         pass
 
-    # 3. REMOVED on purpose: "any visible Argon text" used to be accepted here.
-    #    That is exactly what sent tasks to Flash - the OPEN model picker shows
-    #    "4 Argon" as a line even while "3.8 Flash" is the checked model, and a
-    #    chat history entry can read "Argon ..." as well. The chip (1) and the
-    #    checked picker entry (2) are the only trustworthy signals.
-    return False
-
-
-def select_task_mode(page, require_verifiable: bool = False,
-                     wait_for_toggle_seconds: float = 30.0) -> bool:
-    """Switch Gemini Web into Task mode. Returns True only when verifiable.
-
-    On an EXISTING conversation there is no Chat/Task toggle at all: the chat
-    already runs in the mode it was created with, so there is nothing to switch
-    and the inherited mode is accepted.
-
-    On a BRAND-NEW chat there is NO inherited mode, so "the toggle is not
-    there" must never be accepted as "Task mode": the toggle can simply not
-    have rendered yet. MEASURED 2026-11-04: the owner kept getting prompts
-    that went to Chat mode because this function returned True without ever
-    proving the mode. With `require_verifiable=True` the toggle is WAITED for
-    (bounded) and the run FAILS LOUDLY when the mode cannot be proven.
-    """
-    waited = 0.0
-    while True:
-        state = _select_task_mode_once(page)
-        if state is True:
-            return True
-        if state is None:
-            # The toggle is not on the page at all. On a continuation the chat
-            # keeps the mode it was created with. On a NEW chat the mode must
-            # be proven, so we wait for the toggle to render.
-            if not require_verifiable:
-                print("[+] No Chat/Task toggle on this page - the conversation keeps its mode.")
-                return True
-            if waited >= max(0.0, float(wait_for_toggle_seconds)):
-                break
-            waited += 3.0
-            try:
-                page.wait_for_timeout(3000)
-            except Exception:
-                time.sleep(3.0)
-            continue
-        # The toggle IS there but Task mode could not be confirmed.
-        return False
-    if require_verifiable:
-        print(
-            "[!] The Chat/Task toggle never appeared, so Task mode could NOT be "
-            "verified on a NEW chat. Refusing to send - a prompt sent in Chat "
-            "mode cannot do the work.",
-            file=sys.stderr,
-        )
     return False
 
 
@@ -5007,7 +4925,7 @@ def _inspect_option_in_picker(page, pattern) -> str:
       - 'clicked'  : a matching enabled option was found and clicked.
       - 'disabled' : a matching option was present in the picker, but disabled
                      (aria-disabled='true' or disabled attribute) - meaning the
-                     account has no Argon quota/tier available right now.
+                     account has no Argon tier available right now.
       - 'missing'  : no matching option was found in the picker at all (meaning
                      the picker did not open).
     """
@@ -5050,12 +4968,7 @@ def _inspect_option_in_picker(page, pattern) -> str:
 
 
 def _click_option_in_picker(page, pattern) -> bool:
-    """Click a matching option INSIDE the open picker.
-
-    The sidebar chat history can also contain the text "4 Argon" (an old chat
-    title). Clicking that would navigate away from the composer, so a global
-    text match is only allowed when it really sits inside a listbox / menu.
-    """
+    """Click a matching option INSIDE the open picker."""
     return _inspect_option_in_picker(page, pattern) == "clicked"
 
 
@@ -5063,136 +4976,6 @@ def _argon_picker_is_disabled(page) -> bool:
     """Return True when the most recent model check saw '4 Argon' present but disabled."""
     info = _LAST_PICKER_ARGON_STATE.get(id(page)) or {}
     return bool(info.get("disabled"))
-
-
-def ensure_argon_model(page, attempts: int = 3, wait_for_chip_seconds: float = 45.0,
-                       require_chip: bool = True) -> bool:
-    """THE double check: the model must be 4 Argon before anything is sent.
-
-    Sending a task to Flash is the single worst failure this bridge can have -
-    the work is lost and the quota is wasted. So the model is verified against
-    the CHIP, which shows the model that will really answer, and not against
-    loose text on the page.
-
-    Distinguishes a disabled '4 Argon' option (aria-disabled='true' / disabled,
-    meaning this account has no Argon available right now and the bridge must
-    rotate to the next pool account) from a missing option (meaning the picker
-    did not open).
-
-    MEASURED 2026-11-04: the chip is rendered by the page itself, so right
-    after a load it can simply be NOT THERE YET. That is not a failed check -
-    the run must WAIT for it (bounded by `wait_for_chip_seconds`) instead of
-    aborting a healthy account. Before this, a lane died in pre-flight with
-    "model = 4 Argon : FAILED, model chip: (not visible)" while the screenshot
-    showed a perfectly working, signed-in Gemini page.
-
-    Returns True only when the chip reads Argon.
-    """
-    _LAST_PICKER_ARGON_STATE.pop(id(page), None)
-    last_seen = ""
-    last_picker_state = "missing"
-    waited = 0.0
-    attempt = 0
-    while True:
-        chip = _model_chip(page)
-        if chip is None:
-            if not require_chip:
-                # MEASURED 2026-11-04: on an EXISTING conversation the model
-                # switcher is not rendered at all - the composer reads
-                # "Ask a follow-up" and there is no chip. The chat keeps the
-                # model it was created with, so a missing chip is NOT a
-                # failure; treating it as one aborted a healthy follow-up.
-                print(
-                    "[+] No model chip on this conversation - it keeps the model "
-                    "it was created with (verified when the chat was started).",
-                    file=sys.stderr,
-                )
-                return True
-            # The chip has not rendered yet. Wait for it - but only for a
-            # bounded time, and only when it is really absent.
-            if waited >= max(0.0, float(wait_for_chip_seconds)):
-                break
-            waited += 3.0
-            try:
-                page.wait_for_timeout(3000)
-            except Exception:
-                time.sleep(3.0)
-            continue
-        if attempt >= max(1, attempts):
-            break
-        attempt += 1
-        name = _model_name(chip)
-        if name:
-            last_seen = name
-        if _chip_is_argon(chip):
-            if attempt > 1:
-                print(f"[+] Model switched to Argon ({name!r}).")
-            return True
-        # Not Argon (or no chip at all): open the picker and pick it.
-        if chip is not None:
-            try:
-                chip.click(timeout=4000)
-                page.wait_for_timeout(1200)
-            except Exception:
-                pass
-        picker_state = _inspect_option_in_picker(page, RE_ARGON)
-        last_picker_state = picker_state
-        try:
-            page.wait_for_timeout(1400)
-        except Exception:
-            time.sleep(1.4)
-        # Close the picker again - an open picker must never be left behind,
-        # and its menu text must not be mistaken for the selected model.
-        try:
-            page.keyboard.press("Escape")
-            page.wait_for_timeout(500)
-        except Exception:
-            pass
-        if picker_state == "disabled":
-            acct = _detect_signed_in_account(page)
-            _LAST_PICKER_ARGON_STATE[id(page)] = {
-                "disabled": True,
-                "account": acct,
-                "chip": last_seen,
-            }
-            print(
-                f"[!] The '4 Argon' option is present in the model picker but DISABLED "
-                f"(aria-disabled) on account {acct}: this account has no Argon available right now.",
-                file=sys.stderr,
-            )
-            return False
-        chip2 = _model_chip(page)
-        if chip2 is not None:
-            name2 = _model_name(chip2)
-            if name2:
-                last_seen = name2
-            if _chip_is_argon(chip2):
-                print(f"[+] Model switched to Argon ({name2!r}).")
-                return True
-    if last_picker_state == "missing":
-        print(
-            f"[!] The '4 Argon' option was not found in the model picker (the picker may not "
-            f"have opened) and the model chip reads {last_seen!r} - refusing to send.",
-            file=sys.stderr,
-        )
-    else:
-        print(
-            f"[!] The model chip reads {last_seen!r} and not 4 Argon - refusing to send.",
-            file=sys.stderr,
-        )
-    return False
-
-
-def select_argon_model(page, require_chip: bool = True) -> bool:
-    """Select the 4 Argon model. Returns True only when verifiable.
-
-    The verification is delegated to `ensure_argon_model`, so the pre-flight
-    and the gate right before the send use exactly the same rule.
-
-    `require_chip=False` is for a CONTINUATION: such a conversation has no
-    model switcher at all, so the model is inherited from the chat.
-    """
-    return ensure_argon_model(page, require_chip=require_chip)
 
 
 def _picker_open(page) -> bool:
@@ -5241,17 +5024,7 @@ def select_task_mode(
     wait_for_toggle_seconds: float = 30.0,
     recorded_workspace_mode: Optional[str] = None,
 ) -> bool:
-    """Switch Gemini Web into Task mode and verify it (E2).
-
-    Rules (E2.1 - E2.4):
-      - On a NEW chat, the Chat/Task toggle must be present, switched to Task,
-        and observed in Task mode before any prompt is sent.
-      - On a CONTINUATION, if the toggle is visible and shows Task, Task mode is
-        observed directly. If the toggle is absent, Task mode is accepted ONLY
-        when the conversation's recorded `workspace_mode` in SessionStore is
-        `'task'`. If the recorded mode is `'unknown'` or `'chat'`, reports
-        `mode = Task : UNKNOWN` and returns False (never claims `mode = Task : OK`).
-    """
+    """Switch Gemini Web into Task mode and verify it (E2)."""
     if require_verifiable is None:
         is_cont = bool(getattr(page, "_argon_is_continuation", False))
         require_verifiable = not is_cont
@@ -5347,23 +5120,25 @@ def ensure_argon_model(
     require_chip: Optional[bool] = None,
     wait_for_chip_seconds: float = 45.0,
 ) -> bool:
-    """Verify 4 Argon model: waits for chip on half-rendered pages (D8.2) and inherits on continuation when chip is absent (D11)."""
-    if require_chip is None:
-        is_cont = bool(getattr(page, "_argon_is_continuation", False))
-        require_chip = not is_cont
+    """Hard Flash Guard & 4 Argon model selector (Rule 6).
 
+    Because the model chip reverts to the account default (often 'Flash') AFTER a
+    message is sent, both a NEW chat and a FOLLOW-UP in an existing chat must check
+    the model chip before every send. If the chip shows Flash or any non-Argon model,
+    this function selects '4 Argon' again; if the chip is still not Argon (or if
+    Flash remains active), it returns False so the send is aborted immediately.
+    """
     _LAST_PICKER_ARGON_STATE.pop(id(page), None)
     last_seen = ""
     last_picker_state = "missing"
 
-    # D8.2: When the chip is absent right after page load, wait boundedly for it to render.
-    chip_wait = float(wait_for_chip_seconds) if require_chip else min(8.0, float(wait_for_chip_seconds))
+    is_cont = bool(getattr(page, "_argon_is_continuation", False))
+    if require_chip is None:
+        require_chip = True
+
+    chip_wait = float(wait_for_chip_seconds) if not is_cont else min(12.0, float(wait_for_chip_seconds))
     initial_chip = _wait_for_model_chip(page, timeout=chip_wait)
-    if initial_chip is None and not require_chip:
-        print(
-            "[+] Model = 4 Argon : INHERITED from existing conversation "
-            "(no model switcher chip rendered on continuation chat)."
-        )
+    if initial_chip is None and not require_chip and not is_cont:
         return True
 
     for attempt in range(max(1, attempts)):
@@ -5378,6 +5153,11 @@ def ensure_argon_model(
                 if attempt:
                     print(f"[+] Model switched to Argon ({name!r}).")
                 return True
+            if _chip_is_flash(chip):
+                print(
+                    f"[!] Flash model detected on chip ({name!r}) - switching to 4 Argon (attempt {attempt + 1}/{max(1, attempts)})...",
+                    file=sys.stderr,
+                )
             try:
                 chip.click(timeout=4000)
                 page.wait_for_timeout(1200)
@@ -5420,9 +5200,13 @@ def ensure_argon_model(
                 print(f"[+] Model switched to Argon ({name2!r}).")
                 return True
 
-    if not last_seen and not require_chip:
-        print("[+] Model = 4 Argon : INHERITED from existing conversation.")
-        return True
+    if last_seen and RE_FLASH.search(last_seen):
+        print(
+            f"[ERROR] FLASH GUARD ABORT: model chip still reads {last_seen!r} after {max(1, attempts)} attempt(s). "
+            "A task must NEVER be sent on Flash - aborting send.",
+            file=sys.stderr,
+        )
+        return False
     if last_picker_state == "missing":
         print(
             f"[!] The '4 Argon' option was not found in the model picker "
@@ -5450,13 +5234,37 @@ def select_argon_model(
     )
 
 
+def enforce_no_flash_before_send(page) -> bool:
+    """Hard safety guard executed immediately before clicking Send (Rule 6).
+
+    Reads the model chip; if it is not 4 Argon (for example, if the chat reverted
+    to Flash on a follow-up or after upload), selects 4 Argon again. If the model
+    is still not 4 Argon, returns False so the caller aborts the send immediately.
+    """
+    chip = _model_chip(page)
+    if chip is not None and _chip_is_argon(chip):
+        return True
+    if ensure_argon_model(page, attempts=3, require_chip=True, wait_for_chip_seconds=15.0):
+        chip_after = _model_chip(page)
+        if chip_after is not None and _chip_is_argon(chip_after):
+            return True
+    chip_now = _model_chip(page)
+    chip_name = _model_name(chip_now) if chip_now is not None else "(not visible)"
+    print(
+        f"[ERROR] HARD FLASH GUARD TRIGGERED: model chip reads {chip_name!r} (not 4 Argon). "
+        "Aborting send - a task must never go out on Flash.",
+        file=sys.stderr,
+    )
+    return False
+
+
 def _inspect_zip_archive(zip_path: Path) -> tuple[bool, int, int, str]:
-    """Verify that `zip_path` exists, is non-empty, opens as a valid zip, contains readable TASK_BRIEF.md and API_INDEX.md, and has no binary poison (E1, D14, D15).
+    """Verify that `zip_path` exists, is non-empty, opens as a valid zip, contains readable TASK_BRIEF.md and API_INDEX.md, and has no binary poison (E1, D14, D15, Rule 4).
 
     Returns (ok, size_bytes, entry_count, error_reason).
     """
     import zipfile as _zf
-    from package_context import DEFAULT_EXCLUDED_EXTS as _BIN_EXTS
+    from package_context import DEFAULT_EXCLUDED_EXTS as _BIN_EXTS, DEFAULT_MAX_ARCHIVE_MB as _MAX_ARCH_MB
 
     zp = Path(zip_path)
     if not zp.is_file():
@@ -5467,6 +5275,14 @@ def _inspect_zip_archive(zip_path: Path) -> tuple[bool, int, int, str]:
         return False, 0, 0, f"could not stat archive {zp}: {exc}"
     if sz <= 0:
         return False, 0, 0, f"archive {zp.name} is 0 bytes (empty)"
+    max_allowed_bytes = int(_MAX_ARCH_MB) * 1024 * 1024
+    if sz > max_allowed_bytes:
+        return (
+            False,
+            sz,
+            0,
+            f"archive {zp.name} ({sz} bytes) exceeds the {_MAX_ARCH_MB} MB hard limit ({max_allowed_bytes} bytes)",
+        )
     try:
         with _zf.ZipFile(zp, "r") as zf:
             members = zf.namelist()
@@ -5502,7 +5318,7 @@ def _inspect_zip_archive(zip_path: Path) -> tuple[bool, int, int, str]:
 
 
 def _attachment_present(page, zip_path: Path) -> bool:
-    """Verify the composer carries the valid archive with matching byte size and TASK_BRIEF.md (D14)."""
+    """Verify the composer carries the valid archive with matching byte size and TASK_BRIEF.md (D14, Section 1.3b)."""
     ok_zip, disk_size, member_count, err_reason = _inspect_zip_archive(Path(zip_path))
     if not ok_zip:
         print(f"[ERROR] Attachment check failed on disk: {err_reason}", file=sys.stderr)
@@ -5542,10 +5358,19 @@ def _attachment_present(page, zip_path: Path) -> bool:
 
     chip_visible = False
     try:
-        chip = page.get_by_text(re.compile(re.escape(Path(zip_path).name), re.IGNORECASE))
-        for i in range(min(chip.count(), 5)):
-            if _safe_visible(chip.nth(i)):
-                chip_visible = True
+        # Gemini renders the attachment chip with the file name WITHOUT its extension
+        # ("argon_context_r22" for argon_context_r22.zip), and once the upload finished it
+        # also clears the file input. So the name has to be matched on the stem as well,
+        # otherwise a perfectly attached archive is reported as missing.
+        for candidate in (Path(zip_path).name, Path(zip_path).stem):
+            if not candidate:
+                continue
+            chip = page.get_by_text(re.compile(re.escape(candidate), re.IGNORECASE))
+            for i in range(min(chip.count(), 5)):
+                if _safe_visible(chip.nth(i)):
+                    chip_visible = True
+                    break
+            if chip_visible:
                 break
     except Exception:
         pass
@@ -5554,17 +5379,7 @@ def _attachment_present(page, zip_path: Path) -> bool:
 
 
 def _open_upload_menu(page) -> bool:
-    """Open the composer's upload-and-tools menu (the '+' button).
-
-    The hidden `input[type=file]` does NOT exist until this menu is open, so
-    the menu has to be opened before the file can be attached.
-
-    The button is looked for inside the REAL composer first - the container
-    that holds the prompt box - and the bottom-most match wins. A loaded
-    conversation can render a floating quick-action bar in the middle of the
-    page with its own '+' button, and clicking THAT one is what made the
-    cursor jump into the conversation and opened the wrong menu.
-    """
+    """Open the composer's upload-and-tools menu (the '+' button)."""
     roots = []
     comp = _find_composer(page)
     if comp is not None:
@@ -5637,11 +5452,7 @@ def _zip_input(page):
 
 
 def _verify_zip_has_no_credentials(zip_path: Path) -> bool:
-    """Verify that a context archive is readable, contains TASK_BRIEF.md, and has no credentials (D14, D15).
-
-    Never swallows a corrupt/truncated archive error: any unreadable or empty zip
-    is refused loudly before upload.
-    """
+    """Verify that a context archive is readable, contains TASK_BRIEF.md, and has no credentials (D14, D15)."""
     zp = Path(zip_path)
     ok_zip, sz, entry_count, err_reason = _inspect_zip_archive(zp)
     if not ok_zip:
@@ -5695,10 +5506,33 @@ def _composer_upload_in_progress(page) -> bool:
     return False
 
 
-def _wait_for_upload_complete(page, zip_path: Path, timeout: float = 90.0) -> bool:
-    """Wait until the attached archive's upload spinner clears before pasting/sending (D16)."""
+def _upload_timeout_for_archive(zip_path: Path, floor_seconds: float = 600.0) -> float:
+    """Scale the upload window dynamically from the archive's byte size (Rule 4).
+
+    Derived from a measured minimum upload rate of ~128 KB/s (8 s per MB) plus 60 s
+    of server-side indexing overhead, with `floor_seconds` (600 s) as the minimum floor
+    so a 40 MB archive has at least 600 s and a 100 MB archive has ~900 s (15 minutes).
+    """
+    try:
+        sz_bytes = Path(zip_path).stat().st_size if Path(zip_path).is_file() else 0
+    except OSError:
+        sz_bytes = 0
+    min_bytes_per_sec = 128.0 * 1024.0
+    scaled_seconds = 60.0 + (float(sz_bytes) / min_bytes_per_sec)
+    return max(float(floor_seconds), scaled_seconds)
+
+
+def _wait_for_upload_complete(page, zip_path: Path, timeout: float = 600.0) -> bool:
+    """Wait until the attached archive's upload spinner clears before pasting/sending (D16).
+
+    The window has to cover the REAL upload time of a large context archive. A 40 MB
+    archive needs about five minutes on a normal link, and the old 90 s window made the
+    pre-flight give up ("refusing to send a half-uploaded archive") while the file was
+    still uploading - the prompt was then never pasted at all.
+    """
+    effective_timeout = _upload_timeout_for_archive(Path(zip_path), floor_seconds=float(timeout))
     start_mono = time.monotonic()
-    deadline = start_mono + max(5.0, float(timeout))
+    deadline = start_mono + max(5.0, effective_timeout)
     clear_streak = 0
     while time.monotonic() < deadline:
         present = _attachment_present(page, zip_path)
@@ -5710,7 +5544,7 @@ def _wait_for_upload_complete(page, zip_path: Path, timeout: float = 90.0) -> bo
                 sz = Path(zip_path).stat().st_size if Path(zip_path).is_file() else 0
                 print(
                     f"[+] Upload of {Path(zip_path).name} ({sz} bytes) finished in {waited:.1f}s "
-                    "(attachment chip ready, upload spinner cleared)."
+                    f"(window={effective_timeout:.0f}s; attachment chip ready, upload spinner cleared)."
                 )
                 return True
         else:
@@ -5723,21 +5557,23 @@ def _wait_for_upload_complete(page, zip_path: Path, timeout: float = 90.0) -> bo
     waited = time.monotonic() - start_mono
     print(
         f"[ERROR] Upload of {Path(zip_path).name} did not finish within {waited:.1f}s "
-        "(upload spinner still active or attachment missing) - refusing to send a half-uploaded archive.",
+        f"(window={effective_timeout:.0f}s; upload spinner still active or attachment missing) - "
+        "refusing to send a half-uploaded archive.",
         file=sys.stderr,
     )
     return False
 
 
 def attach_zip(page, zip_path: Path) -> bool:
-    """Attach the context zip to the composer, verify its size/members, and wait until upload finishes (D14, D15, D16)."""
+    """Attach the context zip to the composer, verify its size/members, and wait until upload finishes (D14, D15, D16, Section 1.3c)."""
     zp = Path(zip_path)
     if not _verify_zip_has_no_credentials(zp):
         return False
     ok_zip, sz, entries, _ = _inspect_zip_archive(zp)
     if not ok_zip:
         return False
-    print(f"[+] Attaching archive {zp.name} ({sz} bytes, {entries} entries)...")
+    eff_win = _upload_timeout_for_archive(zp, floor_seconds=600.0)
+    print(f"[+] Attaching archive {zp.name} ({sz} bytes, {entries} entries, upload window {eff_win:.0f}s)...")
 
     # 1. Open the upload menu first - that is when the file input appears.
     _open_upload_menu(page)
@@ -5748,8 +5584,8 @@ def attach_zip(page, zip_path: Path) -> bool:
             page.wait_for_timeout(1500)
             if _wait_for_upload_complete(page, zp):
                 return True
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"[!] Attach route 1 (upload menu file input) failed: {exc}", file=sys.stderr)
 
     # 2. A file input may already have been present.
     try:
@@ -5760,10 +5596,11 @@ def attach_zip(page, zip_path: Path) -> bool:
                 page.wait_for_timeout(1500)
                 if _wait_for_upload_complete(page, zp):
                     return True
-            except Exception:
+            except Exception as exc:
+                print(f"[!] Attach route 2 (input[type=file] #{i}) failed: {exc}", file=sys.stderr)
                 continue
-    except Exception:
-        pass
+    except Exception as exc:
+        print(f"[!] Attach route 2 (querying input[type=file]) failed: {exc}", file=sys.stderr)
 
     # 3. Use the native file chooser from the upload menu entry.
     try:
@@ -5779,11 +5616,18 @@ def attach_zip(page, zip_path: Path) -> bool:
                 page.wait_for_timeout(1500)
                 if _wait_for_upload_complete(page, zp):
                     return True
-            except Exception:
+            except Exception as exc:
+                print(f"[!] Attach route 3 (native file chooser #{i}) failed: {exc}", file=sys.stderr)
                 continue
-    except Exception:
-        pass
+    except Exception as exc:
+        print(f"[!] Attach route 3 (locating upload menu entry) failed: {exc}", file=sys.stderr)
 
+    print(
+        "[ERROR] The context archive could not be attached. Every attach route was tried: "
+        "the upload menu's file input, a pre-existing input[type=file], and the native file "
+        "chooser. The underlying reason of each route is printed above.",
+        file=sys.stderr,
+    )
     return False
 
 
@@ -5934,31 +5778,211 @@ def _paste_into_composer(page, composer, prompt_text: str) -> str:
     return landed
 
 
-def _type_and_send(page, composer, prompt_text: str, on_progress: Optional[Any] = None) -> None:
-    """Put the prompt into the composer, verify it landed, send it, and verify
-    that the message was really delivered into the conversation.
+def _click_send_immediately(page, composer, expected_min_len: int = 1, probe_snippet: str = "", body_len_before: int = 0, snippet_count_before: int = 0, on_progress: Optional[Any] = None) -> bool:
+    """Click the send button (or press Control+Enter) immediately once upload completes (Rule 5 & Rule 6)."""
+    if not enforce_no_flash_before_send(page):
+        raise RuntimeError("Hard Flash guard aborted send: model chip is not 4 Argon.")
 
-    THE RULE: the prompt is PASTED, never typed, and every step is bounded in
-    time. A 26 KB prompt that is typed into Gemini's Quill editor takes minutes
-    of character-by-character work and looks exactly like a hang - the run sits
-    on "sending..." and nothing happens. A paste is a single event, so it is
-    fast at any size.
+    if on_progress:
+        try:
+            on_progress("prompt_sent")
+        except Exception:
+            pass
 
-    In an already-loaded conversation a plain click also leaves the Quill editor
-    unfocused with class `ql-blank`, so the contenteditable is focused through
-    the DOM (no mouse click, no cursor jumps) before the paste.
+    button = _composer_send_button(page, composer)
+    if button is not None:
+        try:
+            button.click(timeout=6000)
+            page.wait_for_timeout(900)
+        except Exception:
+            pass
+
+    remaining_text = _composer_text(composer)
+    if len(remaining_text) >= expected_min_len:
+        _focus_composer_dom(composer)
+        try:
+            page.keyboard.press("Control+Enter")
+            page.wait_for_timeout(900)
+        except Exception:
+            pass
+        remaining_text = _composer_text(composer)
+
+    if len(remaining_text) >= expected_min_len:
+        try:
+            page.keyboard.press("Enter")
+            page.wait_for_timeout(800)
+        except Exception:
+            pass
+
+    verify_deadline = time.monotonic() + 30.0
+    while time.monotonic() < verify_deadline:
+        after_text = _composer_text(composer)
+        composer_emptied = len(after_text) < expected_min_len
+        body_after = _page_body_snapshot(page)
+        snippet_count_after = body_after.count(probe_snippet) if probe_snippet else 0
+        conversation_grew = (
+            len(body_after) > body_len_before + 15
+            or (bool(probe_snippet) and snippet_count_after > snippet_count_before)
+        )
+        if composer_emptied or conversation_grew:
+            if on_progress:
+                try:
+                    on_progress("verified")
+                except Exception:
+                    pass
+            return True
+        try:
+            page.wait_for_timeout(400)
+        except Exception:
+            time.sleep(0.4)
+    return len(_composer_text(composer)) < expected_min_len
+
+
+def _execute_composer_send_sequence(
+    page,
+    zip_path: Optional[Path],
+    prompt_text: str,
+    manual_setup: bool = False,
+    is_continuation: bool = False,
+    recorded_ws_mode: str = "unknown",
+    on_progress: Optional[Any] = None,
+    preflight_log: Optional[List[str]] = None,
+) -> tuple[bool, bool, bool]:
+    """Execute the owner's unified send order in one place (Rule 5, Rule 6, Rule 7):
+
+    1st step: find the prompt box and select Task mode + the 4 Argon model (hard Flash guard).
+    2nd step: paste the prompt into the composer.
+    3rd step: attach the archive and wait until THIS upload finishes (chip visible, spinner cleared).
+    4th step: the moment the upload has finished, verify the Flash guard and click send immediately.
+
+    Returns (mode_ok, model_ok, attached_and_sent_ok).
     """
+    p_log = preflight_log if preflight_log is not None else []
+    clean_prompt = (prompt_text or "").strip()
+    if not clean_prompt:
+        raise ValueError("Refusing to send an empty prompt.")
+
+    # Step 1: Find the prompt box and select Task mode + 4 Argon model.
+    composer = _find_composer(page)
+    if composer is None:
+        p_log.append("composer : MISSING")
+        return False, False, False
+
+    mode_ok = True if manual_setup else _retry(
+        lambda p: select_task_mode(
+            p,
+            require_verifiable=not is_continuation,
+            recorded_workspace_mode=recorded_ws_mode,
+        ),
+        page,
+    )
+    chip_seen_pf = getattr(page, "_argon_chip_seen", "")
+    if not chip_seen_pf:
+        chip_el_pf = _model_chip(page)
+        chip_seen_pf = (_model_name(chip_el_pf) or "").strip() if chip_el_pf is not None else ""
+
+    if not manual_setup and chip_seen_pf and "high" in chip_seen_pf.lower():
+        p_log.append(f"mode = Chat : REFUSED (chip='{chip_seen_pf}')")
+        mode_ok = False
+    else:
+        chip_tag = (
+            f" (chip='{chip_seen_pf}')"
+            if (chip_seen_pf and mode_ok and "chip=" not in str(getattr(page, "_argon_mode_status", "")))
+            else ""
+        )
+        mode_status_str = (
+            "OK (manual)"
+            if manual_setup
+            else str(getattr(page, "_argon_mode_status", "") or ("OK" if mode_ok else "UNKNOWN"))
+        )
+        p_log.append(f"mode = Task : {mode_status_str}{chip_tag}")
+
+    # Hard Flash guard applies even when --manual-setup is passed: never send on Flash.
+    model_ok = _retry(
+        lambda p: select_argon_model(p, require_chip=True),
+        page,
+    )
+    check_basis = "verified on continuation chip" if is_continuation else "proven on new chat chip"
+    p_log.append(f"model = 4 Argon : {'OK' if model_ok else 'FAILED'} ({check_basis})")
+    if not (mode_ok and model_ok):
+        return mode_ok, model_ok, False
+
+    # Step 2: Paste the prompt into the composer BEFORE attaching the archive.
+    expected_min_len = max(1, min(len(clean_prompt) // 2, 40))
+    first_line = next(
+        (ln.strip() for ln in clean_prompt.splitlines() if len(ln.strip()) >= 8),
+        clean_prompt[:80],
+    )
+    probe_snippet = first_line[:60]
+    body_before = _page_body_snapshot(page)
+    body_len_before = len(body_before)
+    snippet_count_before = body_before.count(probe_snippet) if probe_snippet else 0
+
+    composer = _find_composer(page) or composer
+    landed_text = _paste_into_composer(page, composer, prompt_text)
+    if len(landed_text) < expected_min_len and len(clean_prompt) <= 2000:
+        _focus_composer_dom(composer)
+        try:
+            page.keyboard.insert_text(clean_prompt)
+            page.wait_for_timeout(400)
+        except Exception:
+            pass
+        landed_text = _composer_text(composer)
+
+    if len(landed_text) < expected_min_len:
+        p_log.append(f"prompt paste : FAILED (len={len(landed_text)}, expected>={expected_min_len})")
+        return mode_ok, model_ok, False
+
+    p_log.append(f"prompt paste : OK ({len(landed_text)} chars in composer)")
+    if on_progress:
+        try:
+            on_progress("prompt_pasted")
+        except Exception:
+            pass
+
+    # Step 3: Attach the archive and wait until THIS upload finishes.
+    if zip_path is not None:
+        attached = _retry(lambda p: attach_zip(p, zip_path), page)
+        ok_z, z_sz, z_cnt, _ = _inspect_zip_archive(zip_path)
+        size_tag = f" ({z_sz} bytes, {z_cnt} entries, TASK_BRIEF.md verified)" if ok_z else " (invalid/corrupt archive)"
+        p_log.append(f"attachment {zip_path.name}{size_tag} : {'OK' if attached else 'FAILED'}")
+        if not attached:
+            return mode_ok, model_ok, False
+        if on_progress:
+            try:
+                on_progress("zip_attached")
+            except Exception:
+                pass
+
+    # Re-verify that the prompt is still in the composer after attaching the archive (re-paste if cleared).
+    composer = _find_composer(page) or composer
+    if len(_composer_text(composer)) < expected_min_len:
+        landed_text = _paste_into_composer(page, composer, prompt_text)
+        if len(landed_text) < expected_min_len:
+            p_log.append("prompt re-verify after upload : FAILED")
+            return mode_ok, model_ok, False
+
+    # Step 4: The moment the upload has finished, verify the Flash guard and click send immediately.
+    sent_ok = _click_send_immediately(
+        page,
+        composer,
+        expected_min_len=expected_min_len,
+        probe_snippet=probe_snippet,
+        body_len_before=body_len_before,
+        snippet_count_before=snippet_count_before,
+        on_progress=on_progress,
+    )
+    return mode_ok, model_ok, sent_ok
+
+
+def _type_and_send(page, composer, prompt_text: str, on_progress: Optional[Any] = None) -> None:
+    """Put the prompt into the composer, verify the Flash guard, send it, and verify delivery."""
     clean_prompt = prompt_text.strip()
     if not clean_prompt:
         raise ValueError("Refusing to send an empty prompt.")
 
-    if len(clean_prompt) > 8000:
-        print(
-            f"[!] The prompt is {len(clean_prompt)} characters long. It is pasted "
-            "in chunks, but a prompt this big usually means the task description "
-            "carries the codebase - the project belongs in argon_context.zip.",
-            file=sys.stderr,
-        )
+    if not enforce_no_flash_before_send(page):
+        raise RuntimeError("Hard Flash guard aborted send: model chip is not 4 Argon.")
 
     expected_min_len = max(1, min(len(clean_prompt) // 2, 40))
     first_line = next(
@@ -5967,15 +5991,8 @@ def _type_and_send(page, composer, prompt_text: str, on_progress: Optional[Any] 
     )
     probe_snippet = first_line[:60]
 
-    deadline = time.monotonic() + 150.0
-
     for attempt in range(2):
         if attempt > 0:
-            print(
-                "[!] The prompt was not delivered on attempt 1 - re-focusing the "
-                "composer and retrying once...",
-                file=sys.stderr,
-            )
             fresh = _find_composer(page)
             if fresh is not None:
                 composer = fresh
@@ -5984,11 +6001,9 @@ def _type_and_send(page, composer, prompt_text: str, on_progress: Optional[Any] 
         body_len_before = len(body_before)
         snippet_count_before = body_before.count(probe_snippet) if probe_snippet else 0
 
-        # 1. Paste the prompt (never type it).
-        landed_text = _paste_into_composer(page, composer, prompt_text)
-
-        # A tiny prompt that the clipboard refused can still be typed - typing
-        # is only safe when it is short.
+        landed_text = _composer_text(composer)
+        if len(landed_text) < expected_min_len:
+            landed_text = _paste_into_composer(page, composer, prompt_text)
         if len(landed_text) < expected_min_len and len(clean_prompt) <= 2000:
             _focus_composer_dom(composer)
             try:
@@ -5998,13 +6013,7 @@ def _type_and_send(page, composer, prompt_text: str, on_progress: Optional[Any] 
                 pass
             landed_text = _composer_text(composer)
 
-        # Never send an empty composer.
         if len(landed_text) < expected_min_len:
-            print(
-                f"[!] The composer stayed empty or too short (attempt {attempt + 1}/2, "
-                f"len={len(landed_text)}, expected>={expected_min_len}).",
-                file=sys.stderr,
-            )
             continue
 
         if on_progress:
@@ -6013,83 +6022,17 @@ def _type_and_send(page, composer, prompt_text: str, on_progress: Optional[Any] 
             except Exception:
                 pass
 
-        print(f"[+] Composer populated (length={len(landed_text)} chars). Sending...")
-
-        # 2. Send. The keyboard is used first: a keyboard event goes to the
-        #    focused element and never waits for the editor to become
-        #    "stable", which on a huge Quill editor takes minutes.
-        _focus_composer_dom(composer)
-        if on_progress:
-            try:
-                on_progress("prompt_sent")
-            except Exception:
-                pass
-        try:
-            page.keyboard.press("Control+Enter")
-        except Exception:
-            pass
-        try:
-            page.wait_for_timeout(1200)
-        except Exception:
-            time.sleep(1.2)
-
-        remaining_text = _composer_text(composer)
-        if len(remaining_text) >= expected_min_len:
-            try:
-                page.keyboard.press("Enter")
-            except Exception:
-                pass
-            try:
-                page.wait_for_timeout(1000)
-            except Exception:
-                time.sleep(1.0)
-            remaining_text = _composer_text(composer)
-
-        # The composer did not empty: press the real send button. It is a
-        # normal button, so the click is quick.
-        if len(remaining_text) >= expected_min_len:
-            button = _composer_send_button(page, composer)
-            if button is not None:
-                try:
-                    button.click(timeout=8000)
-                    page.wait_for_timeout(1500)
-                except Exception:
-                    pass
-                remaining_text = _composer_text(composer)
-
-        # 3. Verify that the message really went out: the composer emptied AND
-        #    the conversation grew.
-        delivered_ok = False
-        while time.monotonic() < deadline:
-            after_text = _composer_text(composer)
-            composer_emptied = len(after_text) < expected_min_len
-            body_after = _page_body_snapshot(page)
-            snippet_count_after = body_after.count(probe_snippet) if probe_snippet else 0
-            conversation_grew = (
-                len(body_after) > body_len_before + 15
-                or (bool(probe_snippet) and snippet_count_after > snippet_count_before)
-            )
-            if composer_emptied and conversation_grew:
-                delivered_ok = True
-                break
-            try:
-                page.wait_for_timeout(500)
-            except Exception:
-                time.sleep(0.5)
-
-        if delivered_ok:
-            if on_progress:
-                try:
-                    on_progress("verified")
-                except Exception:
-                    pass
+        print(f"[+] Composer populated (length={len(landed_text)} chars). Clicking send immediately...")
+        if _click_send_immediately(
+            page,
+            composer,
+            expected_min_len=expected_min_len,
+            probe_snippet=probe_snippet,
+            body_len_before=body_len_before,
+            snippet_count_before=snippet_count_before,
+            on_progress=on_progress,
+        ):
             return
-
-        print(
-            f"[!] The prompt delivery verification failed on attempt {attempt + 1}/2 "
-            f"(composer_len={len(_composer_text(composer))}).",
-            file=sys.stderr,
-        )
 
     raise RuntimeError(
         "The prompt could not be pasted, sent and verified as delivered in the "
@@ -7487,7 +7430,7 @@ def _carry_over_to_new_session(
         return None
 
     # The project may have changed in the previous round, so the context is
-    # packed again and re-attached.
+    # packed again before executing the unified send sequence (model -> prompt -> attachment -> immediate send).
     try:
         package_context(
             project_path=str(proj_root),
@@ -7498,31 +7441,21 @@ def _carry_over_to_new_session(
     except Exception as exc:
         print(f"[!] Could not repack the context for the carry-over: {exc}",
               file=sys.stderr)
-    try:
-        attach_zip(page, zip_path)
-    except Exception as exc:
-        print(f"[!] Could not attach the context in the new session: {exc}",
-              file=sys.stderr)
-        return None
-    page.wait_for_timeout(5000)
-    if not _attachment_present(page, zip_path):
-        print("[!] The context did not attach in the new session.", file=sys.stderr)
-        return None
 
-    comp = _find_composer(page)
-    if comp is None:
-        print("[!] No composer in the new session.", file=sys.stderr)
-        return None
-    # The double check again - a new session starts on the default model.
-    if not ensure_argon_model(page):
-        print("[!] The new session is not on 4 Argon - carry-over abandoned.",
-              file=sys.stderr)
-        return None
     turns_before_co = _assistant_turns(page)
     responses_before_co = len(turns_before_co) if turns_before_co is not None else 0
     chips_before_co = len(_generated_file_chip_indices(page))
     try:
-        _type_and_send(page, comp, new_prompt)
+        co_mode_ok, co_model_ok, co_sent_ok = _execute_composer_send_sequence(
+            page=page,
+            zip_path=zip_path,
+            prompt_text=new_prompt,
+            manual_setup=manual_setup,
+            is_continuation=False,
+        )
+        if not (co_mode_ok and co_model_ok and co_sent_ok):
+            print("[!] Carry-over send sequence failed (Task mode, 4 Argon guard, or upload/send).", file=sys.stderr)
+            return None
     except Exception as exc:
         print(f"[!] The carry-over prompt could not be sent: {exc}", file=sys.stderr)
         return None
@@ -7977,8 +7910,7 @@ def _verify_project_locally(
 ) -> int:
     """Run the project's own build/lint command ONCE, locally, and report it.
 
-    NOTHING is sent to Gemini here. The build runs on this machine, so it costs
-    no quota at all.
+    NOTHING is sent to Gemini here. The build runs locally on this machine.
 
     When the project does not build, the errors are printed and recorded in the
     task state and in the notes file, and the run ends with EXIT_BUILD_FAILED.
@@ -8027,7 +7959,7 @@ def _verify_project_locally(
     print(f"[+] Project verification: {cmd} -> {err_count} {err_word}")
     print(
         "[!] The patched project does not build yet. The errors are recorded for "
-        "the agent: fix them locally - they are small and cost no quota.",
+        "the agent: fix them locally - they are small and self-contained.",
         file=sys.stderr,
     )
     if verify_out.strip():
@@ -8130,40 +8062,18 @@ def dispatch_to_argon(
         delivery_attempt += 1
         current_attempt = delivery_attempt
 
+    manual_self_send_mode = False
     if current_attempt > MAX_LADDER_ATTEMPTS:
-        refused_slot = str(slot or prior_ladder_entry.get("slot") or "/u/0/")
-        refused_lane = str(lane or prior_ladder_entry.get("lane") or "new")
-        q_file_prev = str(prior_ladder_entry.get("quarantined_file") or "")
-        last_fail_prev = str(prior_ladder_entry.get("last_failure_reason") or prior_state_val or "previous attempts failed")
-        print("\n" + "!" * 78, file=sys.stderr)
+        manual_self_send_mode = True
         print(
-            f"[ERROR] Bounded retry ladder exhausted for phase '{ladder_phase}' "
-            f"(attempt {current_attempt} of {MAX_LADDER_ATTEMPTS} refused)!",
-            file=sys.stderr,
+            f"[+] Automatic retry ladder ({MAX_LADDER_ATTEMPTS} attempts) exhausted for phase='{ladder_phase}'; "
+            "switching to self-executed manual send fallback (Rule 8: opening browser, writing manual hand-off pack, "
+            "selecting 4 Argon, pasting prompt, attaching archive, and clicking send automatically)."
         )
+    else:
         print(
-            f"  Automated {ladder_phase} attempts 1..{MAX_LADDER_ATTEMPTS} have already run for this task "
-            f"(last reason: {last_fail_prev}).",
-            file=sys.stderr,
+            f"[+] Retry ladder: phase={ladder_phase}, attempt {current_attempt} of {MAX_LADDER_ATTEMPTS}"
         )
-        if q_file_prev:
-            print(f"  Quarantined delivery file kept at: {q_file_prev}", file=sys.stderr)
-            print(f'  Apply it by hand with: Open_Argon_Apply.bat -PatchFile "{q_file_prev}"', file=sys.stderr)
-        print(
-            "  A 4th automated attempt is strictly forbidden. Proceed to Step 4 (Manual Hand-Off):",
-            file=sys.stderr,
-        )
-        print(
-            f'    python "{SCRIPTS_DIR / "dispatch_argon.py"}" --project-path "{proj_root}" '
-            f"--manual-handoff --lane {refused_lane} --slot {refused_slot} --open-browser",
-            file=sys.stderr,
-        )
-        print("!" * 78 + "\n", file=sys.stderr)
-        return EXIT_PREFLIGHT_FAILED
-
-    print(
-        f"[+] Retry ladder: phase={ladder_phase}, attempt {current_attempt} of {MAX_LADDER_ATTEMPTS}"
-    )
 
     send_progress = str(prior_ladder_entry.get("send_progress") or "none") if resume else "none"
     task_state_store.set(
@@ -8558,6 +8468,11 @@ def dispatch_to_argon(
     else:
         print("[+] Starting a new session for this project (no stored chat to continue).")
 
+    # Rule 8: Write the manual hand-off pack (prompt file + zip location) on EVERY attempt
+    # right at the start of the attempt so a human can also send by hand at any moment.
+    if not resume_chat and prompt_text:
+        _emit_send_failure(f"attempt_{current_attempt}_ready", None, page_obj=None)
+
     from playwright.sync_api import sync_playwright
 
 
@@ -8842,7 +8757,7 @@ def dispatch_to_argon(
                     if _recover_preflight_or_send_browser(nav_exc, "navigation") is None:
                         print(
                             f"[ERROR] Browser closed during navigation to {target_url} and could not be recovered. "
-                            "Nothing was sent yet, so repeating this task costs zero quota.",
+                            "Nothing was sent yet.",
                             file=sys.stderr,
                         )
                         task_registry.register_done(proj_root, lane=lane, slot=active_slot, status="failed")
@@ -8852,7 +8767,7 @@ def dispatch_to_argon(
 
             if not _wait_for_workspace(page):
                 print(
-                    "[!] The Gemini workspace did not become ready in time.",
+                    "[!] The Gemini workspace did not become ready in time (page not ready; session data on disk was not cleared).",
                     file=sys.stderr,
                 )
                 shot_ws = _take_step_screenshot(
@@ -8866,26 +8781,36 @@ def dispatch_to_argon(
                 ev_ws = _collect_diagnostic_evidence(
                     page=page,
                     proj_root=proj_root,
-                    reason="Gemini workspace composer did not become ready before timeout",
+                    reason="Gemini workspace composer did not become ready before timeout (page not ready; session data on disk is intact)",
                     slot=active_slot,
                     email=target_email,
                     profile_dir=profile_dir,
                     chat_url=target_url,
                     screenshot_path=shot_ws,
                     ruled_out=["Browser launched on slot profile"],
-                    next_step="Run Open_Argon_Login.bat to verify the account session, then re-run this task.",
+                    next_step="Re-run the task or inspect the open browser window.",
                 )
                 task_state_store.set(proj_root, lane=lane, state="preflight_failed", diagnostic_evidence=ev_ws)
                 task_registry.register_done(proj_root, lane=lane, slot=active_slot, status="failed", screenshot_path=str(shot_ws or ""))
                 _print_run_failure_summary(ev_ws)
+                _emit_send_failure("workspace_not_ready", shot_ws, page_obj=page)
                 return EXIT_PREFLIGHT_FAILED
 
             if _is_page_unauthenticated(page):
+                has_disk_cookies = _has_cookie_db(profile_dir)
+                has_disk_acct = profile_has_signed_in_account(profile_dir)
+                if not has_disk_cookies and not has_disk_acct:
+                    unauth_reason = (
+                        f"Slot profile {profile_dir} has no cookie DB and empty Default/Preferences account_info "
+                        "(session data on disk was cleared or account was never signed in)"
+                    )
+                else:
+                    unauth_reason = (
+                        f"Gemini page at {getattr(page, 'url', target_url)} rendered the guest sign-in state "
+                        f"(disk cookie_db={has_disk_cookies}, preferences_account={has_disk_acct}; session data on disk was NOT cleared)"
+                    )
                 print("\n" + "!" * 72, file=sys.stderr)
-                print(
-                    "[ERROR] No Google account is signed into the Argon browser profile.",
-                    file=sys.stderr,
-                )
+                print(f"[ERROR] Authentication check failed: {unauth_reason}", file=sys.stderr)
                 print(
                     "Run the Account Pool Login Assistant to sign in your accounts first:",
                     file=sys.stderr,
@@ -8905,39 +8830,28 @@ def dispatch_to_argon(
                     proj_root,
                     "failed.png",
                     step_label="not_signed_in",
-                    state_label="Anonymous guest page or Google sign-in screen",
+                    state_label=unauth_reason,
                     lane=lane,
                 )
                 ev_unauth = _collect_diagnostic_evidence(
                     page=page,
                     proj_root=proj_root,
-                    reason="Profile is not signed in (anonymous guest page or Google sign-in screen)",
+                    reason=unauth_reason,
                     slot=active_slot,
                     email=target_email,
                     profile_dir=profile_dir,
                     chat_url=target_url,
                     screenshot_path=shot_unauth,
-                    ruled_out=["Browser launched and page loaded"],
+                    ruled_out=["Browser launched and page finished loading"],
                     next_step="Run Open_Argon_Login.bat, then re-run this task.",
                 )
                 task_state_store.set(proj_root, lane=lane, state="not_signed_in", diagnostic_evidence=ev_unauth)
                 task_registry.register_done(proj_root, lane=lane, slot=active_slot, status="failed", screenshot_path=str(shot_unauth or ""))
                 _print_run_failure_summary(ev_unauth)
+                _emit_send_failure("not_signed_in", shot_unauth, page_obj=page)
                 return EXIT_NOT_SIGNED_IN
 
             _select_profile_account_if_needed(page, target_email)
-
-            early_quota = _detect_quota_limit(page)
-            if early_quota:
-                acct_now = _detect_signed_in_account(page, target_email, active_slot)
-                print(
-                    f"\n[!] Account {acct_now} at slot {active_slot} has hit its usage limit ({early_quota}).",
-                    file=sys.stderr,
-                )
-                print("    Moving on to the next account in the pool.", file=sys.stderr)
-                _mark_quota_limited(active_slot)
-                task_registry.register_done(proj_root, lane=lane, slot=active_slot, status="quota_limited")
-                return EXIT_QUOTA_LIMITED
 
             # D19: On a NEW session (not a continuation and not a resume), explicitly click
             # 'New chat' and verify the conversation is genuinely fresh before pasting or attaching anything.
@@ -8971,11 +8885,11 @@ def dispatch_to_argon(
                     task_state_store.set(proj_root, lane=lane, state="preflight_failed", diagnostic_evidence=ev_fc)
                     task_registry.register_done(proj_root, lane=lane, slot=active_slot, status="failed", screenshot_path=str(shot_fc or ""))
                     _print_run_failure_summary(ev_fc)
+                    _emit_send_failure("new_chat_failed", shot_fc, page_obj=page)
                     return EXIT_PREFLIGHT_FAILED
 
             # Addendum A.1: Wait for an existing conversation to finish rendering its turns
             # in the DOM before deciding whether Argon is working or whether the prompt is a duplicate.
-            # "Still loading" (empty conversation area with a progressbar) must NEVER be read as "working".
             if is_continuation or resume_chat:
                 conv_ready = _wait_for_conversation_loaded(page, timeout=30.0, require_turns=True)
                 if not conv_ready:
@@ -9019,11 +8933,9 @@ def dispatch_to_argon(
                         screenshot_path=str(loading_shot or ""),
                         end_reason=load_reason,
                     )
+                    _emit_send_failure("conversation_still_loading", loading_shot, page_obj=page)
                     return EXIT_PREFLIGHT_FAILED
 
-            # Rule 1.1 & 1.2 + D22: Before attaching the zip or sending, check whether
-            # this prompt is already the last user message in the conversation
-            # or whether this chat already has an unfinished running task.
             existing_task_entry = (task_state_store.get(proj_root, lane=lane) or task_state_store.get(proj_root)) or {}
             if not resume_chat and is_continuation and _is_argon_working(page) and not force:
                 live_working_shot = _take_step_screenshot(
@@ -9072,205 +8984,11 @@ def dispatch_to_argon(
                 if not resume_entry:
                     resume_entry = existing_task_entry
 
-            # ---------------------------------------------------------- pre-flight --
+            # ------------------------------------------------- send & pre-flight --
             preflight: List[str] = []
             shot_dir = proj_root / ".argon_backup"
             shot_dir.mkdir(parents=True, exist_ok=True)
-            shot_path = shot_dir / "preflight_failure.png"
 
-            if resume_chat:
-                # The prompt was already sent in an earlier run. Nothing has to be
-                # configured now - the run only waits for the answer.
-                print(
-                    f"[+] Resuming the task in: {target_url}"
-                    + (f" (state: {resume_entry.get('state')})" if resume_entry else "")
-                )
-                mode_ok = model_ok = think_ok = attached = True
-            else:
-                # E2.1 - E2.4: Never report `mode = Task : OK` unless Task mode was actually
-                # observed via the toggle or recorded as `workspace_mode == 'task'` in SessionStore.
-                mode_ok = True if manual_setup else _retry(
-                    lambda p: select_task_mode(
-                        p,
-                        require_verifiable=not is_continuation,
-                        recorded_workspace_mode=recorded_ws_mode,
-                    ),
-                    page,
-                )
-                chip_seen_pf = getattr(page, "_argon_chip_seen", "")
-                if not chip_seen_pf:
-                    chip_el_pf = _model_chip(page)
-                    chip_seen_pf = (_model_name(chip_el_pf) or "").strip() if chip_el_pf is not None else ""
-
-                if not manual_setup and chip_seen_pf and "high" in chip_seen_pf.lower():
-                    preflight.append(f"mode = Chat : REFUSED (chip='{chip_seen_pf}')")
-                    mode_ok = False
-                else:
-                    chip_tag = f" (chip='{chip_seen_pf}')" if (chip_seen_pf and mode_ok and "chip=" not in str(getattr(page, "_argon_mode_status", ""))) else ""
-                    mode_status_str = (
-                        "OK (manual)"
-                        if manual_setup
-                        else (
-                            str(getattr(page, "_argon_mode_status", "") or ("OK" if mode_ok else "UNKNOWN"))
-                        )
-                    )
-                    preflight.append(f"mode = Task : {mode_status_str}{chip_tag}")
-                model_ok = True if manual_setup else _retry(
-                    lambda p: select_argon_model(p, require_chip=not is_continuation),
-                    page,
-                )
-                check_basis = "recorded/inherited on continuation" if is_continuation else "proven on new chat"
-                preflight.append(
-                    f"model = 4 Argon : {'OK (manual)' if manual_setup else ('OK' if model_ok else 'FAILED')} ({check_basis})"
-                )
-                think_ok = True
-
-            attached = True if resume_chat else _retry(lambda p: attach_zip(p, zip_path), page)
-            if attached and not resume_chat:
-                _track_send_progress("zip_attached")
-            if not resume_chat:
-                ok_z, z_sz, z_cnt, _ = _inspect_zip_archive(zip_path)
-                size_tag = f" ({z_sz} bytes, {z_cnt} entries, TASK_BRIEF.md verified)" if ok_z else " (invalid/corrupt archive)"
-                preflight.append(f"attachment {zip_path.name}{size_tag} : {'OK' if attached else 'FAILED'}")
-
-            # D17: If the browser/page closed during pre-flight or attach, recover and re-run pre-flight + attach
-            if not (mode_ok and model_ok and think_ok and attached) and (hasattr(page, "is_closed") and page.is_closed()):
-                recovered_pf_page = _recover_preflight_or_send_browser(
-                    RuntimeError("page closed during pre-flight/attach"),
-                    "preflight_and_attach",
-                )
-                if recovered_pf_page is not None:
-                    page = recovered_pf_page
-                    preflight.clear()
-                    mode_ok = True if manual_setup else _retry(
-                        lambda p: select_task_mode(p, require_verifiable=not is_continuation),
-                        page,
-                    )
-                    check_basis = "inherited from existing conversation" if is_continuation else "proven on new chat"
-                    preflight.append(f"mode = Task : {'OK' if mode_ok else 'FAILED'} ({check_basis})")
-                    model_ok = True if manual_setup else _retry(
-                        lambda p: select_argon_model(p, require_chip=not is_continuation),
-                        page,
-                    )
-                    preflight.append(f"model = 4 Argon : {'OK' if model_ok else 'FAILED'} ({check_basis})")
-                    think_ok = True
-                    attached = _retry(lambda p: attach_zip(p, zip_path), page)
-                    ok_z, z_sz, z_cnt, _ = _inspect_zip_archive(zip_path)
-                    size_tag = f" ({z_sz} bytes, {z_cnt} entries, TASK_BRIEF.md verified)" if ok_z else ""
-                    preflight.append(f"attachment {zip_path.name}{size_tag} : {'OK' if attached else 'FAILED'}")
-
-            print("[i] Pre-flight:")
-            for line in preflight:
-                print("      " + line)
-
-            if not (mode_ok and model_ok and think_ok and attached):
-                if _argon_picker_is_disabled(page):
-                    acct_now = _detect_signed_in_account(page, target_email, active_slot)
-                    shot_dis = _take_step_screenshot(
-                        page,
-                        proj_root,
-                        "preflight_failure.png",
-                        step_label="preflight_failure",
-                        state_label="4 Argon option disabled in picker",
-                        lane=lane,
-                    )
-                    print(
-                        f"\n[!] Account {acct_now} (slot {active_slot}): this account has no Argon available "
-                        f"('4 Argon' option is disabled in the model picker).",
-                        file=sys.stderr,
-                    )
-                    print(
-                        f"    Marking {active_slot} as quota_limited and rotating to the next pool account.",
-                        file=sys.stderr,
-                    )
-                    _mark_quota_limited(active_slot)
-                    ev_dis = _collect_diagnostic_evidence(
-                        page=page,
-                        proj_root=proj_root,
-                        reason=f"Account {acct_now} ({active_slot}) has no Argon available ('4 Argon' is aria-disabled in the model picker)",
-                        slot=active_slot,
-                        email=acct_now,
-                        profile_dir=profile_dir,
-                        chat_url=getattr(page, "url", "") or target_url,
-                        screenshot_path=shot_dis,
-                        preflight=preflight,
-                        ruled_out=[
-                            "Google session is signed in (not guest)",
-                            "Model picker opened and '4 Argon' option was located in the menu",
-                        ],
-                        next_step=(
-                            "Rotating to the next pool account automatically. If all pool accounts are "
-                            "exhausted, run Open_Argon_Login.bat to add or sign in another account, then re-run this task."
-                        ),
-                    )
-                    task_state_store.set(proj_root, lane=lane, state="quota_limited", diagnostic_evidence=ev_dis)
-                    task_registry.register_done(proj_root, lane=lane, slot=active_slot, status="quota_limited", screenshot_path=str(shot_dis or ""))
-                    _print_run_failure_summary(ev_dis)
-                    return EXIT_QUOTA_LIMITED
-                preflight_quota = _detect_quota_limit(page)
-                if preflight_quota:
-                    acct_now = _detect_signed_in_account(page, target_email, active_slot)
-                    print(
-                        f"\n[!] Account {acct_now} at slot {active_slot} has hit its usage limit ({preflight_quota}).",
-                        file=sys.stderr,
-                    )
-                    print("    Moving on to the next account in the pool.", file=sys.stderr)
-                    _mark_quota_limited(active_slot)
-                    task_registry.register_done(proj_root, lane=lane, slot=active_slot, status="quota_limited")
-                    return EXIT_QUOTA_LIMITED
-                shot_saved = _take_step_screenshot(
-                    page,
-                    proj_root,
-                    "preflight_failure.png",
-                    step_label="preflight_failure",
-                    state_label="Pre-flight workspace check failed",
-                    lane=lane,
-                )
-                print(
-                    manual_setup_instructions(mode, str(shot_saved) if shot_saved else None),
-                    file=sys.stderr,
-                )
-                ruled = ["Browser launched and workspace composer rendered", "Google account is signed in (not guest)"]
-                if mode_ok:
-                    ruled.append("Task mode toggle verified active")
-                if model_ok:
-                    ruled.append("Model chip verified as 4 Argon")
-                if attached:
-                    ruled.append(f"Archive {zip_path.name} verified attached")
-                ev_pf = _collect_diagnostic_evidence(
-                    page=page,
-                    proj_root=proj_root,
-                    reason="Pre-flight workspace check failed (" + ", ".join(preflight) + ")",
-                    slot=active_slot,
-                    email=target_email,
-                    profile_dir=profile_dir,
-                    chat_url=getattr(page, "url", "") or target_url,
-                    screenshot_path=shot_saved,
-                    preflight=preflight,
-                    ruled_out=ruled,
-                    next_step=(
-                        "Check the conversation link and screenshot above, or run Open_Argon_Login.bat "
-                        "if the session expired, then re-run this task."
-                    ),
-                )
-                task_state_store.set(proj_root, lane=lane, state="preflight_failed", diagnostic_evidence=ev_pf)
-                task_registry.register_done(proj_root, lane=lane, slot=active_slot, status="failed", screenshot_path=str(shot_saved or ""))
-                _print_run_failure_summary(ev_pf)
-                _emit_send_failure("preflight_failure", shot_saved, page_obj=page)
-                return EXIT_PREFLIGHT_FAILED
-
-            # D6.1: Take step screenshot right after pre-flight and upload completion
-            if not resume_chat:
-                last_step_shot = _take_step_screenshot(
-                    page,
-                    proj_root,
-                    "preflight.png",
-                    step_label="preflight",
-                    state_label=f"Task mode, 4 Argon, and {zip_path.name} verified",
-                    lane=lane,
-                )
-
-            # ------------------------------------------------------------- send --
             dispatch_started = (
                 float(resume_entry.get("started_epoch") or 0.0)
                 if (resume_chat and resume_entry)
@@ -9280,8 +8998,6 @@ def dispatch_to_argon(
             chips_before = 0 if resume_chat else len(_generated_file_chip_indices(page))
             turns_before = _assistant_turns(page)
             if resume_chat:
-                # When resuming or continuing an already-sent prompt, only a turn
-                # that sits AFTER the last user message counts as the answer.
                 responses_before = (
                     max(0, len(turns_before) - 1)
                     if (turns_before and _element_is_after_last_user_turn(turns_before[-1]))
@@ -9290,7 +9006,6 @@ def dispatch_to_argon(
             else:
                 responses_before = len(turns_before) if turns_before is not None else 0
 
-            # D1.1 & D1.2: Load all already-handled digests for this project from DeliveryLedger + TaskState + disk
             handled_delivery_hashes = set()
             try:
                 handled_delivery_hashes.update(delivery_ledger.known_hashes(proj_root))
@@ -9314,250 +9029,250 @@ def dispatch_to_argon(
 
             sent_hms = time.strftime("%H:%M:%S")
             just_sent_prompt = False
-            try:
-                if resume_chat:
-                    if dup_sent_hms is None:
-                        print("[+] The prompt was already sent - checking the conversation and waiting for the answer.")
+            mode_ok = model_ok = attached = True
+
+            if resume_chat:
+                print(
+                    f"[+] Resuming the task in: {target_url}"
+                    + (f" (state: {resume_entry.get('state')})" if resume_entry else "")
+                )
+                task_state.set(proj_root, lane=lane, state="waiting", chat_url=page.url, slot=active_slot)
+            else:
+                late_dup_hms = _check_duplicate_prompt(
+                    page,
+                    prompt_text=prompt_text,
+                    task_text=task,
+                    prev_state=prev_state,
+                    new_session=new_session,
+                )
+                if late_dup_hms is not None:
+                    _print_duplicate_prompt_notice(late_dup_hms)
+                    resume_chat = True
                     task_state.set(proj_root, lane=lane, state="waiting", chat_url=page.url, slot=active_slot)
                 else:
-                    # Double-check duplicate prompt right before sending as well.
-                    late_dup_hms = _check_duplicate_prompt(
-                        page,
-                        prompt_text=prompt_text,
-                        task_text=task,
-                        prev_state=prev_state,
-                        new_session=new_session,
-                    )
-                    if late_dup_hms is not None:
-                        _print_duplicate_prompt_notice(late_dup_hms)
-                        resume_chat = True
-                        task_state.set(proj_root, lane=lane, state="waiting", chat_url=page.url, slot=active_slot)
-                    else:
-                        composer = _find_composer(page)
-                        if composer is not None:
-                            if not ensure_argon_model(page, require_chip=not is_continuation):
-                                shot_send_gate = _take_step_screenshot(page, proj_root, "preflight_failure.png")
-                                if _argon_picker_is_disabled(page):
-                                    acct_now = _detect_signed_in_account(page, target_email, active_slot)
-                                    print(
-                                        f"[!] Account {acct_now} (slot {active_slot}): this account has no Argon available "
-                                        f"('4 Argon' is disabled in the model picker).",
-                                        file=sys.stderr,
-                                    )
-                                    _mark_quota_limited(active_slot)
-                                    ev_sg = _collect_diagnostic_evidence(
-                                        page=page,
-                                        proj_root=proj_root,
-                                        reason=f"Account {acct_now} ({active_slot}) has no Argon available ('4 Argon' disabled before send)",
-                                        slot=active_slot,
-                                        email=acct_now,
-                                        profile_dir=profile_dir,
-                                        chat_url=getattr(page, "url", "") or target_url,
-                                        screenshot_path=shot_send_gate,
-                                        preflight=preflight,
-                                        ruled_out=["Task mode active", f"Archive {zip_path.name} attached"],
-                                        next_step="Rotating to the next pool account automatically.",
-                                    )
-                                    task_state_store.set(proj_root, state="quota_limited", diagnostic_evidence=ev_sg)
-                                    _print_run_failure_summary(ev_sg)
-                                    return EXIT_QUOTA_LIMITED
-                                print(
-                                    "[!] Refusing to send: the model is not 4 Argon.",
-                                    file=sys.stderr,
-                                )
-                                print(
-                                    "    Switch the model to '4 Argon (Complex tasks)' in the "
-                                    "browser and re-run, or use --manual-setup after doing it "
-                                    "by hand.",
-                                    file=sys.stderr,
-                                )
-                                ev_sg = _collect_diagnostic_evidence(
-                                    page=page,
-                                    proj_root=proj_root,
-                                    reason="Model chip was not '4 Argon' right before send",
-                                    slot=active_slot,
-                                    email=target_email,
-                                    profile_dir=profile_dir,
-                                    chat_url=getattr(page, "url", "") or target_url,
-                                    screenshot_path=shot_send_gate,
-                                    preflight=preflight,
-                                    ruled_out=["Task mode active", f"Archive {zip_path.name} attached"],
-                                    next_step="Switch the model to '4 Argon (Complex tasks)' in the browser or run Open_Argon_Login.bat, then re-run this task.",
-                                )
-                                task_state_store.set(proj_root, state="preflight_failed", diagnostic_evidence=ev_sg)
-                                _print_run_failure_summary(ev_sg)
-                                return EXIT_PREFLIGHT_FAILED
-                            # E3.1 & E3.2: Right before send on a NEW chat, verify once more (after pre-flight & upload
-                            # have given the page plenty of time to finish loading) that the conversation is still EMPTY
-                            # and its chat_id is not already known.
-                            if not is_continuation and not resume_chat:
-                                ok_pre_send, pre_send_cid, pre_u, pre_a = _conversation_emptiness_report(
-                                    page, forbidden_new_chat_ids
-                                )
-                                if not ok_pre_send:
-                                    shot_foreign_pre = _take_step_screenshot(
-                                        page,
-                                        proj_root,
-                                        "preflight_failure.png",
-                                        step_label="foreign_chat_before_send",
-                                        state_label=f"New chat is not empty before send (chat_id={pre_send_cid})",
-                                        lane=lane,
-                                    )
-                                    print(
-                                        f"[ERROR] New session check failed right before send on {active_slot}: "
-                                        f"ended up in non-empty/known conversation chat_id={pre_send_cid or '(no-chat-id)'!r} "
-                                        f"(url={getattr(page, 'url', target_url)!r}, user_messages={pre_u}, assistant_turns={pre_a}). "
-                                        f"Screenshot: {shot_foreign_pre}",
-                                        file=sys.stderr,
-                                    )
-                                    task_registry.register_done(
-                                        proj_root, lane=lane, slot=active_slot, status="failed", screenshot_path=str(shot_foreign_pre or "")
-                                    )
-                                    return EXIT_PREFLIGHT_FAILED
-                            if brief_summary:
-                                bs_path = Path(brief_summary).resolve()
-                                if bs_path.is_file():
-                                    try:
-                                        print("\n" + "=" * 78)
-                                        print(f"[i] Brief Summary ({bs_path}):")
-                                        print("=" * 78)
-                                        print(bs_path.read_text(encoding="utf-8"))
-                                        print("=" * 78 + "\n")
-                                    except Exception as exc:
-                                        print(f"[!] Warning: Could not read brief summary {bs_path}: {exc}", file=sys.stderr)
-                                else:
-                                    print(f"[!] Warning: Brief summary file not found at {bs_path}; continuing without summary display.", file=sys.stderr)
-                            _type_and_send(page, composer, prompt_text, on_progress=_track_send_progress)
-                            sent_hms = time.strftime("%H:%M:%S")
-                            just_sent_prompt = True
-                            sent_shot = _take_step_screenshot(
-                                page,
-                                proj_root,
-                                "sent.png",
-                                step_label="sent",
-                                state_label=f"Prompt submitted at {sent_hms}",
-                                lane=lane,
-                            )
-                            # D12.1: After the message is sent, the composer chip reverts to the
-                            # ACCOUNT DEFAULT (e.g. 'Flash') even though 4 Argon answered this turn.
-                            chip_after = _model_chip(page)
-                            name_after = _model_name(chip_after)
-                            if name_after:
-                                print(
-                                    f"[i] Post-send model chip reads {name_after!r}: the chip after send shows "
-                                    "the account default for future turns, not the model answering this turn "
-                                    "(4 Argon was verified before send; real proof is verified in the answer)."
-                                )
-                            print("[+] Prompt submitted in a verified Task/Argon workspace with the zip attached.")
-                            try:
-                                profile_dir_str = str(profile_dir)
-                            except Exception:
-                                profile_dir_str = ""
-                            task_state.set(
-                                proj_root,
-                                lane=lane,
-                                chat_url=page.url,
-                                chat_title=_chat_title(page),
-                                slot=active_slot,
-                                profile_number=_slot_number(active_slot),
-                                profile_dir=profile_dir_str,
-                                email=target_email,
-                                mode=mode,
-                                state="sent",
-                                task=task,
-                                prompt_hash=_prompt_hash(prompt_text),
-                                task_hash=_prompt_hash(task),
-                                prompt_prefix=_normalize_ws(prompt_text)[:200],
-                                sent_at=sent_hms,
-                                started_epoch=dispatch_started,
-                                started_at=time.strftime("%Y-%m-%d %H:%M:%S"),
-                                last_screenshot=str(sent_shot or ""),
-                            )
-                            task_registry.update_running(
-                                proj_root,
-                                lane=lane,
-                                slot=active_slot,
-                                chat_url=page.url,
-                                screenshot_path=str(sent_shot or ""),
-                                prompt_hash=_prompt_hash(prompt_text),
-                            )
-                            print(f"[+] Task state saved: {task_state.path}")
-                            print(f"    account / profile : {active_slot}  ({profile_dir_str})")
-                        else:
-                            print("[!] Composer not visible - the prompt was not sent.", file=sys.stderr)
-                            shot_cm = _take_step_screenshot(
+                    if not is_continuation and not resume_chat:
+                        ok_pre_send, pre_send_cid, pre_u, pre_a = _conversation_emptiness_report(
+                            page, forbidden_new_chat_ids
+                        )
+                        if not ok_pre_send:
+                            shot_foreign_pre = _take_step_screenshot(
                                 page,
                                 proj_root,
                                 "preflight_failure.png",
-                                step_label="composer_missing",
-                                state_label="Composer not visible before send",
+                                step_label="foreign_chat_before_send",
+                                state_label=f"New chat is not empty before send (chat_id={pre_send_cid})",
                                 lane=lane,
                             )
-                            task_registry.register_done(proj_root, lane=lane, slot=active_slot, status="failed")
-                            _emit_send_failure("composer_missing", shot_cm, page_obj=page)
+                            print(
+                                f"[ERROR] New session check failed right before send on {active_slot}: "
+                                f"ended up in non-empty/known conversation chat_id={pre_send_cid or '(no-chat-id)'!r} "
+                                f"(url={getattr(page, 'url', target_url)!r}, user_messages={pre_u}, assistant_turns={pre_a}). "
+                                f"Screenshot: {shot_foreign_pre}",
+                                file=sys.stderr,
+                            )
+                            task_registry.register_done(
+                                proj_root, lane=lane, slot=active_slot, status="failed", screenshot_path=str(shot_foreign_pre or "")
+                            )
+                            _emit_send_failure("foreign_chat_before_send", shot_foreign_pre, page_obj=page)
                             return EXIT_PREFLIGHT_FAILED
-            except Exception as exc:
-                if _is_target_closed_error(exc):
-                    # D17: Recover browser when a crash occurs during paste or send!
-                    rec_page = _recover_preflight_or_send_browser(exc, "paste_and_send")
-                    if rec_page is not None:
-                        page = rec_page
-                        dup_after_crash = _check_duplicate_prompt(
-                            page,
-                            prompt_text=prompt_text,
-                            task_text=task,
-                            prev_state=prev_state,
-                            new_session=False,
-                        )
-                        if dup_after_crash is not None:
-                            print("[+] Prompt had already landed before browser crash - continuing to wait for answer.")
-                            resume_chat = True
-                            just_sent_prompt = True
+
+                    if brief_summary:
+                        bs_path = Path(brief_summary).resolve()
+                        if bs_path.is_file():
+                            try:
+                                print("\n" + "=" * 78)
+                                print(f"[i] Brief Summary ({bs_path}):")
+                                print("=" * 78)
+                                print(bs_path.read_text(encoding="utf-8"))
+                                print("=" * 78 + "\n")
+                            except Exception as exc:
+                                print(f"[!] Warning: Could not read brief summary {bs_path}: {exc}", file=sys.stderr)
                         else:
-                            print("[+] Re-applying Task/Argon + zip attachment after crash recovery before sending...")
-                            if not manual_setup:
-                                _retry(lambda p: select_task_mode(p, require_verifiable=not is_continuation), page)
-                                _retry(lambda p: select_argon_model(p, require_chip=not is_continuation), page)
-                            if _retry(lambda p: attach_zip(p, zip_path), page):
-                                comp_rec = _find_composer(page)
-                                if comp_rec is not None:
-                                    _type_and_send(page, comp_rec, prompt_text)
-                                    sent_hms = time.strftime("%H:%M:%S")
+                            print(f"[!] Warning: Brief summary file not found at {bs_path}; continuing without summary display.", file=sys.stderr)
+
+                    # Rule 5 & Rule 8: Execute the unified send sequence
+                    # (1. find composer & select 4 Argon -> 2. paste prompt -> 3. attach zip -> 4. click send immediately on upload completion).
+                    try:
+                        mode_ok, model_ok, attached = _execute_composer_send_sequence(
+                            page=page,
+                            zip_path=zip_path,
+                            prompt_text=prompt_text,
+                            manual_setup=manual_setup,
+                            is_continuation=is_continuation,
+                            recorded_ws_mode=recorded_ws_mode,
+                            on_progress=_track_send_progress,
+                            preflight_log=preflight,
+                        )
+                        just_sent_prompt = bool(mode_ok and model_ok and attached)
+                    except Exception as send_exc:
+                        if _is_target_closed_error(send_exc):
+                            rec_page = _recover_preflight_or_send_browser(send_exc, "send_sequence")
+                            if rec_page is not None:
+                                page = rec_page
+                                dup_after_crash = _check_duplicate_prompt(
+                                    page,
+                                    prompt_text=prompt_text,
+                                    task_text=task,
+                                    prev_state=prev_state,
+                                    new_session=False,
+                                )
+                                if dup_after_crash is not None:
+                                    print("[+] Prompt had already landed before browser crash - continuing to wait for answer.")
+                                    resume_chat = True
                                     just_sent_prompt = True
-                                    _take_step_screenshot(
-                                        page,
-                                        proj_root,
-                                        "sent.png",
-                                        step_label="sent_after_recovery",
-                                        state_label=f"Prompt submitted at {sent_hms} after crash recovery",
-                                        lane=lane,
+                                else:
+                                    preflight.clear()
+                                    mode_ok, model_ok, attached = _execute_composer_send_sequence(
+                                        page=page,
+                                        zip_path=zip_path,
+                                        prompt_text=prompt_text,
+                                        manual_setup=manual_setup,
+                                        is_continuation=is_continuation,
+                                        recorded_ws_mode=recorded_ws_mode,
+                                        on_progress=_track_send_progress,
+                                        preflight_log=preflight,
                                     )
+                                    just_sent_prompt = bool(mode_ok and model_ok and attached)
+                        else:
+                            print(f"[!] Send sequence error: {send_exc}", file=sys.stderr)
+                            just_sent_prompt = False
+
+                    print("[i] Pre-flight & Send Sequence:")
+                    for line in preflight:
+                        print("      " + line)
+
+                    # Rule 8: If the normal send sequence did not succeed, write the manual hand-off pack
+                    # and perform one direct self-executed manual send fallback in the open browser before failing.
                     if not just_sent_prompt and not resume_chat:
+                        shot_retry = _take_step_screenshot(
+                            page,
+                            proj_root,
+                            "preflight_failure.png",
+                            step_label="send_retry_handoff",
+                            state_label="Writing manual hand-off pack and attempting self-executed manual send",
+                            lane=lane,
+                        )
+                        _emit_send_failure("send_sequence_failed", shot_retry, page_obj=page)
+                        if current_attempt >= MAX_LADDER_ATTEMPTS or manual_self_send_mode:
+                            print(
+                                "[+] Automatic attempts exhausted - executing bridge self-manual send fallback "
+                                "using the same composer, upload wait, and hard Flash guard (Rule 8)..."
+                            )
+                            try:
+                                preflight.clear()
+                                mode_ok, model_ok, attached = _execute_composer_send_sequence(
+                                    page=page,
+                                    zip_path=zip_path,
+                                    prompt_text=prompt_text,
+                                    manual_setup=False,
+                                    is_continuation=is_continuation,
+                                    recorded_ws_mode=recorded_ws_mode,
+                                    on_progress=_track_send_progress,
+                                    preflight_log=preflight,
+                                )
+                                just_sent_prompt = bool(mode_ok and model_ok and attached)
+                            except Exception as manual_exc:
+                                print(f"[!] Self-executed manual send fallback failed: {manual_exc}", file=sys.stderr)
+                                just_sent_prompt = False
+
+                    if not just_sent_prompt and not resume_chat:
+                        shot_saved = _take_step_screenshot(
+                            page,
+                            proj_root,
+                            "preflight_failure.png",
+                            step_label="preflight_failure",
+                            state_label="Workspace send sequence failed",
+                            lane=lane,
+                        )
                         print(
-                            f"[ERROR] Browser closed during paste/send step and could not complete send.\n"
-                            f"        Lost step       : paste_and_send (before prompt was sent)\n"
-                            f"        Last screenshot : {last_step_shot or '(none)'}\n"
-                            f"        Nothing was sent, so repeating this task costs zero quota.",
+                            manual_setup_instructions(mode, str(shot_saved) if shot_saved else None),
                             file=sys.stderr,
                         )
-                        task_registry.register_done(proj_root, lane=lane, slot=active_slot, status="failed")
-                        return EXIT_BROWSER_CLOSED
-                else:
-                    print(f"[!] Prompt submission failed: {exc}", file=sys.stderr)
-                    shot_pf_err = _take_step_screenshot(
+                        ruled = ["Browser launched and workspace composer rendered", "Google account is signed in (not guest)"]
+                        if mode_ok:
+                            ruled.append("Task mode toggle verified active")
+                        if model_ok:
+                            ruled.append("Model chip verified as 4 Argon (Flash guard passed)")
+                        if attached:
+                            ruled.append(f"Archive {zip_path.name} verified attached and sent")
+                        ev_pf = _collect_diagnostic_evidence(
+                            page=page,
+                            proj_root=proj_root,
+                            reason="Send sequence failed (" + ", ".join(preflight) + ")",
+                            slot=active_slot,
+                            email=target_email,
+                            profile_dir=profile_dir,
+                            chat_url=getattr(page, "url", "") or target_url,
+                            screenshot_path=shot_saved,
+                            preflight=preflight,
+                            ruled_out=ruled,
+                            next_step=(
+                                "Use the manual hand-off pack printed below (or let the next pool slot take over)."
+                            ),
+                        )
+                        task_state_store.set(proj_root, lane=lane, state="preflight_failed", diagnostic_evidence=ev_pf)
+                        task_registry.register_done(proj_root, lane=lane, slot=active_slot, status="failed", screenshot_path=str(shot_saved or ""))
+                        _print_run_failure_summary(ev_pf)
+                        _emit_send_failure("preflight_failure", shot_saved, page_obj=page)
+                        return EXIT_PREFLIGHT_FAILED
+
+                    sent_hms = time.strftime("%H:%M:%S")
+                    sent_shot = _take_step_screenshot(
                         page,
                         proj_root,
-                        "failed.png",
-                        step_label="send_failed",
-                        state_label=f"Prompt submission failed: {exc}",
+                        "sent.png",
+                        step_label="sent",
+                        state_label=f"Prompt and {zip_path.name} submitted at {sent_hms}",
                         lane=lane,
                     )
-                    task_registry.register_done(proj_root, lane=lane, slot=active_slot, status="failed", screenshot_path=str(shot_pf_err or ""))
-                    return EXIT_PREFLIGHT_FAILED
+                    last_step_shot = sent_shot
+                    chip_after = _model_chip(page)
+                    name_after = _model_name(chip_after)
+                    if name_after:
+                        print(
+                            f"[i] Post-send model chip reads {name_after!r}: the chip after send shows "
+                            "the account default for future turns, not the model answering this turn "
+                            "(4 Argon was verified before send; real proof is verified in the answer)."
+                        )
+                    print("[+] Prompt submitted immediately upon upload completion in a verified Task/4 Argon workspace.")
+                    try:
+                        profile_dir_str = str(profile_dir)
+                    except Exception:
+                        profile_dir_str = ""
+                    task_state.set(
+                        proj_root,
+                        lane=lane,
+                        chat_url=page.url,
+                        chat_title=_chat_title(page),
+                        slot=active_slot,
+                        profile_number=_slot_number(active_slot),
+                        profile_dir=profile_dir_str,
+                        email=target_email,
+                        mode=mode,
+                        state="sent",
+                        task=task,
+                        prompt_hash=_prompt_hash(prompt_text),
+                        task_hash=_prompt_hash(task),
+                        prompt_prefix=_normalize_ws(prompt_text)[:200],
+                        sent_at=sent_hms,
+                        started_epoch=dispatch_started,
+                        started_at=time.strftime("%Y-%m-%d %H:%M:%S"),
+                        last_screenshot=str(sent_shot or ""),
+                    )
+                    task_registry.update_running(
+                        proj_root,
+                        lane=lane,
+                        slot=active_slot,
+                        chat_url=page.url,
+                        screenshot_path=str(sent_shot or ""),
+                        prompt_hash=_prompt_hash(prompt_text),
+                    )
+                    _emit_send_failure("prompt_sent", sent_shot, page_obj=page)
+                    print(f"[+] Task state saved: {task_state.path}")
+                    print(f"    account / profile : {active_slot}  ({profile_dir_str})")
 
             # ------------------------------------------------- remember session --
             chat_id = _wait_for_chat_id(page)
-            # D19.2: On a new session, compare chat_id against forbidden_new_chat_ids
             if not is_continuation and not resume_chat and chat_id and chat_id in forbidden_new_chat_ids:
                 shot_foreign = _take_step_screenshot(
                     page,
@@ -9640,11 +9355,6 @@ def dispatch_to_argon(
             last_body = ""
             run_failed_reason = ""
             last_state_write = 0.0
-            # Rule 5.1 & 5.2: If for 3 minutes (180 s) the conversation text has
-            # not changed, there is no stop button, no thinking indicator, no
-            # spinner and no delivery, the page looks stalled: take a stall
-            # screenshot and refresh the page instead of waiting it out or
-            # re-sending the prompt.
             STALL_SECONDS = 180.0
             HEARTBEAT_SECONDS = 120.0
             WAITING_SHOT_SECONDS = 120.0
@@ -9673,10 +9383,6 @@ def dispatch_to_argon(
                     fallback_url=target_url,
                     task_state=task_state,
                     session_store=session_store,
-                    # The shared master profile holds EVERY account, so the slot
-                    # index must be kept there; only a per-slot profile forces
-                    # /u/0/. Defaulting to True here would silently talk to the
-                    # wrong account.
                     isolated_profile=_profile_is_isolated_slot(profile_dir),
                 )
                 reopen_attempts += 1
@@ -9725,9 +9431,6 @@ def dispatch_to_argon(
                         if live_cid:
                             session_store.remember(
                                 proj_root, mode, active_slot, live_cid,
-                                # The stored chat URL must match the profile the
-                                # run actually used: a per-slot profile stores
-                                # /u/0/, the shared master profile stores /u/<slot>/.
                                 profile_dir=str(profile_dir),
                                 lane=lane,
                             )
@@ -9765,37 +9468,6 @@ def dispatch_to_argon(
                             last_known_url = page.url
                     except Exception:
                         pass
-
-                    quota = _detect_quota_limit(page)
-                    if quota:
-                        acct_now = _detect_signed_in_account(page, target_email, active_slot)
-                        shot_q = _take_step_screenshot(page, proj_root, "quota_limited.png")
-                        print(
-                            f"\n[!] Account {acct_now} (slot {active_slot}) hit its usage limit ({quota}).",
-                            file=sys.stderr,
-                        )
-                        print(
-                            "    Moving on to the next account in the pool.",
-                            file=sys.stderr,
-                        )
-                        _mark_quota_limited(active_slot)
-                        ev_q = _collect_diagnostic_evidence(
-                            page=page,
-                            proj_root=proj_root,
-                            reason=f"Account {acct_now} ({active_slot}) hit usage limit ({quota}) while waiting",
-                            slot=active_slot,
-                            email=acct_now,
-                            profile_dir=profile_dir,
-                            chat_title=chat_title,
-                            chat_url=last_known_url or effective_chat_url,
-                            screenshot_path=shot_q,
-                            preflight=preflight,
-                            ruled_out=["Workspace pre-flight passed", "Prompt was sent to conversation"],
-                            next_step="Rotating to the next pool account automatically.",
-                        )
-                        task_state.set(proj_root, state="quota_limited", diagnostic_evidence=ev_q)
-                        _print_run_failure_summary(ev_q)
-                        return EXIT_QUOTA_LIMITED
 
                     now_mono = time.monotonic()
                     rem_secs = max(0.0, deadline - now_mono)
@@ -10930,7 +10602,7 @@ def append_followup_to_running_task(
                 pg.goto(norm_chat_url, wait_until="domcontentloaded", timeout=60000)
                 _wait_for_conversation_loaded(pg, timeout=25.0, require_turns=False)
                 comp = _find_composer(pg)
-                if comp is not None:
+                if comp is not None and enforce_no_flash_before_send(pg):
                     _type_and_send(pg, comp, formatted_message)
                     pg.wait_for_timeout(2000)
                     sent_in_browser = True
@@ -10966,15 +10638,14 @@ def select_account_slot(
     lane: Optional[str] = None,
     exclude_slots: Optional[set] = None,
 ) -> tuple[str, str]:
-    """Select the pool slot according to the D3 Account Policy and D4 TaskRegistry.
+    """Select the pool slot according to the owner's single slot rule (Rule 2).
 
     Policy:
-      - FOLLOW-UP: the account that holds the chat (the recorded winner's slot,
-        never rotated, because the conversation lives in that profile).
-      - CARRY-OVER: the account that held the failed run, because the context lives there.
-      - NEW TASK: always a DIFFERENT account than the one that just ran - the next
-        free account in pool order, skipping every slot at its registry limit, a
-        quota_limited slot, and the account that ran the previous round.
+      - FOLLOW-UP: always uses the account slot that holds the conversation,
+        even when that slot is already running MAX_TASKS_PER_SLOT tasks.
+      - CARRY-OVER / RESUME: stays on the slot that held the run.
+      - NEW TASK: skips an account ONLY when it is already running the maximum
+        number of tasks (MAX_TASKS_PER_SLOT). No other status or limit skips an account.
     """
     excluded = {normalize_slot(s) for s in (exclude_slots or set()) if s}
     reg = TaskRegistry()
@@ -10995,23 +10666,24 @@ def select_account_slot(
         c_entry = task_store.get(project_path, lane=lane) or task_store.get(project_path) or {}
         if c_entry.get("slot"):
             c_slot = normalize_slot(str(c_entry["slot"]))
-            return c_slot, f"CARRY-OVER policy: staying on {c_slot} where the failed run's context lives"
+            return c_slot, f"CARRY-OVER policy: staying on {c_slot} where the previous context lives"
 
-    # Rule 1: The follow-up always goes to the account that holds the chat - never rotated.
-    # Even when that account is already busy with two tasks, that chat lives there, so USE it and say so in one line.
+    # Follow-up always uses its own account even when that account already runs multiple tasks.
     existing_session = None if (new_session or lane == "new") else sess_store.lookup(project_path, mode=mode)
     if existing_session and existing_session.get("chat_url") and existing_session.get("slot"):
         f_slot = normalize_slot(str(existing_session["slot"]))
         f_cid = str(existing_session.get("chat_id") or "")
         f_load = len(reg.active_tasks_for_slot(f_slot))
-        busy_note = f"; slot already has {f_load} active task(s), using it anyway because the chat lives there" if f_load >= MAX_TASKS_PER_SLOT else f" (registry load {f_load}/{MAX_TASKS_PER_SLOT})"
+        busy_note = (
+            f"; slot already has {f_load} active task(s), using it anyway because the follow-up chat lives there"
+            if f_load >= MAX_TASKS_PER_SLOT
+            else f" (registry load {f_load}/{MAX_TASKS_PER_SLOT})"
+        )
         return (
             f_slot,
             f"FOLLOW-UP policy: continuing conversation {f_cid or '(stored)'} on the account that holds it ({f_slot}{busy_note})",
         )
 
-    # Rule 2 & 3: A new task prefers an account that is not busy. When no account is free,
-    # continue on the least loaded account and print the reason. Never refuse to work because an account is busy.
     last_ran_slots: set = set(excluded)
     if existing_session and existing_session.get("slot"):
         last_ran_slots.add(normalize_slot(str(existing_session["slot"])))
@@ -11035,22 +10707,10 @@ def select_account_slot(
 
     base_prof = pool_cfg.profile_dir if pool_cfg is not None else (Path.home() / ".gemini" / "argon_browser_profile")
 
-    # Pass 1: Prefer a completely idle slot (0 tasks in registry, profile not busy) different from last_ran_slots
+    # Pass 1: Slot under MAX_TASKS_PER_SLOT with 0 running tasks, different from last_ran_slots
     for cand in ordered_pool:
         norm_c = normalize_slot(cand)
         if norm_c in last_ran_slots:
-            continue
-        active_on_slot = reg.active_tasks_for_slot(norm_c)
-        if len(active_on_slot) == 0 and not _profile_is_busy(_profile_dir_for_slot(base_prof, norm_c)):
-            return (
-                norm_c,
-                f"NEW-TASK policy: rotated to next free account {norm_c} (skipped previous {sorted(last_ran_slots)}, registry load 0/{MAX_TASKS_PER_SLOT})",
-            )
-
-    # Pass 2: Any slot with 0 tasks in registry and profile not busy
-    for cand in ordered_pool:
-        norm_c = normalize_slot(cand)
-        if norm_c in excluded:
             continue
         active_on_slot = reg.active_tasks_for_slot(norm_c)
         if len(active_on_slot) == 0 and not _profile_is_busy(_profile_dir_for_slot(base_prof, norm_c)):
@@ -11059,19 +10719,31 @@ def select_account_slot(
                 f"NEW-TASK policy: selected idle account {norm_c} (registry load 0/{MAX_TASKS_PER_SLOT})",
             )
 
-    # Pass 3: Any slot under MAX_TASKS_PER_SLOT (2) different from last_ran_slots
+    # Pass 2: Any slot under MAX_TASKS_PER_SLOT, different from last_ran_slots
     for cand in ordered_pool:
         norm_c = normalize_slot(cand)
         if norm_c in last_ran_slots:
             continue
         ok_s, cap_reason = reg.is_slot_available(norm_c, max_tasks=MAX_TASKS_PER_SLOT)
-        if ok_s and not _profile_is_busy(_profile_dir_for_slot(base_prof, norm_c)):
+        if ok_s:
             return (
                 norm_c,
-                f"NEW-TASK policy: rotated to available account {norm_c} (skipped previous {sorted(last_ran_slots)}, {cap_reason})",
+                f"NEW-TASK policy: selected account {norm_c} under task cap ({cap_reason})",
             )
 
-    # Pass 4: Least-loaded slot across the pool (never refuse because an account is busy)
+    # Pass 3: Any slot in the pool under MAX_TASKS_PER_SLOT
+    for cand in ordered_pool:
+        norm_c = normalize_slot(cand)
+        if norm_c in excluded:
+            continue
+        ok_s, cap_reason = reg.is_slot_available(norm_c, max_tasks=MAX_TASKS_PER_SLOT)
+        if ok_s:
+            return (
+                norm_c,
+                f"NEW-TASK policy: selected available account {norm_c} ({cap_reason})",
+            )
+
+    # Pass 4: Every slot is already at MAX_TASKS_PER_SLOT - pick the least-loaded slot without blocking
     pool_candidates = [normalize_slot(c) for c in ordered_pool if normalize_slot(c) not in excluded] or [
         normalize_slot(c) for c in ordered_pool
     ]
@@ -11086,7 +10758,7 @@ def select_account_slot(
     ll_count = len(reg.active_tasks_for_slot(least_loaded))
     return (
         least_loaded,
-        f"NEW-TASK least-loaded fallback: all accounts are busy; continuing on least-loaded account {least_loaded} (registry load {ll_count}/{MAX_TASKS_PER_SLOT})",
+        f"NEW-TASK least-loaded fallback: all accounts are at capacity; continuing on least-loaded account {least_loaded} (registry load {ll_count}/{MAX_TASKS_PER_SLOT})",
     )
 
 
@@ -11095,11 +10767,11 @@ def _pool_slots_in_order(
     start_slot: Optional[str],
     skip_start_slot: bool = False,
 ) -> list:
-    """Pool slots to try in wrap-around order.
+    """Pool slots to try in wrap-around order (Rule 2).
 
-    When `skip_start_slot=True` (used for NEW tasks under D3), starts at the slot
-    IMMEDIATELY AFTER `start_slot` so a new task never reuses the account that
-    just ran unless every other account is unavailable.
+    Every configured pool account is included regardless of its status field.
+    Slots that are currently below `MAX_TASKS_PER_SLOT` in `TaskRegistry` are
+    ordered ahead of slots that are already running `MAX_TASKS_PER_SLOT` tasks.
     """
     if pool_cfg is None:
         return []
@@ -11124,23 +10796,17 @@ def _pool_slots_in_order(
         start_idx = (start_idx + 1) % len(ordered)
     rotated = ordered[start_idx:] + ordered[:start_idx]
 
-    skip_statuses = {"quota_limited", "argon_disabled", "no_argon"}
-    fresh = [
-        a for a in rotated
-        if str(a.get("status", "")).strip().lower() not in skip_statuses
-    ]
-    return [normalize_slot(a["slot"]) for a in fresh if a.get("slot")]
-
-
-def _mark_quota_limited(slot: str) -> None:
-    """Remember that this account hit its usage limit."""
-    try:
-        from argon_pool_login import PoolConfig
-
-        PoolConfig().set_status(slot, "quota_limited")
-        print(f"[+] Marked {slot} as quota limited; the next run will skip it.")
-    except Exception as exc:
-        print(f"[!] Could not record the quota limit for {slot}: {exc}", file=sys.stderr)
+    reg = TaskRegistry()
+    under_cap: list[str] = []
+    at_cap: list[str] = []
+    for a in rotated:
+        s_norm = normalize_slot(a["slot"])
+        ok_slot, _ = reg.is_slot_available(s_norm, max_tasks=MAX_TASKS_PER_SLOT)
+        if ok_slot:
+            under_cap.append(s_norm)
+        else:
+            at_cap.append(s_norm)
+    return under_cap + at_cap
 
 
 def list_registered_tasks_cli() -> int:
@@ -11172,14 +10838,7 @@ def list_registered_tasks_cli() -> int:
 
 
 def _make_console_utf8_safe() -> None:
-    """Never let a print kill the dispatcher with UnicodeEncodeError.
-
-    A redirected pipe on Windows defaults to cp1252. The brief summary that
-    --brief-summary prints contains emoji and Bengali text, so printing it raw
-    raises UnicodeEncodeError; the surrounding try/except then swallows the
-    summary instead of showing it. Keep the stream's own encoding but replace
-    whatever it cannot represent, so the summary is always displayed.
-    """
+    """Never let a print kill the dispatcher with UnicodeEncodeError."""
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.reconfigure(errors="replace")
@@ -11366,8 +11025,6 @@ def main(argv: Optional[List[str]] = None) -> int:
             open_comparison=args.open_comparison,
         )
 
-    # A run that finishes WITHOUT a delivery is carried over into a NEW session
-    # by default (see --no-carry-over).
     carry_over = not args.no_carry_over
 
     try:
@@ -11401,21 +11058,27 @@ def main(argv: Optional[List[str]] = None) -> int:
             deadline_seconds=args.deadline_seconds,
         )
 
-    existing_session = None if args.new_session else SessionStore().lookup(args.project_path, mode=args.mode)
-    is_followup_bound = bool(existing_session and existing_session.get("chat_url") and not args.new_session)
+    # Rule 2: --lane new is always a NEW task and must rotate across pool slots when needed,
+    # whereas a FOLLOW-UP always stays on its own conversation slot even if busy.
+    is_new_lane_or_session = bool(args.new_session or args.lane == "new")
+    existing_session = None if is_new_lane_or_session else SessionStore().lookup(args.project_path, mode=args.mode)
+    is_followup_bound = bool(
+        existing_session
+        and existing_session.get("chat_url")
+        and not is_new_lane_or_session
+    )
 
     chosen_slot, slot_reason = select_account_slot(
         pool_cfg=pool_cfg,
         project_path=args.project_path,
         mode=args.mode,
         requested_slot=args.slot,
-        new_session=args.new_session,
+        new_session=is_new_lane_or_session,
         lane=args.lane,
     )
     print(f"[+] Account policy selected start slot {chosen_slot}: {slot_reason}")
 
     if is_followup_bound:
-        # D3: A FOLLOW-UP stays on the account that holds the chat (never rotated to another slot)
         slots = [chosen_slot]
     else:
         slots = _pool_slots_in_order(pool_cfg, chosen_slot, skip_start_slot=False)
@@ -11435,7 +11098,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             manual_setup=args.manual_setup,
             target_files=args.files,
             output_zip=args.output_zip,
-            new_session=args.new_session,
+            new_session=is_new_lane_or_session,
             resume=args.resume,
             carry_over=carry_over,
             verify_timeout=args.verify_timeout,
@@ -11447,23 +11110,19 @@ def main(argv: Optional[List[str]] = None) -> int:
             skip_package=args.skip_package,
             force=args.force,
             deadline_seconds=args.deadline_seconds,
+            brief_summary=args.brief_summary,
         )
 
-    # D20: Continue rotating across pool accounts on ANY pre-flight / sign-in / launch / busy / quota failure
-    # of a new task (only marking the account quota_limited when the reason is quota / Argon disabled).
     last = EXIT_FAILURE
-    saw_quota = False
     saw_busy = False
     skipped_accounts: List[tuple[str, str]] = []
     rotatable_codes = {
-        EXIT_QUOTA_LIMITED,
         EXIT_SLOT_BUSY,
         EXIT_PREFLIGHT_FAILED,
         EXIT_NOT_SIGNED_IN,
         EXIT_BROWSER_LAUNCH_FAILED,
     }
     code_labels = {
-        EXIT_QUOTA_LIMITED: "quota_limited / 4 Argon disabled",
         EXIT_SLOT_BUSY: "slot busy or at 2-task registry limit",
         EXIT_PREFLIGHT_FAILED: "pre-flight check failed",
         EXIT_NOT_SIGNED_IN: "profile not signed in",
@@ -11483,7 +11142,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             manual_setup=args.manual_setup,
             target_files=args.files,
             output_zip=args.output_zip,
-            new_session=args.new_session,
+            new_session=is_new_lane_or_session,
             resume=args.resume,
             carry_over=carry_over,
             verify_timeout=args.verify_timeout,
@@ -11495,6 +11154,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             skip_package=args.skip_package,
             force=args.force,
             deadline_seconds=args.deadline_seconds,
+            brief_summary=args.brief_summary,
         )
         if last == EXIT_SUCCESS or last == EXIT_ALREADY_RUNNING:
             if skipped_accounts:
@@ -11505,10 +11165,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         if not is_followup_bound and last in rotatable_codes and len(slots) > 1:
             reason_label = code_labels.get(last, f"exit code {last}")
             skipped_accounts.append((slot, reason_label))
-            if last == EXIT_QUOTA_LIMITED:
-                saw_quota = True
-                _mark_quota_limited(slot)
-            elif last == EXIT_SLOT_BUSY:
+            if last == EXIT_SLOT_BUSY:
                 saw_busy = True
             print(
                 f"[+] Account {slot} failed ({reason_label}) - continuing rotation across remaining pool accounts."
@@ -11520,12 +11177,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"\n[!] Pool rotation exhausted after trying {len(skipped_accounts)} account(s):", file=sys.stderr)
         for sk_slot, sk_reason in skipped_accounts:
             print(f"    - {sk_slot}: {sk_reason}", file=sys.stderr)
-    if saw_busy and not saw_quota:
+    if saw_busy:
         print("\n[!] Every account slot in the pool is currently busy.", file=sys.stderr)
         return EXIT_SLOT_BUSY
-    if saw_quota:
-        print("\n[!] Every available account in the pool is rate limited right now.", file=sys.stderr)
-        return EXIT_QUOTA_LIMITED
     return last
 
 

@@ -103,10 +103,11 @@ def pick_new_session_slot(
     followup_slot: str,
     preferred_slot: Optional[str] = None,
 ) -> str:
-    """Pick a pool slot for the NEW-SESSION lane using TaskRegistry & Account Policy without hard blocking (Section 3).
+    """Pick a pool slot for the NEW-SESSION lane using the single slot rule (Rule 2).
 
-    Prefers an idle account different from `followup_slot`. When all accounts are
-    busy, selects the least-loaded account and prints the reason (never refuses).
+    Every account in the pool is included regardless of status. A new-session lane
+    skips `followup_slot` and skips any slot that already runs `MAX_TASKS_PER_SLOT`
+    tasks (falling back to the least-loaded slot if all slots are at capacity).
     """
     norm_followup = normalize_slot(followup_slot)
     base_profile = pool_cfg.profile_dir if pool_cfg is not None else (Path.home() / ".gemini" / "argon_browser_profile")
@@ -141,7 +142,7 @@ def pick_new_session_slot(
         fallback_slots = ["/u/0/", "/u/1/", "/u/2/", "/u/3/", "/u/4/", "/u/5/", "/u/6/", "/u/7/"]
         candidates = [s for s in fallback_slots if s != norm_followup]
 
-    # Pass 1: Prefer a slot with 0 active registry tasks that also differs from last_used
+    # Pass 1: Prefer a slot under MAX_TASKS_PER_SLOT with 0 active registry tasks that differs from last_used
     for cand in candidates:
         if cand != last_used and _is_slot_free(base_profile, cand, require_zero_tasks=True):
             return cand
@@ -149,9 +150,10 @@ def pick_new_session_slot(
     for cand in candidates:
         if _is_slot_free(base_profile, cand, require_zero_tasks=True):
             return cand
-    # Pass 3: Any slot under MAX_TASKS_PER_SLOT (2)
+    # Pass 3: Any slot under MAX_TASKS_PER_SLOT
     for cand in candidates:
-        if _is_slot_free(base_profile, cand, require_zero_tasks=False):
+        ok_reg, _ = reg.is_slot_available(cand, max_tasks=MAX_TASKS_PER_SLOT)
+        if ok_reg:
             return cand
     # Pass 4 (No Hard Blocking): Pick the least-loaded candidate slot and print the reason
     least_loaded = min(
@@ -163,11 +165,10 @@ def pick_new_session_slot(
     )
     ll_load = len(reg.active_tasks_for_slot(least_loaded))
     print(
-        f"[+] All candidate pool slots are busy; picked least-loaded slot {least_loaded} "
+        f"[+] All candidate pool slots are at capacity; picked least-loaded slot {least_loaded} "
         f"(registry load {ll_load}/{MAX_TASKS_PER_SLOT}) for NEW lane without blocking."
     )
     return least_loaded
-
 
 def prepare_dual_round(
     task: str,

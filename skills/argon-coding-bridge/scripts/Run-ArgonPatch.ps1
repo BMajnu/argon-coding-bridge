@@ -605,8 +605,8 @@ try {
 
             # Structure guard: a file that was balanced before the patch and is
             # unbalanced after it lost a brace - the most common way a delivered
-            # patch breaks the build. Reported here so it can be fixed locally;
-            # it costs no quota.
+            # patch breaks the build. Reported here so it can be fixed locally
+            # without an extra round trip.
             if ($oldBytes.Length -gt 0) {
                 $oldBal = Get-SourceBalance ([System.Text.Encoding]::UTF8.GetString($oldBytes))
                 $newBal = Get-SourceBalance ([System.Text.Encoding]::UTF8.GetString($newBytes))

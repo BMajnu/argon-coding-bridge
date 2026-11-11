@@ -84,6 +84,32 @@ def sanitize_signin_url(url: str, isolated_profile: bool = True) -> str:
     return cleaned
 
 
+def _env_allows_session_reset_for_profile(
+    profile_dir: Union[str, Path],
+    slot: Optional[Union[str, int]] = None,
+) -> bool:
+    """Return True ONLY when ARGON_ALLOW_SESSION_RESET explicitly names the target slot or profile (Rule 1).
+
+    A blanket `ARGON_ALLOW_SESSION_RESET=1` (or `true`/`all`/`*`) is refused so an environment
+    variable can never silently arm destructive cookie/account resets across every slot profile.
+    """
+    raw_env = (os.environ.get("ARGON_ALLOW_SESSION_RESET") or "").strip()
+    if not raw_env or raw_env.lower() in ("0", "1", "true", "false", "yes", "no", "all", "*"):
+        return False
+    prof = Path(profile_dir).expanduser().resolve()
+    candidates = {prof.name.lower()}
+    m_prof = re.search(r"slot-u(\d+)", prof.name, flags=re.IGNORECASE)
+    if m_prof:
+        idx_str = str(int(m_prof.group(1)))
+        candidates.update({f"/u/{idx_str}/", f"/u/{idx_str}", f"u{idx_str}", f"slot-u{idx_str}", idx_str})
+    if slot is not None and str(slot).strip():
+        norm_s = normalize_slot(slot).lower()
+        s_key = slot_key(slot).lower()
+        candidates.update({norm_s, norm_s.strip("/"), s_key, f"slot-{s_key}"})
+    tokens = [tok.strip().lower() for tok in re.split(r"[,;\s]+", raw_env) if tok.strip()]
+    return any(tok in candidates for tok in tokens)
+
+
 def reset_slot_profile_accounts(
     profile_dir: Union[str, Path],
     clear_cookies: bool = False,
@@ -91,9 +117,9 @@ def reset_slot_profile_accounts(
 ) -> None:
     """Reset the stored account list (and optionally cookie DB) of a slot profile on disk.
 
-    Section 2.2.D & 2.3.C:
+    Rule 1 (Session-safe diagnosis & gated reset):
     - Never reachable from an ordinary run without explicit `allow_destructive_reset=True`
-      (or `ARGON_ALLOW_SESSION_RESET=1`).
+      or `ARGON_ALLOW_SESSION_RESET=<slot>` naming this exact slot.
     - Never resets a shared multi-account profile (`not is_isolated_slot_profile(prof)`).
     - Always snapshots `Default/Network/Cookies` and `Default/Preferences` before touching disk.
     """
@@ -111,7 +137,7 @@ def reset_slot_profile_accounts(
         return
 
     explicit_allowed = bool(
-        allow_destructive_reset or os.environ.get("ARGON_ALLOW_SESSION_RESET") == "1"
+        allow_destructive_reset or _env_allows_session_reset_for_profile(prof)
     )
     if not explicit_allowed and has_acct:
         logger.info(
@@ -482,6 +508,7 @@ class PoolConfig:
         self.load()
 
     def load(self) -> Dict[str, Any]:
+        changed_on_load = False
         if self.path.exists():
             raw_text = self.path.read_text(encoding="utf-8-sig")
             self.data = json.loads(raw_text)
@@ -490,8 +517,7 @@ class PoolConfig:
                 "version": "1.3.0",
                 "description": (
                     "Multi-Account Pool configuration for the Gemini 4 Argon Dispatcher. "
-                    "One persistent Chrome profile holds every Google account, so the dispatcher "
-                    "can rotate between them for quota."
+                    "Each Google account runs in its own isolated slot profile."
                 ),
                 "profile_dir": "~/.gemini/argon_browser_profile",
                 "active_slot": "/u/0/",
@@ -503,12 +529,26 @@ class PoolConfig:
             self.data["profile_dir"] = "~/.gemini/argon_browser_profile"
         if "active_slot" not in self.data or not self.data["active_slot"]:
             self.data["active_slot"] = "/u/0/"
+
+        valid_statuses = {"active", "signed_in", "configured", "not_signed_in", "failed", "needs_human"}
+        for acc in self.data["accounts"]:
+            if not isinstance(acc, dict):
+                continue
+            cur_st = str(acc.get("status") or "configured").strip().lower()
+            if cur_st not in valid_statuses:
+                acc["status"] = "signed_in"
+                changed_on_load = True
+        if changed_on_load and self.path.exists():
+            try:
+                self.save()
+            except Exception:
+                pass
         return self.data
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        # Validate unique slots and non-empty passwords before writing
         seen_slots = set()
+        valid_statuses = {"active", "signed_in", "configured", "not_signed_in", "failed", "needs_human"}
         for acc in self.data.get("accounts") or []:
             if not isinstance(acc, dict):
                 continue
@@ -519,6 +559,9 @@ class PoolConfig:
                 acc["index"] = idx
             acc["slot"] = s_norm
             seen_slots.add(s_norm)
+            cur_st = str(acc.get("status") or "configured").strip().lower()
+            if cur_st not in valid_statuses:
+                acc["status"] = "signed_in"
         serialized = json.dumps(self.data, indent=2, ensure_ascii=False) + "\n"
         tmp_path = self.path.with_name(f".{self.path.name}.{os.getpid()}.tmp")
         tmp_path.write_bytes(serialized.encode("utf-8"))
@@ -640,13 +683,15 @@ class PoolConfig:
 
     def set_status(self, slot: Union[str, int], status: str) -> Optional[Dict[str, Any]]:
         """Update the status field for the account matching slot (or email) and persist."""
+        valid_statuses = {"active", "signed_in", "configured", "not_signed_in", "failed", "needs_human"}
+        norm_status = status if str(status).strip().lower() in valid_statuses else "signed_in"
         raw_target = str(slot).strip()
         norm_target = normalize_slot(raw_target) if (raw_target.isdigit() or "/u/" in raw_target) else raw_target
         matched: Optional[Dict[str, Any]] = None
         for acc in self.accounts:
             acc_slot = normalize_slot(acc.get("slot", f"/u/{acc.get('index', 0)}/"))
             if acc_slot == norm_target or acc.get("email", "").lower() == raw_target.lower():
-                acc["status"] = status
+                acc["status"] = norm_status
                 matched = acc
                 break
         if matched is not None:
@@ -666,12 +711,7 @@ class PoolConfig:
         tier: str = "PRO",
         role: str = "Pool Member",
     ) -> Dict[str, Any]:
-        """Safely parse and import multi-line 'email:password' credentials (D7.1, D7.4).
-
-        Blank lines and '#' comment lines are ignored. Every line is validated on
-        its own so one malformed line never corrupts accounts_pool.json. Existing
-        emails have their password updated in place; new emails get a unique slot.
-        """
+        """Safely parse and import multi-line 'email:password' credentials (D7.1, D7.4)."""
         added: List[Dict[str, Any]] = []
         updated: List[Dict[str, Any]] = []
         failed: List[Dict[str, Any]] = []
@@ -726,223 +766,7 @@ class PoolConfig:
                     existing_acc["tier"] = tier.strip()
                 if role:
                     existing_acc["role"] = role.strip()
-                if existing_acc.get("status") in ("not_signed_in", "failed", "quota_limited"):
-                    existing_acc["status"] = "configured"
-                updated.append(existing_acc)
-                if existing_acc not in accounts_to_login:
-                    accounts_to_login.append(existing_acc)
-            else:
-                idx = self.next_index()
-                slot = f"/u/{idx}/"
-                entry: Dict[str, Any] = {
-                    "index": idx,
-                    "slot": slot,
-                    "email": clean_email,
-                    "password": clean_pwd,
-                    "tier": (tier or "PRO").strip(),
-                    "role": (role or "Pool Member").strip(),
-                    "status": "configured",
-                }
-                self.accounts.append(entry)
-                added.append(entry)
-                accounts_to_login.append(entry)
-
-        if added or updated:
-            self.save()
-
-        return {
-            "added": added,
-            "updated": updated,
-            "failed": failed,
-            "accounts_to_login": accounts_to_login,
-        }
-
-    def import_accounts_file(
-        self,
-        file_path: Union[str, Path],
-        tier: str = "PRO",
-        role: str = "Pool Member",
-    ) -> Dict[str, Any]:
-        """Load a .txt file of email:password lines and import them into accounts_pool.json."""
-        p = Path(file_path).expanduser().resolve()
-        raw_text = p.read_text(encoding="utf-8-sig", errors="replace")
-        return self.import_accounts_text(raw_text, tier=tier, role=role)
-
-    def import_accounts_text(
-        self,
-        raw_text: str,
-        tier: str = "PRO",
-        role: str = "Pool Member",
-    ) -> Dict[str, Any]:
-        """Safely parse and import multi-line 'email:password' credentials (D7.1, D7.4).
-
-        Blank lines and '#' comment lines are ignored. Every line is validated on
-        its own so one malformed line never corrupts accounts_pool.json. Existing
-        emails have their password updated in place; new emails get a unique slot.
-        """
-        added: List[Dict[str, Any]] = []
-        updated: List[Dict[str, Any]] = []
-        failed: List[Dict[str, Any]] = []
-        accounts_to_login: List[Dict[str, Any]] = []
-
-        email_re = re.compile(r"^[^@\s:]+@[^@\s:]+\.[^@\s:]+$")
-        for line_no, raw_line in enumerate((raw_text or "").splitlines(), 1):
-            stripped = raw_line.strip()
-            if not stripped or stripped.startswith("#"):
-                continue
-            if ":" not in stripped:
-                failed.append(
-                    {
-                        "line_no": line_no,
-                        "line": stripped[:40],
-                        "reason": "missing ':' separator (expected email:password)",
-                    }
-                )
-                continue
-            email_part, pwd_part = stripped.split(":", 1)
-            clean_email = email_part.strip()
-            clean_pwd = pwd_part.strip()
-            if not clean_email or not email_re.match(clean_email):
-                failed.append(
-                    {
-                        "line_no": line_no,
-                        "line": clean_email or "(empty email)",
-                        "reason": f"invalid email address: {clean_email!r}",
-                    }
-                )
-                continue
-            if not clean_pwd:
-                failed.append(
-                    {
-                        "line_no": line_no,
-                        "line": clean_email,
-                        "reason": f"empty password for {clean_email}",
-                    }
-                )
-                continue
-
-            existing_acc: Optional[Dict[str, Any]] = None
-            for acc in self.accounts:
-                if str(acc.get("email") or "").strip().lower() == clean_email.lower():
-                    existing_acc = acc
-                    break
-
-            if existing_acc is not None:
-                existing_acc["email"] = clean_email
-                existing_acc["password"] = clean_pwd
-                if tier:
-                    existing_acc["tier"] = tier.strip()
-                if role:
-                    existing_acc["role"] = role.strip()
-                if existing_acc.get("status") in ("not_signed_in", "failed", "quota_limited"):
-                    existing_acc["status"] = "configured"
-                updated.append(existing_acc)
-                if existing_acc not in accounts_to_login:
-                    accounts_to_login.append(existing_acc)
-            else:
-                idx = self.next_index()
-                slot = f"/u/{idx}/"
-                entry: Dict[str, Any] = {
-                    "index": idx,
-                    "slot": slot,
-                    "email": clean_email,
-                    "password": clean_pwd,
-                    "tier": (tier or "PRO").strip(),
-                    "role": (role or "Pool Member").strip(),
-                    "status": "configured",
-                }
-                self.accounts.append(entry)
-                added.append(entry)
-                accounts_to_login.append(entry)
-
-        if added or updated:
-            self.save()
-
-        return {
-            "added": added,
-            "updated": updated,
-            "failed": failed,
-            "accounts_to_login": accounts_to_login,
-        }
-
-    def import_accounts_file(
-        self,
-        file_path: Union[str, Path],
-        tier: str = "PRO",
-        role: str = "Pool Member",
-    ) -> Dict[str, Any]:
-        """Load a .txt file of email:password lines and import them into accounts_pool.json."""
-        p = Path(file_path).expanduser().resolve()
-        raw_text = p.read_text(encoding="utf-8-sig", errors="replace")
-        return self.import_accounts_text(raw_text, tier=tier, role=role)
-
-    def import_accounts_text(
-        self,
-        raw_text: str,
-        tier: str = "PRO",
-        role: str = "Pool Member",
-    ) -> Dict[str, Any]:
-        """Safely parse and import multi-line 'email:password' credentials (D7.1, D7.4).
-
-        Blank lines and '#' comment lines are ignored. Every line is validated on
-        its own so one malformed line never corrupts accounts_pool.json. Existing
-        emails have their password updated in place; new emails get a unique slot.
-        """
-        added: List[Dict[str, Any]] = []
-        updated: List[Dict[str, Any]] = []
-        failed: List[Dict[str, Any]] = []
-        accounts_to_login: List[Dict[str, Any]] = []
-
-        email_re = re.compile(r"^[^@\s:]+@[^@\s:]+\.[^@\s:]+$")
-        for line_no, raw_line in enumerate((raw_text or "").splitlines(), 1):
-            stripped = raw_line.strip()
-            if not stripped or stripped.startswith("#"):
-                continue
-            if ":" not in stripped:
-                failed.append(
-                    {
-                        "line_no": line_no,
-                        "line": stripped[:40],
-                        "reason": "missing ':' separator (expected email:password)",
-                    }
-                )
-                continue
-            email_part, pwd_part = stripped.split(":", 1)
-            clean_email = email_part.strip()
-            clean_pwd = pwd_part.strip()
-            if not clean_email or not email_re.match(clean_email):
-                failed.append(
-                    {
-                        "line_no": line_no,
-                        "line": clean_email or "(empty email)",
-                        "reason": f"invalid email address: {clean_email!r}",
-                    }
-                )
-                continue
-            if not clean_pwd:
-                failed.append(
-                    {
-                        "line_no": line_no,
-                        "line": clean_email,
-                        "reason": f"empty password for {clean_email}",
-                    }
-                )
-                continue
-
-            existing_acc: Optional[Dict[str, Any]] = None
-            for acc in self.accounts:
-                if str(acc.get("email") or "").strip().lower() == clean_email.lower():
-                    existing_acc = acc
-                    break
-
-            if existing_acc is not None:
-                existing_acc["email"] = clean_email
-                existing_acc["password"] = clean_pwd
-                if tier:
-                    existing_acc["tier"] = tier.strip()
-                if role:
-                    existing_acc["role"] = role.strip()
-                if existing_acc.get("status") in ("not_signed_in", "failed", "quota_limited"):
+                if existing_acc.get("status") in ("not_signed_in", "failed"):
                     existing_acc["status"] = "configured"
                 updated.append(existing_acc)
                 if existing_acc not in accounts_to_login:
@@ -1270,11 +1094,11 @@ class GoogleLogin:
         return has_auth_cookie
 
     def _reset_profile_accounts(self, allow_destructive_reset: bool = False) -> None:
-        """Gated account reset (Section 2.2.D & 2.3.C).
+        """Gated account reset (Rule 1).
 
         Never reachable from an ordinary run without `allow_destructive_reset=True`
-        (or `ARGON_ALLOW_SESSION_RESET=1`), never resets a shared multi-account profile,
-        and always snapshots cookies and Preferences before touching disk.
+        or `ARGON_ALLOW_SESSION_RESET=<slot>` naming this exact slot, never resets a
+        shared multi-account profile, and always snapshots cookies and Preferences first.
         """
         try:
             from safe_browser import snapshot_profile_session
@@ -1284,7 +1108,7 @@ class GoogleLogin:
             pass
         if not is_isolated_slot_profile(self.profile_dir):
             return
-        if not (allow_destructive_reset or os.environ.get("ARGON_ALLOW_SESSION_RESET") == "1"):
+        if not (allow_destructive_reset or _env_allows_session_reset_for_profile(self.profile_dir)):
             return
         was_running = self.context is not None
         if was_running:
@@ -1298,10 +1122,11 @@ class GoogleLogin:
             self.start()
 
     def _clear_google_session(self, allow_destructive_reset: bool = False) -> None:
-        """Gated cookie clear (Section 2.2.D & 2.3.C).
+        """Gated cookie clear (Rule 1).
 
         Snapshots the profile session first and refuses to clear cookies during
-        ordinary runs or on shared multi-account profiles.
+        ordinary runs or on shared multi-account profiles unless `allow_destructive_reset=True`
+        or `ARGON_ALLOW_SESSION_RESET=<slot>` explicitly names this slot.
         """
         try:
             from safe_browser import snapshot_profile_session
@@ -1311,7 +1136,7 @@ class GoogleLogin:
             pass
         if not is_isolated_slot_profile(self.profile_dir):
             return
-        if not (allow_destructive_reset or os.environ.get("ARGON_ALLOW_SESSION_RESET") == "1"):
+        if not (allow_destructive_reset or _env_allows_session_reset_for_profile(self.profile_dir)):
             return
         try:
             ctx = self.start()
@@ -1319,95 +1144,175 @@ class GoogleLogin:
         except Exception:
             pass
 
-    def verify_session(
+    def _diagnose_session(
         self,
         expected_email: Optional[str] = None,
         expected_index: Optional[int] = None,
-    ) -> bool:
-        """Check that this profile holds a LIVE Google session and verify its index in `Default/Preferences`."""
+    ) -> tuple[bool, str]:
+        """Distinguish a genuinely missing session from a page that is still loading or a menu link (Rule 1).
+
+        Returns `(ok, reason)`:
+          - Never reports that session data was cleared unless BOTH the cookie DB and
+            `Default/Preferences` (`account_info`) are actually empty on disk.
+          - For an isolated slot profile, always checks `/u/0/app` (index 0).
+          - Waits for the Gemini page to finish rendering before deciding.
+          - Ignores 'Sign in' links that sit inside an account menu or conversation turn.
+        """
         isolated = is_isolated_slot_profile(self.profile_dir)
         target_idx = 0 if isolated else (expected_index if expected_index is not None else 0)
+        has_cookies_on_disk = _has_cookie_db(self.profile_dir)
+        has_pref_account = False
         try:
-            from safe_browser import snapshot_profile_session, verify_account_index_in_preferences
+            from safe_browser import profile_has_signed_in_account, verify_account_index_in_preferences
 
-            ok_pref, found_idx, _ = verify_account_index_in_preferences(
+            has_pref_account = profile_has_signed_in_account(self.profile_dir)
+            _, found_idx, _ = verify_account_index_in_preferences(
                 self.profile_dir,
                 expected_email or "",
                 expected_index=(0 if isolated else expected_index),
             )
-            if found_idx is not None:
-                target_idx = 0 if isolated else found_idx
+            if not isolated and found_idx is not None:
+                target_idx = found_idx
         except Exception:
-            pass
+            pref_file_chk = self.profile_dir / "Default" / "Preferences"
+            if pref_file_chk.is_file():
+                try:
+                    pref_obj = json.loads(pref_file_chk.read_text(encoding="utf-8", errors="replace"))
+                    has_pref_account = bool(pref_obj.get("account_info"))
+                except Exception:
+                    pass
 
         try:
             page = self._active_page()
-        except Exception:
-            return False
+        except Exception as exc:
+            return False, f"no browser page could be opened ({exc})"
+
+        target_url = f"https://gemini.google.com/u/{target_idx}/app"
         try:
             page.goto(
-                f"https://gemini.google.com/u/{target_idx}/app",
+                target_url,
                 wait_until="domcontentloaded",
                 timeout=60000,
             )
-            page.wait_for_timeout(6000)
-            body = (page.locator("body").inner_text(timeout=15000) or "").lower()
-        except Exception:
-            return False
-        url_now = (page.url or "").lower()
-        if any(
-            tok in url_now
-            for tok in (
-                "accounts.google.com/v3/signin",
-                "accounts.google.com/signin",
-                "accounts.google.com/servicelogin",
-                "/signin/rejected",
-                "/challenge/",
-            )
-        ):
-            return False
-        try:
-            sign_in_links = page.locator("a[href*='ServiceLogin'], a[aria-label*='Sign in']")
-            if sign_in_links.count() > 0 and sign_in_links.first.is_visible():
-                return False
-        except Exception:
-            pass
-        if "sign in to save activity" in body or "sign in or create an account" in body:
-            return False
-
-        # Verify account is registered in profile Preferences (account_info) at expected index
-        try:
-            pref_file = self.profile_dir / "Default" / "Preferences"
-            if pref_file.is_file():
-                pref_data = json.loads(pref_file.read_text(encoding="utf-8", errors="replace"))
-                acc_info = pref_data.get("account_info")
-                if acc_info is not None:
-                    if isinstance(acc_info, (list, dict)) and not acc_info:
-                        logger.warning(
-                            "Default/Preferences has empty account_info; account is not registered at index %s.",
-                            target_idx,
-                        )
-                        return False
         except Exception as exc:
-            logger.warning("Could not check account_info in Preferences: %s", exc)
+            return False, f"navigation to {target_url} failed or timed out (page not ready: {exc})"
 
-        verified_ok = "sign in to save activity" not in body and "sign in or create an account" not in body
-        try:
-            if page.locator(
-                "a[aria-label*='Google Account'], button[aria-label*='Google Account']"
-            ).count() > 0:
-                verified_ok = True
-        except Exception:
-            pass
-        if verified_ok:
+        # Wait up to 20s for the page to finish rendering either signed-in UI evidence or a real sign-in prompt.
+        ready_deadline = time.monotonic() + 20.0
+        signed_in_ui = False
+        while time.monotonic() < ready_deadline:
+            url_now = (page.url or "").lower()
+            if any(
+                tok in url_now
+                for tok in (
+                    "accounts.google.com/v3/signin",
+                    "accounts.google.com/signin",
+                    "accounts.google.com/servicelogin",
+                    "/signin/rejected",
+                    "/challenge/",
+                )
+            ):
+                if not has_cookies_on_disk and not has_pref_account:
+                    return False, "cookie DB and Default/Preferences account_info are empty (session data was cleared or never signed in)"
+                return False, f"redirected to Google sign-in URL ({page.url}) while disk cookie_db={has_cookies_on_disk} and preferences_account={has_pref_account}"
+
+            try:
+                avatars = page.locator(
+                    "a[aria-label*='Google Account'], button[aria-label*='Google Account'], "
+                    "a[aria-label*='Google অ্যাকাউন্ট'], button[aria-label*='Google অ্যাকাউন্ট']"
+                )
+                for i in range(min(avatars.count(), 4)):
+                    if avatars.nth(i).is_visible():
+                        signed_in_ui = True
+                        break
+                if not signed_in_ui and page.locator("a[href*='/app/']").count() > 0:
+                    signed_in_ui = True
+            except Exception:
+                pass
+            if signed_in_ui:
+                break
+            try:
+                page.wait_for_timeout(1500)
+            except Exception:
+                time.sleep(1.5)
+
+        if signed_in_ui:
             try:
                 from safe_browser import snapshot_profile_session
 
                 snapshot_profile_session(self.profile_dir)
             except Exception:
                 pass
-        return verified_ok
+            return True, "signed-in Gemini workspace verified"
 
+        try:
+            body = (page.locator("body").inner_text(timeout=5000) or "").strip()
+        except Exception:
+            body = ""
+        body_low = body.lower()
+
+        # Check if the page has not finished rendering yet (blank or loading shell without composer or guest banner)
+        has_composer = False
+        try:
+            has_composer = page.locator("rich-textarea div[contenteditable='true'], div[contenteditable='true'], textarea").count() > 0
+        except Exception:
+            has_composer = False
+
+        # Only count a top-level Sign-in control outside menus/dialogs/conversation turns
+        top_level_signin = False
+        try:
+            sign_in_links = page.locator("a[href*='ServiceLogin'], a[aria-label*='Sign in']")
+            for i in range(min(sign_in_links.count(), 6)):
+                el = sign_in_links.nth(i)
+                if not el.is_visible():
+                    continue
+                in_menu_or_turn = bool(
+                    el.evaluate(
+                        """node => {
+                            let cur = node;
+                            while (cur) {
+                                const role = (cur.getAttribute && (cur.getAttribute('role') || '')).toLowerCase();
+                                const tag = (cur.tagName || '').toLowerCase();
+                                if (role === 'menu' || role === 'dialog' || role === 'listbox' ||
+                                    tag === 'user-query' || tag === 'model-response' || tag === 'message-turn') {
+                                    return true;
+                                }
+                                cur = cur.parentElement;
+                            }
+                            return false;
+                        }"""
+                    )
+                )
+                if not in_menu_or_turn:
+                    top_level_signin = True
+                    break
+        except Exception:
+            pass
+
+        guest_banner = "sign in to save activity" in body_low or "sign in or create an account" in body_low
+        if not top_level_signin and not guest_banner:
+            if not body_low or not has_composer:
+                return False, f"Gemini page at {target_url} was not ready before timeout (session data on disk is intact: cookie_db={has_cookies_on_disk}, preferences_account={has_pref_account})"
+            if has_cookies_on_disk and has_pref_account:
+                return True, "composer ready and on-disk session verified (no guest banner present)"
+
+        if not has_cookies_on_disk and not has_pref_account:
+            return False, "cookie DB and Default/Preferences account_info are empty (session data was cleared or never signed in)"
+        if not has_pref_account:
+            return False, f"Default/Preferences has empty account_info at index {target_idx} (cookie_db={has_cookies_on_disk})"
+        return False, f"guest banner shown at {target_url} (cookie_db={has_cookies_on_disk}, preferences_account={has_pref_account}; session data on disk was NOT cleared)"
+
+    def verify_session(
+        self,
+        expected_email: Optional[str] = None,
+        expected_index: Optional[int] = None,
+    ) -> bool:
+        """Check that this profile holds a LIVE Google session and record the exact diagnosis reason in `self.last_session_diagnosis` (Rule 1)."""
+        ok, reason = self._diagnose_session(expected_email=expected_email, expected_index=expected_index)
+        self.last_session_diagnosis = reason
+        if not ok:
+            logger.warning("Session verification failed for profile %s: %s", self.profile_dir, reason)
+        return ok
     def _detect_challenge(self, page: Any) -> Optional[str]:
         """
         Inspect the current page for a human verification challenge:
@@ -1700,9 +1605,10 @@ class GoogleLogin:
             self._dismiss_post_login_prompts(page)
             if self.is_signed_in(page):
                 if not self.verify_session(expected_email=email):
+                    diag_reason = getattr(self, "last_session_diagnosis", "verification failed")
                     return LoginResult(
                         status=STATUS_FAILED,
-                        detail=f"Sign-in completed but account registration verification failed for {email} (shows guest page or missing Preferences account_info).",
+                        detail=f"Sign-in completed but session verification failed for {email}: {diag_reason}.",
                         email=email,
                     )
                 return LoginResult(
@@ -1796,11 +1702,11 @@ class GoogleLogin:
                         res.slot = slot
                         expected_idx = 0 if is_isolated_slot_profile(slot_profile) else slot_number(slot)
                         if res.status == STATUS_OK and not self.verify_session(expected_email=email, expected_index=expected_idx):
+                            diag_reason = getattr(self, "last_session_diagnosis", "guest page or unverified session")
                             res.status = STATUS_FAILED
                             res.detail = (
                                 (res.detail + " | " if res.detail else "")
-                                + "the profile still shows Gemini's guest page - "
-                                  "the session is not usable"
+                                + f"session verification failed: {diag_reason}"
                             )
                         elif res.status == STATUS_OK:
                             try:
@@ -2036,36 +1942,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     pool_cfg = PoolConfig(config_path=args.config, profile_dir_override=args.profile_dir)
 
     target_accounts: List[Dict[str, Any]] = []
-
-    if args.import_file:
-        rep = pool_cfg.import_accounts_file(args.import_file, tier=args.tier, role=args.role)
-        logger.info(
-            "Bulk import from %s: %d added, %d updated, %d failed",
-            args.import_file,
-            len(rep["added"]),
-            len(rep["updated"]),
-            len(rep["failed"]),
-        )
-        for fail in rep["failed"]:
-            logger.warning("  [Line %s] %s - %s", fail["line_no"], fail["line"], fail["reason"])
-        for acc in rep["accounts_to_login"]:
-            if acc not in target_accounts:
-                target_accounts.append(acc)
-
-    if args.import_file:
-        rep = pool_cfg.import_accounts_file(args.import_file, tier=args.tier, role=args.role)
-        logger.info(
-            "Bulk import from %s: %d added, %d updated, %d failed",
-            args.import_file,
-            len(rep["added"]),
-            len(rep["updated"]),
-            len(rep["failed"]),
-        )
-        for fail in rep["failed"]:
-            logger.warning("  [Line %s] %s - %s", fail["line_no"], fail["line"], fail["reason"])
-        for acc in rep["accounts_to_login"]:
-            if acc not in target_accounts:
-                target_accounts.append(acc)
 
     if args.import_file:
         rep = pool_cfg.import_accounts_file(args.import_file, tier=args.tier, role=args.role)

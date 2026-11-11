@@ -89,11 +89,8 @@ The following core rules MUST NOT be changed or bypassed in any contribution:
 
 1. **Viewer Download Button:** Patch scripts (`apply_changes.ps1`) are always captured and downloaded from the viewer toolbar download button—never scraped from preview text or chat blocks.
 2. **Single Local Verification:** Project build/lint checks run locally once after applying the patch; the bridge never loops back asking Argon to fix a build error.
-3. **Account Policy:** A new task prefers an idle, non-quota-limited pool account; a follow-up always stays on the account that owns the conversation.
+3. **Account Policy:** A new task skips an account only when it already runs the maximum number of tasks (`MAX_TASKS_PER_SLOT`); a follow-up always uses its own conversation account even when busy.
 4. **Zero UI Regression:** Maintain existing styling, layouts, and component structures.
-5. **Strict Credential Isolation:** `accounts_pool.json` contains sensitive credentials, is git-ignored, and MUST NEVER be committed, tracked, or bundled into context archives.
-
----
 
 ## License
 
