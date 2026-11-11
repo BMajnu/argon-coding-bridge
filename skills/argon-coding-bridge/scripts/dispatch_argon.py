@@ -10353,7 +10353,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--open-browser",
         action="store_true",
-        help="When generating a manual hand-off pack, open the target conversation in that slot's real Chrome profile and leave it open.",
+        help=(
+            "Open the browser and leave it open. On its own it opens the browser of --slot "
+            "in Gemini Web and PROVES it is up, before anything is sent (Rule 10). "
+            "With --manual-handoff it also opens the target conversation in that slot's "
+            "real Chrome profile."
+        ),
+    )
+    parser.add_argument(
+        "--open-url",
+        default="",
+        metavar="URL",
+        help="The URL --open-browser should open (default: Gemini Web for the slot's account).",
     )
     parser.add_argument(
         "--open-comparison",
@@ -10869,6 +10880,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         from safe_browser import list_browsers_cli
 
         return list_browsers_cli(project_path=args.project_path)
+
+    if getattr(args, "open_browser", False) and not getattr(args, "manual_handoff", False):
+        from safe_browser import open_browser_cli
+
+        return open_browser_cli(
+            slot=args.slot,
+            project_path=args.project_path,
+            url=str(getattr(args, "open_url", "") or ""),
+        )
 
     if getattr(args, "append_followup", None) is not None:
         return append_followup_to_running_task(

@@ -254,9 +254,16 @@ def _backup_sqlite_file(src: Path, dst: Path) -> bool:
                 sidecar.unlink()
         except OSError:
             pass
-    for uri_q in ("?mode=ro", "?mode=ro&immutable=1"):
+    for uri_q in ("?mode=ro&immutable=1", "?mode=ro"):
         try:
-            source = sqlite3.connect(f"file:{src.as_posix()}{uri_q}", uri=True, timeout=5.0)
+            # `as_uri()` percent-encodes the path. A raw path with a SPACE in it
+            # ("C:/Users/TechZone IT/...") is NOT a valid SQLite URI: the space ends
+            # the URI, every read fails with "unable to open database file", and the
+            # code falls back to a raw file copy - which BLOCKS forever on the cookie
+            # database that a live Chrome holds locked. That is how a session snapshot
+            # could hang the whole run.
+            base_uri = src.resolve().as_uri()
+            source = sqlite3.connect(f"{base_uri}{uri_q}", uri=True, timeout=5.0)
             try:
                 target = sqlite3.connect(str(dst), timeout=5.0)
                 try:
@@ -1286,5 +1293,154 @@ def list_browsers_cli(project_path: str = ".") -> int:
                     print(f"        - id={t.get('id')} title={t.get('title')!r} url={t.get('url')}")
             else:
                 print("      Tabs     : 0 registered task tabs")
+    print("=" * 78)
+    return 0
+
+
+def open_browser_cli(
+    slot: Optional[str] = None,
+    profile_dir: Optional[Union[str, Path]] = None,
+    project_path: str = ".",
+    url: str = "",
+    timeout: float = 45.0,
+) -> int:
+    """CLI handler for `dispatch_argon.py --open-browser --slot /u/N/` (Rule 10).
+
+    NOTHING may be sent before the browser is open. A browser tool call on a browser
+    that is not running fails, and the send silently never happens - the run looks
+    like it is working while nothing was ever delivered.
+
+    This starts (or attaches to) the slot's single CDP browser host, navigates a tab
+    to Gemini Web and PROVES that the browser really is up by reading the page title
+    back, so the caller can go on with confidence.
+
+    It uses the CDP HOST and not a second Chrome process: a second Chrome on the same
+    profile directory would take the profile lock and the dispatcher could no longer
+    attach to that profile.
+    """
+    from argon_pool_login import (
+        GEMINI_WEB_URL,
+        PoolConfig,
+        find_chrome_executable,
+        is_isolated_slot_profile,
+        normalize_slot,
+        seed_slot_profile,
+    )
+
+    eff_slot, prof = _resolve_slot_and_profile(slot=slot, profile_dir=profile_dir)
+
+    # Seed the slot profile from the master profile when it has no account yet,
+    # exactly like the pool assistant's "Open in Gemini Web" button does.
+    try:
+        if not is_isolated_slot_profile(prof):
+            pass
+        elif not (prof.is_dir() and (prof / "Default").is_dir()):
+            seed_slot_profile(Path.home() / ".gemini" / "argon_browser_profile", prof)
+    except Exception as exc:
+        print(f"[i] The slot profile could not be seeded ({exc}); continuing anyway.")
+
+    # An isolated slot profile holds exactly ONE account, at index 0. Opening
+    # /u/<N>/ for an isolated profile lands on the guest page.
+    target_url = url.strip()
+    if not target_url:
+        try:
+            if is_isolated_slot_profile(prof):
+                target_url = GEMINI_WEB_URL.format(slot="/u/0/")
+            else:
+                cfg = PoolConfig()
+                acc = cfg.get_by_slot(eff_slot) or {}
+                idx = 0
+                try:
+                    idx = int(str(acc.get("index") or 0))
+                except Exception:
+                    idx = 0
+                target_url = GEMINI_WEB_URL.format(slot=f"/u/{idx}/")
+        except Exception:
+            target_url = GEMINI_WEB_URL.format(slot="/u/0/")
+
+    host = ensure_browser_host(prof, chrome_exe=find_chrome_executable(), headless=False)
+    if not host:
+        # A plain Chrome (one that was started WITHOUT --remote-debugging-port) holds the
+        # profile. It publishes no CDP endpoint, so the bridge cannot attach to it and
+        # every browser tool call on that profile fails. It is closed the SAFE way -
+        # the cookies are snapshotted first and restored afterwards - and then the host
+        # is started, so the account stays signed in.
+        stuck_pids = find_chrome_pids_for_profile(prof)
+        if stuck_pids:
+            print(
+                f"[i] {len(stuck_pids)} Chrome process(es) hold this slot profile without a "
+                f"CDP endpoint - the bridge cannot attach to them. Closing them safely "
+                f"(cookies are snapshotted and restored) and starting the browser host."
+            )
+            try:
+                close_browser_safely(context=None, profile_dir=prof)
+            except Exception as exc:
+                print(f"[!] The safe close failed ({exc}).", file=sys.stderr)
+            host = ensure_browser_host(prof, chrome_exe=find_chrome_executable(), headless=False)
+    if not host:
+        print(
+            "[!] The browser could NOT be opened: a Chrome process for this slot profile "
+            "is already running but it does not publish a CDP endpoint, so it cannot be "
+            "attached to. Close it with --close-browser and try again.",
+            file=sys.stderr,
+        )
+        return 1
+
+    http_ep = str(host.get("http_endpoint") or "")
+    print("=" * 78)
+    print(f"  BROWSER OPEN ({eff_slot})")
+    print("=" * 78)
+    print(f"  Profile path    : {prof}")
+    print(f"  Slot            : {eff_slot}")
+    print(f"  Endpoint        : {http_ep}")
+    print(f"  PID(s)          : {', '.join(str(p) for p in (host.get('pids') or [])) or '(attached)'}")
+
+    title = ""
+    page_url = target_url
+    try:
+        from playwright.sync_api import sync_playwright
+
+        with sync_playwright() as p:
+            browser = p.chromium.connect_over_cdp(http_ep)
+            context = browser.contexts[0] if browser.contexts else browser.new_context(no_viewport=True)
+            page = None
+            for pg in context.pages:
+                try:
+                    if str(pg.url or "").strip() in ("", "about:blank", "chrome://newtab/"):
+                        page = pg
+                        break
+                except Exception:
+                    continue
+            if page is None:
+                page = context.new_page()
+            try:
+                page.goto(target_url, wait_until="domcontentloaded", timeout=int(timeout * 1000))
+            except Exception as exc:
+                print(f"[i] The tab was opened but the page did not finish loading ({exc}).")
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                try:
+                    title = str(page.title() or "").strip()
+                    page_url = str(page.url or target_url)
+                except Exception:
+                    title = ""
+                if title:
+                    break
+                time.sleep(0.5)
+            if not title:
+                print(
+                    "[!] The browser is running, but the page did not produce a title in "
+                    f"{int(timeout)} s - the browser may not be usable yet.",
+                    file=sys.stderr,
+                )
+                return 1
+    except Exception as exc:
+        print(f"[!] The browser host started but the tab could not be opened ({exc}).", file=sys.stderr)
+        return 1
+
+    print(f"  Opened URL      : {page_url}")
+    print(f"  Page title      : {title}")
+    print(f"  Session         : {'signed in' if profile_has_signed_in_account(prof) else 'NOT signed in'}")
+    print("  Browser status  : OPEN and reachable - a prompt can be sent now")
     print("=" * 78)
     return 0

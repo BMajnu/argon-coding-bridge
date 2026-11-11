@@ -91,6 +91,42 @@ Do these four steps in the browser window the dispatcher opened (or open the URL
 3. Press `+` → **Upload files** → choose `argon_context.zip`.
 4. The moment the upload finishes, click **Send** immediately.
 
+### 🪟 The browser must be OPEN before anything is sent (Rule 10)
+
+A browser tool call on a browser that is not running **fails**, and then the prompt and
+the archive never reach the chat - the run looks like it is working while nothing was
+delivered. So the browser is opened and proven first:
+
+```
+python ./skills/argon-coding-bridge/scripts/dispatch_argon.py --project-path . \
+       --open-browser --slot /u/N/
+```
+
+It prints the profile, the CDP endpoint, the opened URL, the page title and the session
+state, and it ends with `Browser status: OPEN and reachable - a prompt can be sent now`.
+
+**Why this is not optional.** A Chrome that was started WITHOUT `--remote-debugging-port`
+takes the profile directory's lock and publishes no debugging endpoint. The bridge then
+cannot attach to that profile, every later browser call on it fails, and the prompt is
+never sent. `--open-browser` detects exactly that case, closes the stray Chrome the safe
+way (the cookies are snapshotted and restored, so the account stays signed in) and
+starts the profile's **single browser host** with a debugging endpoint - one Chrome per
+profile, many tabs, and the dispatcher attaches to it instead of fighting it.
+
+### 📦 The manual-send material is handed over FIRST (Rule 11)
+
+For **every** new request the material for a manual send is handed over **before** the
+automatic send starts - not at the end, not only after a failure:
+
+1. open the browser and prove it is up (above),
+2. hand over the manual-send material: the exact prompt file, the prompt text and the
+   `argon_context.zip` path,
+3. **then** start the automatic send, and keep the material updated on every attempt of
+   the ladder.
+
+Handing it over first is what saves the long wait: when the automatic path stalls, the
+operator can send by hand immediately instead of waiting for the retries to run out.
+
 ---
 
 ## 🛡️ 5. The Dispatcher Pre-Flight Gate & Per-Step Rule Verification (Rule 7)

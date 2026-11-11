@@ -81,7 +81,7 @@ Both the **send phase** and the **delivery phase** retry at most two or three ti
 3. Root-cause fix attempt (`attempt 3 of 3`) — updates the manual hand-off pack, fixes the underlying cause, records the fix, and runs the final automatic retry.
 4. **Self-executed manual send fallback**: If the automatic attempts still fail, the bridge performs the manual send **itself** in the browser using the exact same composer, scaled upload wait, and hard Flash model guard, and then waits for the delivery as usual.
 
-### 6. Never kill a slot browser with `taskkill /F`
+### 7. Never kill a slot browser with `taskkill /F`
 
 **Never kill the browser of a slot profile with `taskkill /F`.** A hard kill destroys the
 Chrome cookie database and logs the account out. Close it with
@@ -91,7 +91,7 @@ To close only one tab while leaving the browser and other tabs running, use
 `python dispatch_argon.py --project-path . --close-tab --slot /u/N/ --tab <tab-id>`, and
 inspect running browser hosts with `python dispatch_argon.py --project-path . --list-browsers`.
 
-### 7. Extending a running task (`--append-followup`)
+### 8. Extending a running task (`--append-followup`)
 
 > **A running task can be extended.** To add a requirement to a task that is already
 > running, send it with `--append-followup`. The running task is not stopped, and the single
@@ -99,6 +99,51 @@ inspect running browser hosts with `python dispatch_argon.py --project-path . --
 
 Command:
 `python dispatch_argon.py --project-path . --append-followup "<file.md>" --lane <lane> --slot /u/N/`
+
+### 9. Open the browser BEFORE you send anything (Rule 10)
+
+> **Nothing may be sent into a browser that is not open.** A browser tool call on a
+> browser that is not running FAILS, and the prompt - or the attached archive - never
+> reaches the chat. The run then looks like it is working while nothing was delivered.
+
+Before EVERY prompt - the follow-up, the second lane, a new session, or a follow-up
+message - open the browser of that account first and PROVE that it is up:
+
+```
+python ./skills/argon-coding-bridge/scripts/dispatch_argon.py --project-path . \
+       --open-browser --slot /u/N/
+```
+
+The command prints the profile, the CDP endpoint, the opened URL, the page title and
+the session state, and it ends with `Browser status: OPEN and reachable - a prompt can
+be sent now`. **Only then** send the prompt. If the command cannot open the browser,
+fix that FIRST - sending into a closed browser always fails.
+
+Why this matters in practice: a Chrome that was started WITHOUT a debugging endpoint
+takes the profile directory's lock and publishes no endpoint, so the bridge cannot
+attach to that profile and every later browser call on it fails. `--open-browser`
+detects that case, closes the stray Chrome the safe way (the cookies are snapshotted
+and restored, so the account stays signed in) and starts the profile's single browser
+host with a debugging endpoint, which the dispatcher can then attach to.
+
+### 10. Hand over the manual-send material FIRST, then send automatically (Rule 11)
+
+> **For every new request the manual-send material is handed over BEFORE the automatic
+> send starts.** Not at the end, not only when something failed - up front.
+
+The order is strict:
+
+1. **Open the browser** (Rule 9) and prove it is up.
+2. **Hand over the manual-send material**: the exact prompt file, the prompt text and
+   the `argon_context.zip` path, so a human can click and send it by hand in the open
+   browser at any moment. The bridge writes that pack itself - `manual_handoff.md` and
+   `handoff.json` under `.argon_backup/<session>/` - and prints the paths.
+3. **THEN start the automatic send**, and keep the manual-send material updated on
+   every attempt of the ladder (Rule 8).
+
+Handing the material over first is what saves the long wait: when the automatic path
+stalls, the operator can send by hand immediately instead of waiting for the retries
+to run out.
 
 ---
 
@@ -130,20 +175,45 @@ command again. Only when the user is happy do you continue to Step 3.
 
 Never send a prompt the user has not seen.
 
-### Step 3 - Send the FOLLOW-UP first
+### Step 3 - Open the browser and PROVE it is up (Rule 10)
+
+Command:
+`python "./skills/argon-coding-bridge/scripts/dispatch_argon.py" --project-path . --open-browser --slot "<the account you are about to use>"`
+
+Why: a browser tool call on a browser that is not running FAILS, so the prompt and the
+      archive never reach the chat. The command opens that account's browser, attaches
+      to it, navigates to Gemini Web and prints the page title and the session state.
+      It must end with `Browser status: OPEN and reachable`.
+
+Fix a browser that will not open BEFORE you go on. Never send into a closed browser.
+
+### Step 4 - Hand over the manual-send material (Rule 11)
+
+Command:
+`python "./skills/argon-coding-bridge/scripts/dispatch_argon.py" --project-path . --manual-handoff --lane followup --slot "<slot>"`
+
+Why: for every new request the material for a MANUAL send is handed over BEFORE the
+      automatic send starts - not at the end, not only after a failure. The pack holds
+      the exact prompt file, the prompt text and the `argon_context.zip` path, and the
+      browser of Step 3 is already open, so a human can click and send at any moment.
+
+Give the user the prompt path and the zip path in your reply, and keep the pack
+updated on every attempt of the ladder (Rule 8).
+
+### Step 5 - Send the FOLLOW-UP first
 Command:  `python "./skills/argon-coding-bridge/scripts/dispatch_argon.py" --project-path . --task "<task>" --slot "<the account that holds the chat>" --lane followup`
 Why:  the follow-up runs in the conversation that already knows this codebase.
       Send this one FIRST and let it finish.
 
-### Step 4 - CHECK the follow-up before you go on
+### Step 6 - CHECK the follow-up before you go on
 Read the screenshot of the run (the path is printed) and check three things:
   a. the conversation was in TASK mode (not Chat),
   b. the model chip said 4 Argon,
   c. Argon produced a real answer, not a chat-style reply.
 If anything is wrong, FIX IT FIRST and send the follow-up again.
-Only when the follow-up is confirmed good do you continue to Step 5.
+Only when the follow-up is confirmed good do you continue to Step 7.
 
-### Step 5 - Then run the NEW task
+### Step 7 - Then run the NEW task
 Command:  `python "./skills/argon-coding-bridge/scripts/dispatch_argon.py" --project-path . --task "<task>" --new-session --slot "<another account>"`
 Why:  a new task belongs in a new conversation, on a different account, so the
       two runs never collide.
@@ -167,7 +237,7 @@ the bounded ladder (`MAX_LADDER_ATTEMPTS = 3`):
 | **follow-up** | Attempts 1, 2, 3, and self-manual fallback | account e-mail, chat link, prompt file, ZIP path, progress, screenshot path |
 | **new** | Attempts 1, 2, 3, and self-manual fallback | the same complete set so a human can click and send in the browser at any moment |
 
-### Step 6 - Compare and apply
+### Step 8 - Compare and apply
 Command:  `python "./skills/argon-coding-bridge/scripts/compare_argon_patches.py" --followup-patch "downloads/followup/apply_changes.ps1" --new-patch "downloads/new/apply_changes.ps1" --merge --pick new --apply`
 Why:  compares the follow-up delivery and the new-session delivery side by side,
       combines their non-conflicting blocks (using `--pick new` or `--choices`
@@ -175,14 +245,14 @@ Why:  compares the follow-up delivery and the new-session delivery side by side,
       the local build verification once. Record the winning lane afterwards with:
       `python "./skills/argon-coding-bridge/scripts/dispatch_argon.py" --project-path . --record-winner followup|new`
 
-### Step 7 - For the NEW lane: confirm the account e-mail and chat link
+### Step 9 - For the NEW lane: confirm the account e-mail and chat link
 
 Tell the user the account e-mail and the chat link that the new run used and ask them to confirm or correct them. The agent already knows both - state them and ask for confirmation, not asking the user to find them:
 - **Account e-mail:** `<email>`
 - **Chat link:** `<chat-url>`
 The next round's winner selection needs this information.
 
-### Step 8 - Mark the task completed
+### Step 10 - Mark the task completed
 Command:  `python "./skills/argon-coding-bridge/scripts/dispatch_argon.py" --project-path . --register-task-done --label "<same label>"`
 Why:  releases the task in `~/.gemini/argon_tasks.json` so the next round sees
       accurate slot load counts.
@@ -215,6 +285,9 @@ Why:  releases the task in `~/.gemini/argon_tasks.json` so the next round sees
 
 | Symptom | Root Cause | Action |
 |---|---|---|
+| **A browser tool call fails and the prompt/archive never reaches the chat** | The browser of that account was not open (Rule 10). A browser call on a browser that is not running fails, and the run looks like it is working while nothing was delivered. | Run `python dispatch_argon.py --project-path . --open-browser --slot /u/N/` FIRST, and only send once it prints `Browser status: OPEN and reachable`. If it cannot open the browser, fix that first. |
+| **The browser will not open and the bridge cannot attach to the profile** | A Chrome that was started WITHOUT `--remote-debugging-port` holds the profile directory: it takes the profile lock and publishes no endpoint, so every later browser call on that profile fails. | `--open-browser` detects this, closes the stray Chrome the SAFE way (cookies snapshotted and restored, so the account stays signed in) and starts the profile's single browser host with a debugging endpoint. Never start a second plain Chrome on a slot profile. |
+| **A session snapshot or a safe close hangs** | The cookie database was read with a malformed SQLite URI (`file:C:/Users/<name with a space>/...`), so every read failed and the code fell back to a raw file copy of the file a live Chrome holds locked. | The snapshot now builds the URI with `Path.as_uri()` and reads `immutable=1` first, so it never blocks and never waits for the lock. |
 | **The answer is a chat-style reply instead of work** | The prompt went out in Chat mode. | Open a new chat (`--new-session`), switch it to Task mode, check the `4 Argon` chip in `.argon_backup/shots/<NN>-preflight.png`, and resend. |
 | **Gemini says the archive is unreadable / binary data** | Binary files (fonts, images, media, or non-UTF-8 data) were included in the archive. | The packager must exclude every binary file by extension and 8 KB NUL/UTF-8 content check and enforce the 100 MB archive cap; re-run `package_context.py` to rebuild `argon_context.zip`. |
 | **The prompt landed in an old conversation** | The new chat was not verified empty after loading. | The run must verify after the conversation loads that there are zero user messages and zero assistant turns and report the `chat_id` it used; re-run with `--new-session`. |

@@ -254,8 +254,17 @@ def write_manual_handoff_pack(
 
 
 def open_browser_for_slot(slot: str, chat_url: str, chrome_exe: Optional[str] = None, profile_dir: Optional[Path] = None) -> bool:
-    """Open Chrome in the slot's real profile and leave it open."""
+    """Open Chrome in the slot's real profile and leave it open.
+
+    It opens the slot's CDP browser HOST, not a second plain Chrome process. A plain
+    Chrome takes the profile directory's lock and publishes NO debugging endpoint, so
+    the bridge can no longer attach to that profile - every later browser call on it
+    fails, and the prompt that should have been sent is never sent. The host keeps a
+    single Chrome per profile and publishes its endpoint, so the browser stays open
+    AND usable.
+    """
     from argon_pool_login import find_chrome_executable
+
     exe = chrome_exe or find_chrome_executable()
     if not exe:
         print("[!] Cannot open browser: Google Chrome executable was not found.", file=sys.stderr)
@@ -269,6 +278,34 @@ def open_browser_for_slot(slot: str, chat_url: str, chrome_exe: Optional[str] = 
 
     profile_dir.mkdir(parents=True, exist_ok=True)
     target_url = chat_url or "https://gemini.google.com/u/0/app"
+
+    # The CDP host: one Chrome per profile, with a debugging endpoint.
+    try:
+        from safe_browser import ensure_browser_host, find_chrome_pids_for_profile
+
+        host = ensure_browser_host(profile_dir, chrome_exe=exe, headless=False)
+        if not host and find_chrome_pids_for_profile(profile_dir):
+            print(
+                "[i] A Chrome without a debugging endpoint already holds this profile - "
+                "closing it safely and starting the browser host instead."
+            )
+            from safe_browser import close_browser_safely
+
+            close_browser_safely(context=None, profile_dir=profile_dir)
+            host = ensure_browser_host(profile_dir, chrome_exe=exe, headless=False)
+        if host:
+            http_ep = str(host.get("http_endpoint") or "")
+            print(f"[+] Browser opened in real Chrome profile for slot {slot} and left open.")
+            print(f"    Chat URL: {target_url}")
+            print(f"    Debug endpoint: {http_ep}")
+            return True
+        print(
+            "[!] The browser host could not be started for this profile; falling back to "
+            "a plain Chrome (the bridge cannot attach to it).",
+            file=sys.stderr,
+        )
+    except Exception as exc:
+        print(f"[i] The browser host could not be started ({exc}); falling back to a plain Chrome.")
 
     args = [
         str(exe),
