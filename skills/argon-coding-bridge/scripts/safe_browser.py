@@ -237,8 +237,15 @@ def verify_account_index_in_preferences(
     return True, found_idx, all_emails
 
 
-def _backup_sqlite_file(src: Path, dst: Path) -> bool:
-    """Safely copy a SQLite database file using SQLite's online backup API with fallbacks."""
+def _backup_sqlite_file(src: Path, dst: Path, attempts: int = 6, retry_seconds: float = 0.5) -> bool:
+    """Safely copy a SQLite database file using SQLite's online backup API with fallbacks.
+
+    A live Chrome holds `Default/Network/Cookies` with an EXCLUSIVE lock: a plain read
+    raises PermissionError and SQLite reports "unable to open database file". Chrome
+    releases that lock every few seconds, so the copy is retried for a few seconds
+    instead of failing outright - a snapshot that silently misses the cookie database
+    is WORSE than none, because the caller then believes the session is protected.
+    """
     if not src.is_file():
         return False
     try:
@@ -254,28 +261,33 @@ def _backup_sqlite_file(src: Path, dst: Path) -> bool:
                 sidecar.unlink()
         except OSError:
             pass
-    for uri_q in ("?mode=ro&immutable=1", "?mode=ro"):
-        try:
-            # `as_uri()` percent-encodes the path. A raw path with a SPACE in it
-            # ("C:/Users/TechZone IT/...") is NOT a valid SQLite URI: the space ends
-            # the URI, every read fails with "unable to open database file", and the
-            # code falls back to a raw file copy - which BLOCKS forever on the cookie
-            # database that a live Chrome holds locked. That is how a session snapshot
-            # could hang the whole run.
-            base_uri = src.resolve().as_uri()
-            source = sqlite3.connect(f"{base_uri}{uri_q}", uri=True, timeout=5.0)
+    for attempt in range(max(1, int(attempts))):
+        for uri_q in ("?mode=ro&immutable=1", "?mode=ro"):
             try:
-                target = sqlite3.connect(str(dst), timeout=5.0)
+                # `as_uri()` percent-encodes the path. A raw path with a SPACE in it
+                # ("C:/Users/TechZone IT/...") is NOT a valid SQLite URI: the space ends
+                # the URI, every read fails with "unable to open database file", and the
+                # code falls back to a raw file copy - which BLOCKS forever on the cookie
+                # database that a live Chrome holds locked. That is how a session snapshot
+                # could hang the whole run.
+                base_uri = src.resolve().as_uri()
+                source = sqlite3.connect(f"{base_uri}{uri_q}", uri=True, timeout=5.0)
                 try:
-                    source.backup(target)
+                    target = sqlite3.connect(str(dst), timeout=5.0)
+                    try:
+                        source.backup(target)
+                    finally:
+                        target.close()
                 finally:
-                    target.close()
-            finally:
-                source.close()
-            if dst.is_file() and dst.stat().st_size > 0:
-                return True
-        except Exception:
-            continue
+                    source.close()
+                if dst.is_file() and dst.stat().st_size > 0:
+                    return True
+            except Exception:
+                continue
+        # The file is locked by a live Chrome, which releases the lock every few
+        # seconds. Retry instead of failing outright.
+        if attempt + 1 < max(1, int(attempts)):
+            time.sleep(float(retry_seconds))
     try:
         raw = src.read_bytes()
         if raw:
@@ -283,6 +295,25 @@ def _backup_sqlite_file(src: Path, dst: Path) -> bool:
             return dst.is_file() and dst.stat().st_size > 0
     except Exception:
         pass
+    return False
+
+
+def snapshot_holds_cookies(snapshot_dir: Union[str, Path]) -> bool:
+    """True when the snapshot really carries the cookie database.
+
+    The cookie database IS the session. `snapshot_profile_session()` also copies
+    `Default/Preferences` and `Local State`, so it can report success while the cookie
+    database was locked and skipped - which would let a forced kill destroy the very
+    session the snapshot was supposed to protect.
+    """
+    snap = Path(snapshot_dir)
+    for rel in ("Default/Network/Cookies", "Default/Cookies"):
+        p = snap / rel
+        try:
+            if p.is_file() and p.stat().st_size > 0:
+                return True
+        except OSError:
+            continue
     return False
 
 
@@ -1025,14 +1056,39 @@ def close_browser_safely(
     remaining_pids = find_chrome_pids_for_profile(prof) if prof is not None else []
     mode = "graceful"
     if remaining_pids:
+        cookies_protected = False
         if prof is not None and prof.is_dir():
             snap_ok, snap_path = snapshot_profile_session(prof)
             snapshot_taken = snapshot_taken or snap_ok
-        _terminate_pids(remaining_pids)
-        time.sleep(0.4)
-        mode = "forced"
-        if prof is not None and snapshot_taken:
-            snapshot_restored = restore_profile_session(prof, snap_path)
+            cookies_protected = bool(snap_ok and snapshot_holds_cookies(snap_path))
+            if not cookies_protected:
+                # The cookie database is the session. It is locked by the live Chrome,
+                # and Chrome releases that lock every few seconds - so retry for a
+                # while. A snapshot without the cookies is NOT a session backup.
+                for _ in range(10):
+                    time.sleep(0.8)
+                    snap_ok2, snap_path = snapshot_profile_session(prof)
+                    if snap_ok2 and snapshot_holds_cookies(snap_path):
+                        cookies_protected = True
+                        snapshot_taken = True
+                        break
+        if not cookies_protected:
+            # Killing the browser now would DESTROY the session, because there is no
+            # cookie backup to restore. The browser is left running and the reason is
+            # reported - a live browser is far better than a logged-out account.
+            print(
+                "[!] The cookie database could not be snapshotted while the browser holds "
+                "it, so the session cannot be protected by a backup. The browser is LEFT "
+                "RUNNING instead of being killed (a kill would log the account out).",
+                file=sys.stderr,
+            )
+            remaining_pids = []
+        else:
+            _terminate_pids(remaining_pids)
+            time.sleep(0.4)
+            mode = "forced"
+            if prof is not None and snapshot_taken:
+                snapshot_restored = restore_profile_session(prof, snap_path)
     elif prof is not None and snapshot_taken and not has_cookie_db(prof):
         snapshot_restored = restore_profile_session(prof, snap_path)
 

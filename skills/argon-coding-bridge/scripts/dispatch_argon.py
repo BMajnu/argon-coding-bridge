@@ -1680,6 +1680,196 @@ def _validate_and_save_download(dl, dest_dir: Path) -> tuple[Optional[Path], str
     return dest, ""
 
 
+def _install_drive_id_listener(page) -> None:
+    """Record the Drive file id of every preview the page opens.
+
+    Clicking the delivery chip makes the Gemini page request
+    `drive.google.com/viewer/meta?id=<FILE_ID>` (and then `viewer/text?id=...`).
+    The Drive viewer itself CRASHES in headless Chromium, so the id can never be read
+    from the viewer's URL or markup - it only ever exists in the request that the
+    Gemini page fired. So the id is captured from the network instead.
+    """
+    if getattr(page, "_argon_drive_id_listener", False):
+        return
+
+    def _record(req) -> None:
+        try:
+            url = str(getattr(req, "url", "") or "")
+        except Exception:
+            return
+        if "drive.google.com" not in url:
+            return
+        m = re.search(r"[?&]id=([\w-]{20,})", url)
+        if not m:
+            return
+        fid = m.group(1)
+        try:
+            ids = getattr(page, "_argon_drive_file_ids", None)
+            if ids is None:
+                ids = []
+                setattr(page, "_argon_drive_file_ids", ids)
+            if fid not in ids:
+                ids.append(fid)
+        except Exception:
+            pass
+
+    try:
+        page.context.on("request", _record)
+    except Exception:
+        try:
+            page.on("request", _record)
+        except Exception:
+            pass
+    setattr(page, "_argon_drive_id_listener", True)
+
+
+def _drive_viewer_file_id(page, wait_seconds: float = 8.0) -> str:
+    """Return the Drive file id of the open delivery preview, or "".
+
+    The preview opens in the current tab or in a popup, and the id shows up in the
+    viewer's own URL as well as in the page markup. When the viewer CRASHES (headless
+    Chromium does that) neither carries it, so the id recorded from the network is used.
+
+    The id arrives ASYNCHRONOUSLY - the Gemini page fires `viewer/meta?id=...` a moment
+    after the chip is clicked - so the network record is polled for a few seconds
+    instead of being read once.
+    """
+    deadline = time.monotonic() + max(0.0, float(wait_seconds))
+    while True:
+        try:
+            pages = list(page.context.pages)
+        except Exception:
+            pages = [page]
+        for pg in pages:
+            try:
+                url = str(getattr(pg, "url", "") or "")
+            except Exception:
+                continue
+            for pat in (r"[?&]id=([\w-]{20,})", r"/file/d/([\w-]{20,})", r"/d/([\w-]{20,})"):
+                m = re.search(pat, url)
+                if m:
+                    return m.group(1)
+        for pg in pages:
+            try:
+                html = pg.content()
+            except Exception:
+                continue
+            m = re.search(r"ACFrOg[\w-]{40,}", html)
+            if m:
+                return m.group(0)
+        # the network recorded it when the chip was clicked
+        try:
+            ids = list(getattr(page, "_argon_drive_file_ids", None) or [])
+            if ids:
+                return ids[-1]
+        except Exception:
+            pass
+        if time.monotonic() >= deadline:
+            return ""
+        time.sleep(0.4)
+
+
+def _decode_drive_text_envelope(raw: str) -> Optional[str]:
+    """Decode the `viewer/text` envelope into the file body, or None."""
+    if raw is None:
+        return None
+    body = raw
+    if body.startswith(")]}'"):
+        body = body[4:]
+    body = body.lstrip("\r\n")
+    try:
+        obj = json.loads(body)
+    except Exception:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    data = obj.get("data")
+    if data is None:
+        return None
+    if isinstance(data, list):
+        try:
+            return "".join(str(x) for x in data)
+        except Exception:
+            return None
+    return str(data)
+
+
+def _download_from_drive_text(page, dest_dir: Path, max_pages: int = 12) -> tuple[Optional[Path], str]:
+    """Fetch the delivery through Drive's `viewer/text` endpoint, PAGE BY PAGE.
+
+    The viewer's toolbar download button is not always reachable - the run reports
+    "the viewer's download button did not produce a valid .ps1 file (a print control
+    was never clicked)" - and the preview text is a SILENT TRUNCATION:
+    `viewer/text?id=...&page=N` serves the file in PAGES, and page 0 simply stops
+    mid-statement with no error at all. A downloader that reads one page therefore
+    accepts a HALF patch that still parses, and the apply step then fails with a
+    missing target block.
+
+    This walks page 0, 1, 2 ... until a page comes back empty and stitches the
+    chunks, so the file that is written is the WHOLE file.
+    """
+    dest_dir = Path(dest_dir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    file_id = _drive_viewer_file_id(page)
+    if not file_id:
+        return None, "the Drive preview did not expose a file id"
+
+    try:
+        api = page.context.request
+    except Exception:
+        return None, "the browser context has no request API"
+
+    chunks: List[str] = []
+    for pg_no in range(max_pages):
+        url = f"https://drive.google.com/viewer/text?id={file_id}&authuser=0&page={pg_no}"
+        try:
+            resp = api.get(url, timeout=120000)
+            raw = resp.text()
+        except Exception as exc:
+            return None, f"the Drive text endpoint failed on page {pg_no} ({exc})"
+        data = _decode_drive_text_envelope(raw)
+        if data is None:
+            if pg_no == 0:
+                return None, "the Drive text endpoint did not return a file body"
+            break
+        chunks.append(data)
+        if len(data) < 200:
+            break
+        if len(chunks) > 1 and chunks[0] == chunks[1]:
+            # The endpoint answered the same page twice - there is only one page.
+            chunks = chunks[:1]
+            break
+
+    if not chunks:
+        return None, "the Drive text endpoint returned no content"
+    text = chunks[0] if len(chunks) == 1 else "".join(chunks)
+
+    if len(text.encode("utf-8")) < MIN_PATCH_FILE_BYTES:
+        return None, (
+            f"the Drive text endpoint returned only {len(text.encode('utf-8'))} bytes "
+            f"(< {MIN_PATCH_FILE_BYTES} minimum) after {len(chunks)} page(s)"
+        )
+    if text.lstrip().startswith("%PDF"):
+        return None, "the Drive text endpoint returned PDF bytes"
+
+    dest = dest_dir / "apply_changes.ps1"
+    staging = dest_dir / f".staging_{os.getpid()}_{int(time.time() * 1000)}_apply_changes.ps1"
+    try:
+        staging.write_text(text, encoding="utf-8", newline="")
+        os.replace(str(staging), str(dest))
+    except Exception as exc:
+        try:
+            staging.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return None, f"the fetched delivery could not be written ({exc})"
+    print(
+        f"[+] Fetched the delivery through the Drive text endpoint: {len(text.encode('utf-8'))} bytes "
+        f"in {len(chunks)} page(s) (file id {file_id[:14]}...)."
+    )
+    return dest, ""
+
+
 def _download_from_viewer(page, dest_dir: Path, timeout_ms: int = 12000) -> Optional[Path]:
     """Find the viewer's verified toolbar download button, click ONLY that button, and validate the file.
 
@@ -2054,6 +2244,11 @@ def capture_generated_file(
         )
         return None
 
+    # The Drive file id only ever appears in the request the Gemini page fires when the
+    # chip is clicked, and the Drive viewer crashes headless - so the listener has to be
+    # in place BEFORE the chip is opened.
+    _install_drive_id_listener(page)
+
     if not _open_generated_file(page, chip_index=chip_index, chip=chip):
         return None
 
@@ -2098,6 +2293,22 @@ def capture_generated_file(
                     attempt += 1
                     print(f"[i] Download attempt {attempt} of {MAX_CHIP_DOWNLOAD_ATTEMPTS} for this chip...")
                 downloaded = cand
+
+        if downloaded is None:
+            # The viewer's toolbar button is not always reachable, and the preview text
+            # is a SILENT TRUNCATION (page 0 of the Drive text endpoint just stops
+            # mid-statement). The text endpoint serves the WHOLE file page by page, so
+            # it is the reliable way to get the delivery.
+            text_file, text_reason = _download_from_drive_text(page, dest_dir)
+            if text_file is not None:
+                downloaded = text_file
+                failure_reason = ""
+                attempt += 1
+            elif text_reason:
+                failure_reason = text_reason
+                if dl_btn is None:
+                    attempt += 1
+                    print(f"[i] Download attempt {attempt} of {MAX_CHIP_DOWNLOAD_ATTEMPTS} for this chip...")
 
         if downloaded is not None and downloaded.is_file():
             try:

@@ -562,22 +562,33 @@ the whole file. The dispatcher therefore:
 
 1. clicks the chip's button and waits for the viewer to render;
 2. presses the viewer's **Download** button and keeps the downloaded bytes;
-3. validates the result, then applies it through `Run-ArgonPatch.ps1`, which backs up every touched
+3. if the button is not reachable, fetches the same file from Drive's `viewer/text`
+   endpoint **page by page** and stitches the pages;
+4. validates the result, then applies it through `Run-ArgonPatch.ps1`, which backs up every touched
    file first and prints the rollback command.
 
-### The delivery rule: always the Download button, never the preview
+### The delivery rule: always the WHOLE file, never a truncated preview
 
-**The preview is never used as the source of a delivery.** The Drive viewer only renders what fits
-in the viewport, so a long patch read from the preview can stop half-way - and a half-written patch
-fails the apply step with "Target block not found" even though Argon's delivery was perfectly fine.
-That is why the file is always taken from the **Download** button: those are the real bytes.
+**A truncated preview is never used as the source of a delivery.** The Drive viewer only renders
+what fits in the viewport, so a long patch read from the preview can stop half-way - and a
+half-written patch fails the apply step with "Target block not found" even though Argon's delivery
+was perfectly fine.
 
-When the download does not produce a file, the capture **fails loudly and writes nothing**:
+The second source - Drive's `viewer/text` endpoint - is **paged**: it serves the file in PAGES and
+**page 0 simply stops mid-statement with no error at all**. Reading one page therefore accepts a
+HALF patch that still parses. The bridge walks `page=0, 1, 2 ...` until a page comes back empty and
+stitches the chunks, so the file it writes is the whole file. Measured on a 544 KB delivery: page 0 =
+262 114 characters, page 1 = 261 605, page 2 = 20 639 - the whole file is 544 927 bytes and its
+SHA-256 matches the file downloaded by hand.
+
+The file id cannot be read from the preview (the Drive viewer crashes headless), so it is recorded
+from the network request the Gemini page fires when the chip is clicked.
+
+When neither way produces a complete file, the capture **fails loudly and writes nothing**:
 
 ```
-[!] The delivery could NOT be downloaded - the viewer's download button did not produce a file.
-    The preview text is deliberately NOT used as a substitute: a preview can be truncated, and a
-    truncated patch fails the apply step.
+[!] The delivery could NOT be downloaded after 1/3 download attempt(s) for this chip - <the real reason>.
+    A truncated file is never accepted as a patch: it fails the apply step.
     Download the file from the Gemini chat by hand and apply it with:
         Open_Argon_Apply.bat -PatchFile <path-to-apply_changes.ps1>
 ```

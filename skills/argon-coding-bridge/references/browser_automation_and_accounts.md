@@ -227,19 +227,33 @@ still THINKING is not a failed run:
 
 Only when none of these hold is the run treated as "finished without a delivery"
 and carried over into a new session. `--no-carry-over` turns the rule off.
-### The delivery rule - Download button only
+### The delivery rule - the whole file, never a truncated preview
 
-A delivered patch is **always** taken from the viewer's **Download** button, never from the
-preview text.
+A delivered patch is **always** taken in full. Two ways are used, and both must yield
+the WHOLE file:
 
-The Drive viewer renders only what fits on screen, so a long patch read out of the preview can
-stop half-way. A half-written patch then fails the apply step with *"Target block not found"* -
-even though Argon's delivery was fine. The download button gives the real bytes, so it is the
-only accepted source.
+1. the viewer's **Download** button (the real bytes), and
+2. Drive's `viewer/text` endpoint, **page by page**, when the button is not reachable.
 
-When the download does not produce a file the run **fails loudly and writes nothing**; the
-preview is not used as a fallback. The same applies to a script that Argon inlines in the chat
-bubble: it must be complete before it is accepted.
+The Drive viewer renders only what fits on screen, so a long patch read out of the
+preview can stop half-way. A half-written patch then fails the apply step with *"Target
+block not found"* - even though Argon's delivery was fine.
+
+The second way matters even more, because the endpoint is **paged**:
+`drive.google.com/viewer/text?id=<FILE_ID>&page=N` serves the file in PAGES, and
+**page 0 simply stops mid-statement with no error at all**. A downloader that reads one
+page accepts a HALF patch that still parses. So the bridge walks `page=0, 1, 2 ...`
+until a page comes back empty and stitches the chunks. Measured on a 544 KB delivery:
+page 0 = 262 114 characters, page 1 = 261 605, page 2 = 20 639 - the whole file is
+544 927 bytes, and its SHA-256 matches the file the owner downloaded by hand.
+
+The file id is not read from the preview: the Drive viewer **crashes in headless
+Chromium**, so the id only ever appears in the request the Gemini page fires when the
+chip is clicked (`viewer/meta?id=...`). The bridge records it from the network.
+
+When neither way produces a complete file the run **fails loudly and writes nothing**;
+a truncated file is never accepted as a patch. The same applies to a script that Argon
+inlines in the chat bubble: it must be complete before it is accepted.
 
 A downloaded file is checked for completeness: it has to carry the `[SUCCESS]` marker, a
 `NOTES` block that was opened must be closed, and no here-string may be left unterminated. A
