@@ -57,6 +57,18 @@ exact DOM node you measured, the exact value you read).
 4. **DO NOT PASTE THE BODY OF `apply_changes.ps1` INTO THE CHAT:** An inline fenced `powershell` block is a fallback used ONLY when file delivery is unavailable; in that case output the full script in one block. A short inline excerpt (the `$TargetRoot` line plus the list of touched files) is fine.
 5. **WHY:** A delivered file is applied with one click, while a streamed code block is slow to render and can be truncated — which silently corrupts the patch.
 
+### 🎨 MULTI-ARTIFACT DELIVERY (WHEN THE TASK PRODUCED MORE THAN A PATCH):
+The patch file is only ONE part of a delivery. A round often produces artifacts that a page file cannot carry at all - a generated image, an SVG graphic, an icon set, a UI card mock-up, a voice-over, a data file. **Deliver those too, as FILES.**
+
+1. **ATTACH EVERY EXTRA ARTIFACT AS ITS OWN FILE**, in the SAME reply as `apply_changes.ps1`. Each attached file becomes a chip; the bridge downloads every chip of your turn and puts the non-patch ones into `assets/` next to the patch, then packs the whole set into `argon_delivery.zip` with a `DELIVERY_MANIFEST.md` (file name, byte size, SHA-256 and one-line description of every file).
+2. **NAME EACH FILE SO IT EXPLAINS ITSELF** - the file name becomes the asset name:
+   `logo-mark.svg`, `app-icon-1024.png`, `card-background.png`, `onboarding-screen.jpg`, `voice-over-intro.wav`, `icon-set.zip`.
+   Always use the REAL format extension (`.png`, `.jpg`, `.webp`, `.svg`, `.wav`, `.mp3`, `.zip`, `.json`) so the bridge can tell the kinds apart.
+3. **LIST EACH EXTRA ARTIFACT IN THE CHAT REPLY** - one line each: the file name, what it is and what it is for. The bridge records the size and the SHA-256, but only YOU know what the artifact means.
+4. **`apply_changes.ps1` STAYS THE PRIMARY FILE** and must contain EVERY code change. The artifacts never replace it, and code that belongs in the patch never travels as an artifact.
+5. **NEVER PASTE A BINARY INTO THE CHAT** - attach the file. An inline base64 blob is unreadable, huge and gets truncated.
+6. **IF THE TASK NEEDED NO ARTIFACT, DELIVER ONLY THE PATCH.** Never invent files; the bundle is built from whatever you really produced.
+
 ### 🗂️ TARGET DIRECTORY (USE THESE EXACT PATHS):
 The target codebase lives at the absolute directory pinned in `$TargetRoot` below. The generated script MUST begin by pinning it and MUST resolve every path against it:
 

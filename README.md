@@ -285,9 +285,23 @@ straight to the real project and applies the whole change set in a single run.
 | --- | --- |
 | 1. Package | `package_context.py` / `Package-ArgonContext.ps1` build `argon_context.zip` and inject the **absolute project path** into `TASK_BRIEF.md`. |
 | 2. Prompt | The prompt states that absolute directory, so the generated script pins `$TargetRoot` and resolves every path against it. |
-| 3. Deliver | Argon attaches `apply_changes.ps1`. The chat reply stays short: what changed, which files changed, how to verify. |
+| 3. Deliver | Argon attaches `apply_changes.ps1` - plus, when the round produced any, the generated images / SVG / audio / other artifacts as their own files. The chat reply stays short: what changed, which files changed, how to verify. |
+| 3b. Bundle | The dispatcher downloads EVERY chip of the turn, puts the non-patch files into `assets/` next to the patch and writes `argon_delivery.zip` + `DELIVERY_MANIFEST.md` (name, byte size, SHA-256, one-line description of every file). |
 | 4. Apply | Double-click **`Open_Argon_Apply.bat`** at the repository root. |
 | 5. Verify | The runner prints every file it patched, plus the rollback command. |
+
+### One delivery can carry more than the patch
+
+A round is not always "code only". When Argon also generated an image, an SVG graphic, an icon set, a
+UI card or a voice-over, the task prompt asks for every extra artifact as its own file, with a
+self-describing name. The dispatcher then downloads **every** chip of the turn:
+
+```
+<delivery-dir>/apply_changes.ps1        the patch - applied by Open_Argon_Apply.bat
+<delivery-dir>/assets/<artifact>         every other delivered file, by its own name
+<delivery-dir>/argon_delivery.zip        the patch + assets/ + the manifest
+<delivery-dir>/DELIVERY_MANIFEST.md      name, byte size, SHA-256 and one-line description per file
+```
 
 ### `Open_Argon_Apply.bat` — the one-click applier
 
