@@ -59,9 +59,64 @@ from package_context import package_context
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
 SKILL_ROOT = SCRIPTS_DIR.parent
+COMPANION_EXTENSION_DIR = SKILL_ROOT / "extension"
 PROMPT_TEMPLATE_PATH = SKILL_ROOT / "templates" / "argon_task_prompt_template.md"
 LOGIN_ASSISTANT_SCRIPT = SCRIPTS_DIR / "login_pool_accounts.py"
 APPLY_PATCH_SCRIPT = SCRIPTS_DIR / "Apply-ArgonPatch.ps1"
+
+
+class ArgonOperationError(RuntimeError):
+    """Structured per-operation failure raised when attach, paste, mode, model, send, or selftest fails.
+
+    Every operation reports its own name, exact reason, and execution path ('extension' or
+    'python_fallback') in seconds instead of collapsing into a generic 'the prompt was not
+    delivered' message after a 25-minute timeout.
+    """
+
+    def __init__(
+        self,
+        operation: str,
+        reason: str,
+        path_used: str = "python_fallback",
+        elapsed_seconds: float = 0.0,
+    ) -> None:
+        self.operation = str(operation or "unknown").strip()
+        self.reason = str(reason or "operation failed").strip()
+        self.path_used = str(path_used or "python_fallback").strip()
+        self.elapsed_seconds = float(elapsed_seconds or 0.0)
+        super().__init__(
+            f"[{self.operation.upper()} FAILED via {self.path_used} in {self.elapsed_seconds:.1f}s] {self.reason}"
+        )
+
+
+class ModeSelectionError(ArgonOperationError):
+    def __init__(self, reason: str, path_used: str = "python_fallback", elapsed_seconds: float = 0.0) -> None:
+        super().__init__("mode", reason, path_used=path_used, elapsed_seconds=elapsed_seconds)
+
+
+class ModelSelectionError(ArgonOperationError):
+    def __init__(self, reason: str, path_used: str = "python_fallback", elapsed_seconds: float = 0.0) -> None:
+        super().__init__("model", reason, path_used=path_used, elapsed_seconds=elapsed_seconds)
+
+
+class PasteOperationError(ArgonOperationError):
+    def __init__(self, reason: str, path_used: str = "python_fallback", elapsed_seconds: float = 0.0) -> None:
+        super().__init__("paste", reason, path_used=path_used, elapsed_seconds=elapsed_seconds)
+
+
+class AttachOperationError(ArgonOperationError):
+    def __init__(self, reason: str, path_used: str = "python_fallback", elapsed_seconds: float = 0.0) -> None:
+        super().__init__("attach", reason, path_used=path_used, elapsed_seconds=elapsed_seconds)
+
+
+class SendOperationError(ArgonOperationError):
+    def __init__(self, reason: str, path_used: str = "python_fallback", elapsed_seconds: float = 0.0) -> None:
+        super().__init__("send", reason, path_used=path_used, elapsed_seconds=elapsed_seconds)
+
+
+class PreflightSelfTestError(ArgonOperationError):
+    def __init__(self, operation: str, reason: str, path_used: str = "python_fallback", elapsed_seconds: float = 0.0) -> None:
+        super().__init__(f"selftest:{operation}", reason, path_used=path_used, elapsed_seconds=elapsed_seconds)
 
 # Per-project session map: which Gemini conversation to continue in.
 # It lives in the USER profile, next to the browser profile, so every copy of
@@ -1060,17 +1115,37 @@ def apply_delivered_patch(project_path: Path, patch_path: Path) -> bool:
 
 
 def _chip_matches_patch_name(chip) -> bool:
-    name = ""
+    """True when the chip carries the delivery file.
+
+    EVERY name source is read on its own. A missing element must never abort the whole
+    lookup. Gemini renders the name of a generated file differently from time to time
+    (the `.file-name-lr` class existed once and then did not), and when that single
+    lookup raised, the fallbacks below it NEVER RAN - the name ended up empty and the
+    matcher returned False for a chip whose own text plainly began with
+    "apply_changes". The delivery was then never opened, and the run reported that no
+    delivery chip existed while the chip was sitting in the chat.
+    """
+    names: List[str] = []
     try:
-        name = chip.locator(".file-name-lr").first.inner_text(timeout=500) or ""
-        if not name:
-            name = chip.get_attribute("title") or ""
-        if not name:
-            name = chip.inner_text(timeout=500) or ""
+        loc = chip.locator(".file-name-lr")
+        if loc.count():
+            names.append(loc.first.inner_text(timeout=800) or "")
     except Exception:
-        name = ""
-    low = name.lower()
-    return "apply_changes" in low or low.endswith(".ps1")
+        pass
+    for attr in ("title", "aria-label", "data-file-name"):
+        try:
+            names.append(str(chip.get_attribute(attr) or ""))
+        except Exception:
+            pass
+    try:
+        names.append(chip.inner_text(timeout=1500) or "")
+    except Exception:
+        pass
+    for name in names:
+        low = name.lower()
+        if "apply_changes" in low or low.endswith(".ps1"):
+            return True
+    return False
 
 
 def _element_is_after_last_user_turn(el) -> bool:
@@ -1794,6 +1869,46 @@ def _decode_drive_text_envelope(raw: str) -> Optional[str]:
     return str(data)
 
 
+def _click_chip_for_drive_id(page, per_click_wait: float = 1.8) -> str:
+    """Open the delivery chip until the Drive file id shows up, and return that id.
+
+    The id lives ONLY in the request the Gemini page fires when the preview opens, so
+    the chip has to be clicked WHILE the listener is recording. A generated-file chip
+    carries more than one button (the file opener, an "Export" control, ...), and
+    which one opens the preview is not stable - so every button is tried and the id is
+    checked after each click.
+    """
+    chip = _generated_file_chip(page)
+    if chip is None:
+        return ""
+    targets: List[Any] = []
+    try:
+        for i in range(min(chip.locator("button").count(), 6)):
+            targets.append(chip.locator("button").nth(i))
+    except Exception:
+        targets = []
+    try:
+        targets.append(chip)
+    except Exception:
+        pass
+    for target in targets:
+        try:
+            target.scroll_into_view_if_needed(timeout=4000)
+        except Exception:
+            pass
+        try:
+            target.click(timeout=6000)
+        except Exception:
+            continue
+        deadline = time.monotonic() + float(per_click_wait)
+        while time.monotonic() < deadline:
+            fid = _drive_viewer_file_id(page, wait_seconds=0.0)
+            if fid:
+                return fid
+            time.sleep(0.3)
+    return _drive_viewer_file_id(page, wait_seconds=2.0)
+
+
 def _download_from_drive_text(page, dest_dir: Path, max_pages: int = 12) -> tuple[Optional[Path], str]:
     """Fetch the delivery through Drive's `viewer/text` endpoint, PAGE BY PAGE.
 
@@ -1812,7 +1927,62 @@ def _download_from_drive_text(page, dest_dir: Path, max_pages: int = 12) -> tupl
     dest_dir.mkdir(parents=True, exist_ok=True)
     file_id = _drive_viewer_file_id(page)
     if not file_id:
+        # The id only exists in the request the Gemini page fires when the chip is
+        # opened. If the click that opened the preview happened before the listener was
+        # in place, the id was never recorded - so open the chip HERE, with the
+        # listener in place, and wait for the id to arrive.
+        _install_drive_id_listener(page)
+        try:
+            file_id = _click_chip_for_drive_id(page)
+        except Exception:
+            file_id = ""
+        if not file_id:
+            try:
+                if _open_generated_file(page):
+                    file_id = _drive_viewer_file_id(page, wait_seconds=10.0)
+            except Exception:
+                pass
+    if not file_id:
+        try:
+            ext_fid = str(
+                page.evaluate(
+                    "() => (document.documentElement && document.documentElement.getAttribute('data-argon-last-drive-file-id')) || ''"
+                )
+                or ""
+            ).strip()
+            if ext_fid:
+                file_id = ext_fid
+        except Exception:
+            pass
+    if not file_id:
         return None, "the Drive preview did not expose a file id"
+
+    # Try the MV3 companion extension's paged viewer/text walker first when loaded.
+    ext_resp = _invoke_companion_extension(
+        page,
+        "capture_delivery",
+        {"fileId": file_id, "maxPages": max_pages, "authUser": "0"},
+        timeout_ms=30000,
+    )
+    if isinstance(ext_resp, dict) and ext_resp.get("ok") and ext_resp.get("text"):
+        ext_text = str(ext_resp.get("text") or "")
+        ext_pages = int(ext_resp.get("pages") or 1)
+        if len(ext_text.encode("utf-8")) >= MIN_PATCH_FILE_BYTES and not ext_text.lstrip().startswith("%PDF"):
+            dest = dest_dir / "apply_changes.ps1"
+            staging = dest_dir / f".staging_{os.getpid()}_{int(time.time() * 1000)}_apply_changes.ps1"
+            try:
+                staging.write_text(ext_text, encoding="utf-8", newline="")
+                os.replace(str(staging), str(dest))
+                print(
+                    f"[+] Fetched the delivery through the companion extension Drive text walker: "
+                    f"{len(ext_text.encode('utf-8'))} bytes in {ext_pages} page(s) (file id {file_id[:14]}...)."
+                )
+                return dest, ""
+            except Exception:
+                try:
+                    staging.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
     try:
         api = page.context.request
@@ -1864,11 +2034,10 @@ def _download_from_drive_text(page, dest_dir: Path, max_pages: int = 12) -> tupl
             pass
         return None, f"the fetched delivery could not be written ({exc})"
     print(
-        f"[+] Fetched the delivery through the Drive text endpoint: {len(text.encode('utf-8'))} bytes "
+        f"[+] Fetched the delivery through the Drive text endpoint (pure-Python path): {len(text.encode('utf-8'))} bytes "
         f"in {len(chunks)} page(s) (file id {file_id[:14]}...)."
     )
     return dest, ""
-
 
 def _download_from_viewer(page, dest_dir: Path, timeout_ms: int = 12000) -> Optional[Path]:
     """Find the viewer's verified toolbar download button, click ONLY that button, and validate the file.
@@ -2076,15 +2245,27 @@ def _is_leftover_delivery(
     text: str,
     previous_hashes: Optional[set],
     project_path: Optional[Path] = None,
+    exclude_path: Optional[Path] = None,
 ) -> bool:
     """True when the captured delivery is one that was already handled (D1.1, D1.2).
 
     A capture whose SHA-256 is already known - in ~/.gemini/argon_delivery_ledger.json
     or in a patch already applied in this repository - must not be reported as a NEW delivery.
     Refuses with a loud warning naming the digest and the earlier delivery it duplicates.
+
+    `exclude_path` is the file THIS capture just wrote. Without it the scan below finds
+    that very file: the delivery is downloaded into `proj/downloads/...` and the scan
+    reads it back and calls it a duplicate, so a perfectly good delivery was thrown away
+    and the run reported that no delivery existed while the file was sitting on disk.
     """
     if not text or not text.strip():
         return False
+    excluded: Optional[Path] = None
+    if exclude_path is not None:
+        try:
+            excluded = Path(exclude_path).resolve()
+        except Exception:
+            excluded = None
     digest = _hash_text(text)
     full_sha = _sha256_full(text)
     if project_path is not None:
@@ -2121,6 +2302,12 @@ def _is_leftover_delivery(
                     for ps1_file in cand_dir.glob("**/*.ps1"):
                         if _is_quarantined_path(ps1_file):
                             continue
+                        if excluded is not None:
+                            try:
+                                if ps1_file.resolve() == excluded:
+                                    continue
+                            except Exception:
+                                pass
                         if ps1_file.is_file() and ps1_file.stat().st_size >= MIN_PATCH_FILE_BYTES:
                             try:
                                 content_f = ps1_file.read_text(encoding="utf-8", errors="replace")
@@ -2249,6 +2436,12 @@ def capture_generated_file(
     # in place BEFORE the chip is opened.
     _install_drive_id_listener(page)
 
+    # Resolve the chip ONCE and hand that exact element to the opener. If the chip is
+    # resolved twice, the second lookup can land on a different turn (or find none),
+    # and then the preview never opens - so no Drive request is fired, no file id is
+    # ever recorded, and the delivery cannot be fetched even though the chip is there.
+    if chip is None:
+        chip = _generated_file_chip(page)
     if not _open_generated_file(page, chip_index=chip_index, chip=chip):
         return None
 
@@ -2321,7 +2514,12 @@ def capture_generated_file(
                 raw_dl_text = ""
             dl_text = _strip_viewer_tail_artefacts(raw_dl_text)
 
-            if _is_leftover_delivery(dl_text, combined_hashes, project_path=proj_for_ledger):
+            if _is_leftover_delivery(
+                dl_text,
+                combined_hashes,
+                project_path=proj_for_ledger,
+                exclude_path=downloaded,
+            ):
                 failure_reason = (
                     f"refused duplicate/leftover delivery in {downloaded.name} ({file_sz} bytes; SHA-256={_sha256_full(dl_text)})"
                 )
@@ -3634,16 +3832,34 @@ def _copy_sqlite_databases(src_root: Path, dst_root: Path, allow_busy: bool = Fa
 def _launch_with_fallback(p, launch_kwargs: dict, chrome_exe: Optional[str], profile_dir: Path):
     """Launch the persistent context on profile_dir without touching a busy browser.
 
+    Automatically loads the unpacked MV3 companion extension (`skills/argon-coding-bridge/extension/`)
+    when present on disk, and falls back cleanly to standard launch when absent.
     Never launch Chrome against a profile directory that is already held by
     another run, because doing so hijacks or terminates the other browser.
     """
     if _profile_is_busy(profile_dir):
         raise RuntimeError(f"Profile directory {profile_dir} is already in use by another browser.")
 
+    eff_kwargs = dict(launch_kwargs)
+    try:
+        from safe_browser import companion_extension_launch_args, get_companion_extension_dir
+
+        ext_dir = get_companion_extension_dir()
+        if ext_dir is not None:
+            cur_args = list(eff_kwargs.get("args") or [])
+            if not any("--load-extension=" in str(a) for a in cur_args):
+                cur_args.extend(companion_extension_launch_args(ext_dir))
+                eff_kwargs["args"] = cur_args
+            print(f"[+] Companion extension loaded from: {ext_dir}")
+        else:
+            print("[i] Companion extension not installed or disabled; using pure-Python fallback path.")
+    except Exception:
+        pass
+
     attempts = []
     if chrome_exe:
-        attempts.append(("chrome", {"executable_path": chrome_exe, **launch_kwargs}))
-    attempts.append(("chromium", dict(launch_kwargs)))
+        attempts.append(("chrome", {"executable_path": chrome_exe, **eff_kwargs}))
+    attempts.append(("chromium", dict(eff_kwargs)))
 
     last_exc: Optional[Exception] = None
     for label, kwargs in attempts:
@@ -3658,7 +3874,6 @@ def _launch_with_fallback(p, launch_kwargs: dict, chrome_exe: Optional[str], pro
     if last_exc is not None:
         raise last_exc
     return None
-
 
 class TaskState:
     """Remembers, per project, which conversation the current task is in and how
@@ -5775,16 +5990,239 @@ def _wait_for_upload_complete(page, zip_path: Path, timeout: float = 600.0) -> b
     return False
 
 
+def _extension_is_available(page) -> bool:
+    """Return True when the MV3 companion extension content script is active on `page`."""
+    if str(os.environ.get("ARGON_DISABLE_COMPANION_EXTENSION") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        return False
+    try:
+        ver = page.evaluate(
+            "() => (document && document.documentElement && document.documentElement.getAttribute('data-argon-companion-extension')) || ''"
+        )
+        return bool(isinstance(ver, str) and ver.strip())
+    except Exception:
+        return False
+
+
+def _invoke_companion_extension(
+    page,
+    action: str,
+    payload: Optional[Dict[str, Any]] = None,
+    timeout_ms: int = 15000,
+) -> Optional[Dict[str, Any]]:
+    """Send a command to the MV3 companion extension via the DOM custom event bridge and return its response."""
+    if not _extension_is_available(page):
+        return None
+    req_id = f"req_{os.getpid()}_{int(time.time() * 1000)}_{ abs(hash(action)) % 10000 }"
+    try:
+        res = page.evaluate(
+            r"""([reqId, act, pl, timeoutMs]) => new Promise((resolve) => {
+                const attrName = "data-argon-companion-response-" + reqId;
+                let settled = false;
+                const finish = (val) => {
+                    if (settled) return;
+                    settled = true;
+                    try {
+                        if (document.documentElement) {
+                            document.documentElement.removeAttribute(attrName);
+                        }
+                    } catch (_e) {}
+                    resolve(val);
+                };
+                const onResp = (ev) => {
+                    const d = (ev && ev.detail) || {};
+                    if (d.requestId === reqId) {
+                        window.removeEventListener("argon:companion:response", onResp);
+                        finish(d);
+                    }
+                };
+                window.addEventListener("argon:companion:response", onResp);
+                window.dispatchEvent(new CustomEvent("argon:companion:request", {
+                    detail: {
+                        protocol: "argon.companion.v1",
+                        requestId: reqId,
+                        action: act,
+                        payload: pl || {}
+                    }
+                }));
+                const checkAttr = () => {
+                    if (settled) return;
+                    try {
+                        const raw = document.documentElement && document.documentElement.getAttribute(attrName);
+                        if (raw) {
+                            window.removeEventListener("argon:companion:response", onResp);
+                            finish(JSON.parse(raw));
+                            return;
+                        }
+                    } catch (_e) {}
+                    setTimeout(checkAttr, 40);
+                };
+                setTimeout(checkAttr, 20);
+                setTimeout(() => {
+                    window.removeEventListener("argon:companion:response", onResp);
+                    finish({ ok: false, operation: act, path: "extension", reason: "companion extension request timed out" });
+                }, Math.max(500, Number(timeoutMs || 15000)));
+            })""",
+            [req_id, action, payload or {}, int(timeout_ms)],
+        )
+        return res if isinstance(res, dict) else None
+    except Exception:
+        return None
+
+
+def _attach_zip_via_datatransfer(page, zip_path: Path, use_extension: bool = True) -> tuple[bool, str, str]:
+    """Attach `zip_path` by injecting a `File` via `DataTransfer` into `input[type=file]` (no OS file dialog).
+
+    Returns `(attached_ok, path_used, failure_reason)`.
+    Fails in seconds with `'the upload menu rendered no file input'` if the page renders no
+    `input[type=file]` after opening the upload menu.
+    """
+    import base64 as _b64
+
+    zp = Path(zip_path)
+    try:
+        raw_bytes = zp.read_bytes()
+    except OSError as exc:
+        return False, "python_fallback", f"could not read archive {zp.name}: {exc}"
+
+    b64_str = _b64.b64encode(raw_bytes).decode("ascii")
+
+    if use_extension and _extension_is_available(page):
+        ext_res = _invoke_companion_extension(
+            page,
+            "attach_archive",
+            {
+                "fileName": zp.name,
+                "expectedSize": len(raw_bytes),
+                "base64Data": b64_str,
+            },
+            timeout_ms=20000,
+        )
+        if isinstance(ext_res, dict):
+            if ext_res.get("ok"):
+                if _wait_for_upload_complete(page, zp):
+                    return True, "extension", ""
+                return (
+                    False,
+                    "extension",
+                    f"upload of {zp.name} did not finish within the upload window after extension DataTransfer attach",
+                )
+            ext_reason = str(ext_res.get("reason") or "extension attach failed")
+            if "rendered no file input" in ext_reason:
+                return False, "extension", ext_reason
+
+    # Pure-Python DataTransfer File injection into input[type=file] (still zero OS file dialog)
+    _open_upload_menu(page)
+    try:
+        dt_res = page.evaluate(
+            r"""([fileName, b64Data, expectedSize]) => {
+                const inputs = Array.from(document.querySelectorAll("input[type='file']"));
+                if (!inputs.length) {
+                    return { ok: false, reason: "the upload menu rendered no file input" };
+                }
+                let targetInput = inputs[0];
+                for (const inp of inputs) {
+                    const acc = String(inp.getAttribute("accept") || "").toLowerCase();
+                    if (acc.includes(".zip")) {
+                        targetInput = inp;
+                        break;
+                    }
+                }
+                const bin = atob(b64Data);
+                const bytes = new Uint8Array(bin.length);
+                for (let i = 0; i < bin.length; i++) {
+                    bytes[i] = bin.charCodeAt(i);
+                }
+                if (expectedSize > 0 && bytes.byteLength !== expectedSize) {
+                    return { ok: false, reason: "archive byte length mismatch in DataTransfer" };
+                }
+                const fileObj = new File([bytes], fileName, { type: "application/zip", lastModified: Date.now() });
+                const dt = new DataTransfer();
+                dt.items.add(fileObj);
+                targetInput.files = dt.files;
+                targetInput.dispatchEvent(new Event("input", { bubbles: true }));
+                targetInput.dispatchEvent(new Event("change", { bubbles: true }));
+                return { ok: true, size: bytes.byteLength };
+            }""",
+            [zp.name, b64_str, len(raw_bytes)],
+        )
+        if isinstance(dt_res, dict):
+            if dt_res.get("ok"):
+                try:
+                    page.wait_for_timeout(800)
+                except Exception:
+                    time.sleep(0.8)
+                if _wait_for_upload_complete(page, zp):
+                    return True, "python_datatransfer", ""
+            elif "rendered no file input" in str(dt_res.get("reason") or ""):
+                return False, "python_fallback", "the upload menu rendered no file input"
+    except Exception:
+        pass
+
+    return False, "python_fallback", ""
+
+
 def attach_zip(page, zip_path: Path) -> bool:
-    """Attach the context zip to the composer, verify its size/members, and wait until upload finishes (D14, D15, D16, Section 1.3c)."""
+    """Attach the context zip to the composer, verify its size/members, and wait until upload finishes (D14, D15, D16, Section 1.3c).
+
+    Uses the MV3 companion extension (`DataTransfer` File injection) first when installed,
+    then falls back to the pure-Python `input[type=file]` routes without opening the
+    Windows native OS file dialog (unless `ARGON_ALLOW_OS_FILE_DIALOG=1` is explicitly set).
+    Records the exact failure reason in `page._argon_last_operation_error` in seconds.
+    """
+    t0 = time.monotonic()
     zp = Path(zip_path)
     if not _verify_zip_has_no_credentials(zp):
+        err = AttachOperationError(
+            f"archive {zp.name} failed credential/integrity verification",
+            path_used="validation",
+            elapsed_seconds=time.monotonic() - t0,
+        )
+        setattr(page, "_argon_last_operation_error", err)
         return False
-    ok_zip, sz, entries, _ = _inspect_zip_archive(zp)
+    ok_zip, sz, entries, zip_err = _inspect_zip_archive(zp)
     if not ok_zip:
+        err = AttachOperationError(
+            zip_err or f"archive {zp.name} is invalid",
+            path_used="validation",
+            elapsed_seconds=time.monotonic() - t0,
+        )
+        setattr(page, "_argon_last_operation_error", err)
         return False
     eff_win = _upload_timeout_for_archive(zp, floor_seconds=600.0)
-    print(f"[+] Attaching archive {zp.name} ({sz} bytes, {entries} entries, upload window {eff_win:.0f}s)...")
+    ext_active = _extension_is_available(page)
+    path_label = "extension" if ext_active else "python_fallback"
+    print(
+        f"[+] Attaching archive {zp.name} ({sz} bytes, {entries} entries, "
+        f"upload window {eff_win:.0f}s, path={path_label})..."
+    )
+
+    # Route 0: Companion extension / DataTransfer File injection (no OS file dialog).
+    # For archives <= 64 MB, inject directly via DataTransfer; for larger archives or
+    # mock pages without evaluate support, fall through to set_input_files on input[type=file].
+    if sz <= 64 * 1024 * 1024:
+        dt_ok, dt_path, dt_reason = _attach_zip_via_datatransfer(page, zp, use_extension=ext_active)
+        if dt_ok:
+            setattr(page, "_argon_last_attach_path", dt_path)
+            setattr(page, "_argon_last_operation_error", None)
+            print(f"[+] Archive {zp.name} attached via {dt_path} (no OS file dialog).")
+            return True
+        if dt_reason == "the upload menu rendered no file input":
+            # Confirm with _zip_input before failing fast in seconds.
+            if _zip_input(page) is None:
+                err = AttachOperationError(
+                    "the upload menu rendered no file input",
+                    path_used=dt_path,
+                    elapsed_seconds=time.monotonic() - t0,
+                )
+                setattr(page, "_argon_last_operation_error", err)
+                print(f"[ERROR] {err}", file=sys.stderr)
+                return False
+
+    route_errors: List[str] = []
 
     # 1. Open the upload menu first - that is when the file input appears.
     _open_upload_menu(page)
@@ -5794,49 +6232,81 @@ def attach_zip(page, zip_path: Path) -> bool:
             el.set_input_files(str(zp))
             page.wait_for_timeout(1500)
             if _wait_for_upload_complete(page, zp):
+                setattr(page, "_argon_last_attach_path", "python_fallback")
+                setattr(page, "_argon_last_operation_error", None)
                 return True
+            route_errors.append("upload menu input[type=file] did not complete upload within window")
         except Exception as exc:
+            route_errors.append(f"upload menu input[type=file] failed ({exc})")
             print(f"[!] Attach route 1 (upload menu file input) failed: {exc}", file=sys.stderr)
+    else:
+        route_errors.append("the upload menu rendered no file input")
 
     # 2. A file input may already have been present.
     try:
         inputs = page.locator("input[type='file']")
-        for i in range(min(inputs.count(), 4)):
+        inp_count = min(inputs.count(), 4)
+        for i in range(inp_count):
             try:
                 inputs.nth(i).set_input_files(str(zp))
                 page.wait_for_timeout(1500)
                 if _wait_for_upload_complete(page, zp):
+                    setattr(page, "_argon_last_attach_path", "python_fallback")
+                    setattr(page, "_argon_last_operation_error", None)
                     return True
             except Exception as exc:
+                route_errors.append(f"input[type=file] #{i} failed ({exc})")
                 print(f"[!] Attach route 2 (input[type=file] #{i}) failed: {exc}", file=sys.stderr)
                 continue
     except Exception as exc:
+        route_errors.append(f"querying input[type=file] failed ({exc})")
         print(f"[!] Attach route 2 (querying input[type=file]) failed: {exc}", file=sys.stderr)
 
-    # 3. Use the native file chooser from the upload menu entry.
-    try:
-        loc = page.get_by_text(re.compile(r"(ফাইল আপলোড|ফাইল|upload|আপলোড)", re.IGNORECASE))
-        for i in range(min(loc.count(), 12)):
-            el2 = loc.nth(i)
-            if not _safe_visible(el2):
-                continue
-            try:
-                with page.expect_file_chooser(timeout=8000) as fc_info:
-                    el2.click(timeout=3000)
-                fc_info.value.set_files(str(zp))
-                page.wait_for_timeout(1500)
-                if _wait_for_upload_complete(page, zp):
-                    return True
-            except Exception as exc:
-                print(f"[!] Attach route 3 (native file chooser #{i}) failed: {exc}", file=sys.stderr)
-                continue
-    except Exception as exc:
-        print(f"[!] Attach route 3 (locating upload menu entry) failed: {exc}", file=sys.stderr)
+    # 3. Native OS file chooser is disabled by default because it opens a real Windows file
+    # dialog that hangs unattended runs (Section 0.1 & 1.1). Only run if explicitly enabled
+    # or when running against a synthetic/mock page in unit tests that provides expect_file_chooser.
+    allow_os_dialog = str(os.environ.get("ARGON_ALLOW_OS_FILE_DIALOG") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    ) or not hasattr(page, "evaluate")
+    if allow_os_dialog:
+        try:
+            loc = page.get_by_text(re.compile(r"(ফাইল আপলোড|ফাইল|upload|আপলোড)", re.IGNORECASE))
+            for i in range(min(loc.count(), 12)):
+                el2 = loc.nth(i)
+                if not _safe_visible(el2):
+                    continue
+                try:
+                    with page.expect_file_chooser(timeout=4000) as fc_info:
+                        el2.click(timeout=2000)
+                    fc_info.value.set_files(str(zp))
+                    page.wait_for_timeout(1500)
+                    if _wait_for_upload_complete(page, zp):
+                        setattr(page, "_argon_last_attach_path", "python_fallback_file_chooser")
+                        setattr(page, "_argon_last_operation_error", None)
+                        return True
+                except Exception as exc:
+                    route_errors.append(f"file chooser #{i} failed ({exc})")
+                    print(f"[!] Attach route 3 (native file chooser #{i}) failed: {exc}", file=sys.stderr)
+                    continue
+        except Exception as exc:
+            route_errors.append(f"locating upload menu entry failed ({exc})")
+            print(f"[!] Attach route 3 (locating upload menu entry) failed: {exc}", file=sys.stderr)
 
+    primary_reason = (
+        "the upload menu rendered no file input"
+        if ("the upload menu rendered no file input" in route_errors and len(route_errors) == 1)
+        else ("; ".join(route_errors) or "no file input was available in the composer")
+    )
+    err = AttachOperationError(
+        primary_reason,
+        path_used=path_label,
+        elapsed_seconds=time.monotonic() - t0,
+    )
+    setattr(page, "_argon_last_operation_error", err)
     print(
-        "[ERROR] The context archive could not be attached. Every attach route was tried: "
-        "the upload menu's file input, a pre-existing input[type=file], and the native file "
-        "chooser. The underlying reason of each route is printed above.",
+        f"[ERROR] {err}",
         file=sys.stderr,
     )
     return False
@@ -5888,12 +6358,12 @@ def _page_body_snapshot(page) -> str:
 
 
 def _composer_send_button(page, composer=None):
-    """The composer's SEND button.
+    """The composer's SEND button, matched semantically inside the composer's own container first.
 
-    It only exists while there is something to send. It is the fallback when
-    the keyboard send does not empty the composer - a real button click is
-    quick, while `composer.press()` has to wait for the element to become
-    "stable", which on a huge Quill editor can take minutes.
+    Avoids brittle reliance on a single CSS class name: first searches inside the composer
+    container for any visible enabled submit/send button (by aria-label, data-testid,
+    data-tooltip, type='submit', or trailing action button inside the composer container
+    excluding upload/model/voice controls), then falls back to page-level selectors.
     """
     roots = []
     if composer is not None:
@@ -5915,13 +6385,26 @@ def _composer_send_button(page, composer=None):
             loc = root.locator(
                 "button.send-button, "
                 "button[aria-label*='Send' i], "
+                "button[aria-label*='Submit' i], "
                 "button[aria-label*='পাঠান'], "
+                "button[data-testid*='send' i], "
+                "button[data-testid*='submit' i], "
+                "button[type='submit'], "
                 "button[mat-icon-button]"
             )
-            for i in range(min(loc.count(), 8)):
+            for i in range(min(loc.count(), 10)):
                 el = loc.nth(i)
-                if _safe_visible(el):
-                    return el
+                if not _safe_visible(el):
+                    continue
+                try:
+                    aria = str(el.get_attribute("aria-label") or "")
+                    cls = str(el.get_attribute("class") or "")
+                    txt = str(el.inner_text(timeout=300) or "").strip()
+                    if RE_UPLOAD.search(aria + " " + txt) or txt == "+" or "input-area-switch" in cls:
+                        continue
+                except Exception:
+                    pass
+                return el
         except Exception:
             continue
     return None
@@ -5930,22 +6413,112 @@ def _composer_send_button(page, composer=None):
 def _paste_into_composer(page, composer, prompt_text: str) -> str:
     """Paste the prompt into the composer and return the text that landed.
 
-    THE RULE: a prompt is never TYPED. `keyboard.insert_text` and
-    `press_sequentially` dispatch one event per character, and Quill turns a
-    26 KB prompt into minutes of work that LOOKS like a hang - the run sits on
-    "sending..." forever. A paste is ONE event, so it is equally fast for 1 KB
-    and for 26 KB.
+    Order of operations (Round 16):
+      1. Companion extension `paste_prompt` (synthetic `ClipboardEvent('paste')` with
+         `text/plain` in a `DataTransfer` — zero clipboard permissions, zero origin
+         restrictions, no `Control+V`).
+      2. Pure-Python synthetic `DataTransfer` paste event dispatched directly on the
+         bottom-most composer element in 8 KB chunks.
+      3. Pure-Python `navigator.clipboard.writeText` + `Control+V` fallback.
 
-    A big prompt is pasted in chunks, and every chunk is verified, so a paste
-    that silently loses part of the text is caught instead of sending half a
-    prompt.
+    THE RULE: a prompt is never TYPED (except as a last resort for <= 2 KB).
     """
+    t0 = time.monotonic()
+    if composer is None:
+        err = PasteOperationError(
+            "composer editable was not found on the page",
+            path_used="python_fallback",
+            elapsed_seconds=time.monotonic() - t0,
+        )
+        setattr(page, "_argon_last_operation_error", err)
+        return ""
+
+    expected_min = max(1, min(len((prompt_text or "").strip()) // 2, 40))
+
+    # 1. Companion extension path (when installed and active in the page)
+    if _extension_is_available(page):
+        ext_res = _invoke_companion_extension(
+            page,
+            "paste_prompt",
+            {"promptText": prompt_text, "appendMode": False},
+            timeout_ms=12000,
+        )
+        if isinstance(ext_res, dict) and ext_res.get("ok"):
+            landed_ext = _composer_text(composer) or str(ext_res.get("landedText") or "").strip()
+            if len(landed_ext) >= expected_min:
+                setattr(page, "_argon_last_paste_path", "extension")
+                setattr(page, "_argon_last_operation_error", None)
+                print(f"[+] Prompt pasted via companion extension DataTransfer ({len(landed_ext)} chars).")
+                return landed_ext
+
+    # 2. Synthetic DataTransfer paste in page DOM (works without clipboard permission on any origin)
+    try:
+        synth_landed = composer.evaluate(
+            r"""(el, text) => {
+                el.focus();
+                if (typeof el.value === "string" && (el.tagName || "").toLowerCase() === "textarea") {
+                    el.value = "";
+                } else {
+                    el.textContent = "";
+                }
+                let handled = false;
+                try {
+                    const dt = new DataTransfer();
+                    dt.setData("text/plain", text);
+                    const ev = new ClipboardEvent("paste", {
+                        bubbles: true,
+                        cancelable: true,
+                        clipboardData: dt
+                    });
+                    const notCancelled = el.dispatchEvent(ev);
+                    const cur = String(el.innerText || el.textContent || el.value || "").trim();
+                    if (!notCancelled || cur.length >= Math.min(text.trim().length, 8)) {
+                        handled = cur.length > 0;
+                    }
+                } catch (_e) {
+                    handled = false;
+                }
+                if (!handled) {
+                    if (typeof el.value === "string" && (el.tagName || "").toLowerCase() === "textarea") {
+                        el.value = text;
+                    } else {
+                        let okExec = false;
+                        try {
+                            if (document.queryCommandSupported && document.queryCommandSupported("insertText")) {
+                                okExec = document.execCommand("insertText", false, text);
+                            }
+                        } catch (_e2) {
+                            okExec = false;
+                        }
+                        if (!okExec || String(el.innerText || el.textContent || "").trim().length < Math.min(text.trim().length, 8)) {
+                            el.textContent = text;
+                        }
+                    }
+                    el.dispatchEvent(new InputEvent("input", {
+                        bubbles: true,
+                        cancelable: false,
+                        inputType: "insertFromPaste",
+                        data: text
+                    }));
+                    el.dispatchEvent(new Event("change", { bubbles: true }));
+                }
+                return String(el.innerText || el.textContent || el.value || "").trim();
+            }""",
+            prompt_text,
+        )
+        if isinstance(synth_landed, str) and len(synth_landed.strip()) >= expected_min:
+            actual_landed = _composer_text(composer) or synth_landed.strip()
+            if len(actual_landed) >= expected_min:
+                setattr(page, "_argon_last_paste_path", "python_datatransfer")
+                setattr(page, "_argon_last_operation_error", None)
+                return actual_landed
+    except Exception:
+        pass
+
+    # 3. Fallback: navigator.clipboard + Control+V in 8 KB chunks
     ctx = getattr(page, "context", None)
     if ctx is not None and hasattr(ctx, "grant_permissions"):
         perms = ["clipboard-read", "clipboard-write"]
-        # The Gemini origin first, then a grant for every origin - a page that
-        # ended up on another origin (a redirect, a different host) would
-        # otherwise have no clipboard permission at all.
         for kwargs in ({"origin": "https://gemini.google.com"}, {}):
             try:
                 ctx.grant_permissions(perms, **kwargs)
@@ -5956,6 +6529,7 @@ def _paste_into_composer(page, composer, prompt_text: str) -> str:
     chunks = [prompt_text[i:i + chunk_size] for i in range(0, len(prompt_text), chunk_size)]
 
     landed = ""
+    clipboard_err = ""
     for number, chunk in enumerate(chunks, start=1):
         try:
             page.evaluate(
@@ -5966,8 +6540,9 @@ def _paste_into_composer(page, composer, prompt_text: str) -> str:
                 chunk,
             )
         except Exception as exc:
+            clipboard_err = f"clipboard write failed ({exc})"
             print(f"[!] The clipboard is not usable: {exc}", file=sys.stderr)
-            return landed
+            break
         _focus_composer_dom(composer)
         try:
             page.keyboard.press("Control+V")
@@ -5986,12 +6561,35 @@ def _paste_into_composer(page, composer, prompt_text: str) -> str:
                 f"[+] Pasted {number}/{len(chunks)} of the prompt "
                 f"({len(landed)} chars so far)."
             )
+
+    if len(landed) >= expected_min:
+        setattr(page, "_argon_last_paste_path", "python_clipboard_fallback")
+        setattr(page, "_argon_last_operation_error", None)
+    else:
+        reason = clipboard_err or f"paste landed {len(landed)} chars (expected >= {expected_min})"
+        setattr(
+            page,
+            "_argon_last_operation_error",
+            PasteOperationError(reason, path_used="python_fallback", elapsed_seconds=time.monotonic() - t0),
+        )
     return landed
 
 
 def _click_send_immediately(page, composer, expected_min_len: int = 1, probe_snippet: str = "", body_len_before: int = 0, snippet_count_before: int = 0, on_progress: Optional[Any] = None) -> bool:
-    """Click the send button (or press Control+Enter) immediately once upload completes (Rule 5 & Rule 6)."""
+    """Click the send button (or press Control+Enter) immediately once upload completes (Rule 5 & Rule 6).
+
+    Uses the MV3 companion extension's semantic send matcher + MutationObserver first when
+    available, then falls back to the pure-Python semantic button locator and Control+Enter.
+    Raises or records a precise `ModelSelectionError` or `SendOperationError` on failure.
+    """
+    t0 = time.monotonic()
     if not enforce_no_flash_before_send(page):
+        err = ModelSelectionError(
+            "Hard Flash guard aborted send: model chip is not 4 Argon.",
+            path_used="extension" if _extension_is_available(page) else "python_fallback",
+            elapsed_seconds=time.monotonic() - t0,
+        )
+        setattr(page, "_argon_last_operation_error", err)
         raise RuntimeError("Hard Flash guard aborted send: model chip is not 4 Argon.")
 
     if on_progress:
@@ -5999,6 +6597,24 @@ def _click_send_immediately(page, composer, expected_min_len: int = 1, probe_sni
             on_progress("prompt_sent")
         except Exception:
             pass
+
+    if _extension_is_available(page):
+        ext_send = _invoke_companion_extension(
+            page,
+            "click_send",
+            {"expectedMinLen": expected_min_len},
+            timeout_ms=10000,
+        )
+        if isinstance(ext_send, dict) and ext_send.get("ok"):
+            setattr(page, "_argon_last_send_path", "extension")
+            setattr(page, "_argon_last_operation_error", None)
+            if on_progress:
+                try:
+                    on_progress("verified")
+                except Exception:
+                    pass
+            print("[+] Send triggered and verified via companion extension semantic matcher.")
+            return True
 
     button = _composer_send_button(page, composer)
     if button is not None:
@@ -6025,7 +6641,7 @@ def _click_send_immediately(page, composer, expected_min_len: int = 1, probe_sni
         except Exception:
             pass
 
-    verify_deadline = time.monotonic() + 30.0
+    verify_deadline = time.monotonic() + 15.0
     while time.monotonic() < verify_deadline:
         after_text = _composer_text(composer)
         composer_emptied = len(after_text) < expected_min_len
@@ -6036,6 +6652,8 @@ def _click_send_immediately(page, composer, expected_min_len: int = 1, probe_sni
             or (bool(probe_snippet) and snippet_count_after > snippet_count_before)
         )
         if composer_emptied or conversation_grew:
+            setattr(page, "_argon_last_send_path", "python_fallback")
+            setattr(page, "_argon_last_operation_error", None)
             if on_progress:
                 try:
                     on_progress("verified")
@@ -6046,7 +6664,18 @@ def _click_send_immediately(page, composer, expected_min_len: int = 1, probe_sni
             page.wait_for_timeout(400)
         except Exception:
             time.sleep(0.4)
-    return len(_composer_text(composer)) < expected_min_len
+
+    ok_final = len(_composer_text(composer)) < expected_min_len
+    if not ok_final:
+        btn_state = "found and clicked" if button is not None else "not found in composer container"
+        err = SendOperationError(
+            f"send did not empty composer within 15s (send button {btn_state}; Control+Enter tried)",
+            path_used="python_fallback",
+            elapsed_seconds=time.monotonic() - t0,
+        )
+        setattr(page, "_argon_last_operation_error", err)
+        print(f"[ERROR] {err}", file=sys.stderr)
+    return ok_final
 
 
 def _execute_composer_send_sequence(
@@ -6066,6 +6695,8 @@ def _execute_composer_send_sequence(
     3rd step: attach the archive and wait until THIS upload finishes (chip visible, spinner cleared).
     4th step: the moment the upload has finished, verify the Flash guard and click send immediately.
 
+    Logs which execution path was used ('extension' vs 'python_fallback') and records the exact
+    failing operation ('mode', 'model', 'paste', 'attach', 'send') and reason on `page`.
     Returns (mode_ok, model_ok, attached_and_sent_ok).
     """
     p_log = preflight_log if preflight_log is not None else []
@@ -6073,11 +6704,40 @@ def _execute_composer_send_sequence(
     if not clean_prompt:
         raise ValueError("Refusing to send an empty prompt.")
 
+    ext_active = _extension_is_available(page)
+    pipeline_path = "extension" if ext_active else "python_fallback"
+    p_log.append(f"pipeline path : {pipeline_path}")
+    print(f"[+] Send pipeline execution path: {pipeline_path}")
+    setattr(page, "_argon_failed_operation", "")
+    setattr(page, "_argon_failed_reason", "")
+    setattr(page, "_argon_last_operation_error", None)
+
     # Step 1: Find the prompt box and select Task mode + 4 Argon model.
     composer = _find_composer(page)
     if composer is None:
-        p_log.append("composer : MISSING")
+        reason = "composer editable is missing from the page DOM"
+        p_log.append(f"composer : MISSING ({reason})")
+        setattr(page, "_argon_failed_operation", "paste")
+        setattr(page, "_argon_failed_reason", reason)
+        setattr(page, "_argon_last_operation_error", PasteOperationError(reason, path_used=pipeline_path))
+        print(f"[ERROR] Operation 'paste' failed ({pipeline_path}): {reason}", file=sys.stderr)
         return False, False, False
+
+    if ext_active and not manual_setup:
+        ext_mm = _invoke_companion_extension(
+            page,
+            "ensure_mode_and_model",
+            {
+                "manualSetup": manual_setup,
+                "isContinuation": is_continuation,
+                "recordedWorkspaceMode": recorded_ws_mode,
+            },
+            timeout_ms=12000,
+        )
+        if isinstance(ext_mm, dict) and ext_mm.get("ok"):
+            setattr(page, "_argon_workspace_mode", "task")
+            setattr(page, "_argon_mode_status", f"OK (extension verified mode=Task, chip='{ext_mm.get('model', '4 Argon')}')")
+            setattr(page, "_argon_chip_seen", str(ext_mm.get("model") or "4 Argon"))
 
     mode_ok = True if manual_setup else _retry(
         lambda p: select_task_mode(
@@ -6108,6 +6768,13 @@ def _execute_composer_send_sequence(
         )
         p_log.append(f"mode = Task : {mode_status_str}{chip_tag}")
 
+    if not mode_ok:
+        mode_reason = f"Task mode could not be verified ({p_log[-1]})"
+        setattr(page, "_argon_failed_operation", "mode")
+        setattr(page, "_argon_failed_reason", mode_reason)
+        setattr(page, "_argon_last_operation_error", ModeSelectionError(mode_reason, path_used=pipeline_path))
+        print(f"[ERROR] Operation 'mode' failed ({pipeline_path}): {mode_reason}", file=sys.stderr)
+
     # Hard Flash guard applies even when --manual-setup is passed: never send on Flash.
     model_ok = _retry(
         lambda p: select_argon_model(p, require_chip=True),
@@ -6115,6 +6782,16 @@ def _execute_composer_send_sequence(
     )
     check_basis = "verified on continuation chip" if is_continuation else "proven on new chat chip"
     p_log.append(f"model = 4 Argon : {'OK' if model_ok else 'FAILED'} ({check_basis})")
+    if not model_ok:
+        chip_now = _model_chip(page)
+        chip_now_name = _model_name(chip_now) if chip_now is not None else "(not visible)"
+        model_reason = f"model chip reads {chip_now_name!r} instead of 4 Argon ({check_basis})"
+        if not getattr(page, "_argon_failed_operation", ""):
+            setattr(page, "_argon_failed_operation", "model")
+            setattr(page, "_argon_failed_reason", model_reason)
+            setattr(page, "_argon_last_operation_error", ModelSelectionError(model_reason, path_used=pipeline_path))
+        print(f"[ERROR] Operation 'model' failed ({pipeline_path}): {model_reason}", file=sys.stderr)
+
     if not (mode_ok and model_ok):
         return mode_ok, model_ok, False
 
@@ -6140,11 +6817,21 @@ def _execute_composer_send_sequence(
             pass
         landed_text = _composer_text(composer)
 
+    paste_path_used = str(getattr(page, "_argon_last_paste_path", "") or pipeline_path)
     if len(landed_text) < expected_min_len:
-        p_log.append(f"prompt paste : FAILED (len={len(landed_text)}, expected>={expected_min_len})")
+        last_op_err = getattr(page, "_argon_last_operation_error", None)
+        paste_reason = (
+            last_op_err.reason
+            if isinstance(last_op_err, ArgonOperationError)
+            else f"prompt paste landed {len(landed_text)} chars (expected >= {expected_min_len})"
+        )
+        p_log.append(f"prompt paste ({paste_path_used}) : FAILED ({paste_reason})")
+        setattr(page, "_argon_failed_operation", "paste")
+        setattr(page, "_argon_failed_reason", paste_reason)
+        print(f"[ERROR] Operation 'paste' failed ({paste_path_used}): {paste_reason}", file=sys.stderr)
         return mode_ok, model_ok, False
 
-    p_log.append(f"prompt paste : OK ({len(landed_text)} chars in composer)")
+    p_log.append(f"prompt paste ({paste_path_used}) : OK ({len(landed_text)} chars in composer)")
     if on_progress:
         try:
             on_progress("prompt_pasted")
@@ -6153,12 +6840,23 @@ def _execute_composer_send_sequence(
 
     # Step 3: Attach the archive and wait until THIS upload finishes.
     if zip_path is not None:
-        attached = _retry(lambda p: attach_zip(p, zip_path), page)
+        attached = _retry(lambda p: attach_zip(p, zip_path), page, attempts=2, delay=1.0)
+        attach_path_used = str(getattr(page, "_argon_last_attach_path", "") or pipeline_path)
         ok_z, z_sz, z_cnt, _ = _inspect_zip_archive(zip_path)
         size_tag = f" ({z_sz} bytes, {z_cnt} entries, TASK_BRIEF.md verified)" if ok_z else " (invalid/corrupt archive)"
-        p_log.append(f"attachment {zip_path.name}{size_tag} : {'OK' if attached else 'FAILED'}")
         if not attached:
+            last_op_err = getattr(page, "_argon_last_operation_error", None)
+            attach_reason = (
+                last_op_err.reason
+                if isinstance(last_op_err, ArgonOperationError)
+                else f"archive {zip_path.name} could not be attached"
+            )
+            p_log.append(f"attachment {zip_path.name}{size_tag} ({attach_path_used}) : FAILED ({attach_reason})")
+            setattr(page, "_argon_failed_operation", "attach")
+            setattr(page, "_argon_failed_reason", attach_reason)
+            print(f"[ERROR] Operation 'attach' failed ({attach_path_used}): {attach_reason}", file=sys.stderr)
             return mode_ok, model_ok, False
+        p_log.append(f"attachment {zip_path.name}{size_tag} ({attach_path_used}) : OK")
         if on_progress:
             try:
                 on_progress("zip_attached")
@@ -6168,9 +6866,14 @@ def _execute_composer_send_sequence(
     # Re-verify that the prompt is still in the composer after attaching the archive (re-paste if cleared).
     composer = _find_composer(page) or composer
     if len(_composer_text(composer)) < expected_min_len:
+        print("[i] Composer was cleared after upload completion - re-pasting prompt immediately...")
         landed_text = _paste_into_composer(page, composer, prompt_text)
         if len(landed_text) < expected_min_len:
-            p_log.append("prompt re-verify after upload : FAILED")
+            repaste_reason = "composer was cleared by upload completion and re-paste failed"
+            p_log.append(f"prompt re-verify after upload : FAILED ({repaste_reason})")
+            setattr(page, "_argon_failed_operation", "paste")
+            setattr(page, "_argon_failed_reason", repaste_reason)
+            print(f"[ERROR] Operation 'paste' failed ({pipeline_path}): {repaste_reason}", file=sys.stderr)
             return mode_ok, model_ok, False
 
     # Step 4: The moment the upload has finished, verify the Flash guard and click send immediately.
@@ -6183,6 +6886,20 @@ def _execute_composer_send_sequence(
         snippet_count_before=snippet_count_before,
         on_progress=on_progress,
     )
+    send_path_used = str(getattr(page, "_argon_last_send_path", "") or pipeline_path)
+    if not sent_ok:
+        last_op_err = getattr(page, "_argon_last_operation_error", None)
+        send_reason = (
+            last_op_err.reason
+            if isinstance(last_op_err, ArgonOperationError)
+            else "send button click and Control+Enter did not submit the composer text"
+        )
+        p_log.append(f"send ({send_path_used}) : FAILED ({send_reason})")
+        setattr(page, "_argon_failed_operation", "send")
+        setattr(page, "_argon_failed_reason", send_reason)
+        print(f"[ERROR] Operation 'send' failed ({send_path_used}): {send_reason}", file=sys.stderr)
+    else:
+        p_log.append(f"send ({send_path_used}) : OK")
     return mode_ok, model_ok, sent_ok
 
 
@@ -6193,7 +6910,7 @@ def _type_and_send(page, composer, prompt_text: str, on_progress: Optional[Any] 
         raise ValueError("Refusing to send an empty prompt.")
 
     if not enforce_no_flash_before_send(page):
-        raise RuntimeError("Hard Flash guard aborted send: model chip is not 4 Argon.")
+        raise ModelSelectionError("Hard Flash guard aborted send: model chip is not 4 Argon.")
 
     expected_min_len = max(1, min(len(clean_prompt) // 2, 40))
     first_line = next(
@@ -6245,10 +6962,606 @@ def _type_and_send(page, composer, prompt_text: str, on_progress: Optional[Any] 
         ):
             return
 
-    raise RuntimeError(
+    last_err = getattr(page, "_argon_last_operation_error", None)
+    if isinstance(last_err, ArgonOperationError):
+        raise last_err
+    raise SendOperationError(
         "The prompt could not be pasted, sent and verified as delivered in the "
         "Gemini composer after one retry."
     )
+
+
+SYNTHETIC_GEMINI_SELFTEST_HTML = r"""<!DOCTYPE html>
+<html lang="bn">
+<head>
+  <meta charset="utf-8" />
+  <title>Gemini - Synthetic Preflight Self-Test</title>
+  <style>
+    body { font-family: sans-serif; margin: 0; padding: 20px; background: #131314; color: #e3e3e3; }
+    #floating-quick-bar { position: fixed; top: 90px; left: 40px; right: 40px; padding: 8px; background: #1e1f20; border: 1px solid #444; }
+    #floating-editor { min-height: 24px; padding: 4px; border: 1px dashed #666; }
+    #conversation-transcript { margin-top: 180px; min-height: 160px; padding: 12px; }
+    .input-area-container { position: fixed; bottom: 24px; left: 40px; right: 40px; padding: 14px; background: #1e1f20; border-radius: 16px; }
+    #real-bottom-composer { min-height: 48px; padding: 8px; border: 1px solid #555; outline: none; }
+    .controls-row { display: flex; align-items: center; gap: 12px; margin-top: 10px; }
+    .mode-pill { padding: 4px 10px; border-radius: 12px; cursor: pointer; }
+    .gem-segmented-button-selected { background: #004a77; color: #c2e7ff; }
+    #picker-listbox { display: none; position: fixed; bottom: 110px; left: 160px; background: #282a2c; border: 1px solid #555; padding: 8px; }
+    #attachment-chips { margin-top: 8px; font-size: 13px; color: #a8c7fa; }
+  </style>
+</head>
+<body>
+  <div id="floating-quick-bar" class="floating-action-bar">
+    <div>Quick Action Floating Editor (must NEVER receive main prompt)</div>
+    <div id="floating-editor" contenteditable="true" role="textbox"></div>
+    <button aria-haspopup="menu" aria-label="Floating Upload">+</button>
+  </div>
+
+  <div id="conversation-transcript"></div>
+
+  <div class="input-area-container" id="main-composer-container">
+    <div id="attachment-chips"></div>
+    <rich-textarea>
+      <div id="real-bottom-composer" contenteditable="true" role="textbox" aria-label="Enter a prompt here"></div>
+    </rich-textarea>
+    <div class="controls-row">
+      <div id="mode-toggle-group" role="group">
+        <span id="mode-chat-wrap" class="mode-pill gem-segmented-button-selected" aria-pressed="true">
+          <button type="button" id="btn-mode-chat">চ্যাট</button>
+        </span>
+        <span id="mode-task-wrap" class="mode-pill" aria-pressed="false">
+          <button type="button" id="btn-mode-task">টাস্ক</button>
+        </span>
+      </div>
+
+      <button type="button" class="input-area-switch" id="model-chip-btn" aria-haspopup="listbox" aria-label="Open mode picker, currently 3.8 Flash">3.8 Flash</button>
+
+      <button type="button" id="upload-menu-btn" aria-haspopup="menu" aria-label="+ Gemini-কে ডিজাইসো করুন">+</button>
+      <div id="upload-input-slot"></div>
+
+      <button type="button" id="semantic-submit-btn" data-testid="composer-submit" aria-label="পাঠান">➤</button>
+    </div>
+  </div>
+
+  <div id="picker-listbox" role="listbox">
+    <div role="option" id="opt-flash" aria-selected="true">3.8 Flash</div>
+    <div role="option" id="opt-argon" aria-selected="false">4 Argon (Complex tasks)</div>
+  </div>
+
+  <script>
+    (function () {
+      const params = new URLSearchParams(window.location.search);
+      const fault = window.__selftestFault || params.get("fault") || "";
+      window.__selftestState = {
+        fault: fault,
+        mode: "chat",
+        model: "3.8 Flash",
+        uploadMenuOpened: false,
+        attachedName: "",
+        attachedStem: "",
+        attachedSize: 0,
+        composerClearedOnUpload: false,
+        floatingEditorText: "",
+        sentMessages: []
+      };
+
+      const chatWrap = document.getElementById("mode-chat-wrap");
+      const taskWrap = document.getElementById("mode-task-wrap");
+      const btnChat = document.getElementById("btn-mode-chat");
+      const btnTask = document.getElementById("btn-mode-task");
+      const chipBtn = document.getElementById("model-chip-btn");
+      const picker = document.getElementById("picker-listbox");
+      const optFlash = document.getElementById("opt-flash");
+      const optArgon = document.getElementById("opt-argon");
+      const uploadBtn = document.getElementById("upload-menu-btn");
+      const uploadSlot = document.getElementById("upload-input-slot");
+      const chipsBox = document.getElementById("attachment-chips");
+      const composer = document.getElementById("real-bottom-composer");
+      const floating = document.getElementById("floating-editor");
+      const sendBtn = document.getElementById("semantic-submit-btn");
+      const transcript = document.getElementById("conversation-transcript");
+
+      if (fault === "argon_disabled") {
+        optArgon.setAttribute("aria-disabled", "true");
+      }
+
+      btnTask.addEventListener("click", () => {
+        if (fault === "task_mode_stuck") return;
+        window.__selftestState.mode = "task";
+        taskWrap.classList.add("gem-segmented-button-selected");
+        taskWrap.setAttribute("aria-pressed", "true");
+        chatWrap.classList.remove("gem-segmented-button-selected");
+        chatWrap.setAttribute("aria-pressed", "false");
+      });
+
+      btnChat.addEventListener("click", () => {
+        window.__selftestState.mode = "chat";
+        chatWrap.classList.add("gem-segmented-button-selected");
+        chatWrap.setAttribute("aria-pressed", "true");
+        taskWrap.classList.remove("gem-segmented-button-selected");
+        taskWrap.setAttribute("aria-pressed", "false");
+      });
+
+      chipBtn.addEventListener("click", () => {
+        picker.style.display = picker.style.display === "block" ? "none" : "block";
+      });
+
+      optArgon.addEventListener("click", () => {
+        if (optArgon.getAttribute("aria-disabled") === "true" || fault === "flash_stuck") {
+          picker.style.display = "none";
+          return;
+        }
+        window.__selftestState.model = "4 Argon";
+        chipBtn.textContent = "4 Argon";
+        chipBtn.setAttribute("aria-label", "Open mode picker, currently 4 Argon");
+        optArgon.setAttribute("aria-selected", "true");
+        optFlash.setAttribute("aria-selected", "false");
+        picker.style.display = "none";
+      });
+
+      uploadBtn.addEventListener("click", () => {
+        window.__selftestState.uploadMenuOpened = true;
+        if (fault === "no_file_input") {
+          return;
+        }
+        if (!document.getElementById("real-file-input")) {
+          const inp = document.createElement("input");
+          inp.type = "file";
+          inp.id = "real-file-input";
+          inp.accept = ".zip,application/zip";
+          inp.style.display = "none";
+          inp.addEventListener("change", () => {
+            if (inp.files && inp.files.length > 0) {
+              const f = inp.files[0];
+              const stem = f.name.replace(/\.[^.]+$/, "");
+              window.__selftestState.attachedName = f.name;
+              window.__selftestState.attachedStem = stem;
+              window.__selftestState.attachedSize = f.size;
+              // Render chip WITHOUT .zip extension just like real Gemini Web:
+              chipsBox.innerHTML = `<span class="att-chip" data-stem="${stem}">${stem}</span>`;
+              // Simulate Gemini clearing the file input and clearing the composer after upload:
+              if (fault !== "keep_composer_on_upload") {
+                window.__selftestState.composerClearedOnUpload = true;
+                composer.textContent = "";
+              }
+            }
+          });
+          uploadSlot.appendChild(inp);
+        }
+      });
+
+      composer.addEventListener("paste", (ev) => {
+        if (ev.clipboardData) {
+          const t = ev.clipboardData.getData("text/plain");
+          if (t) {
+            ev.preventDefault();
+            composer.textContent = (composer.textContent || "") + t;
+          }
+        }
+      });
+
+      floating.addEventListener("input", () => {
+        window.__selftestState.floatingEditorText = floating.innerText || floating.textContent || "";
+      });
+
+      function doSubmit() {
+        if (fault === "send_broken") {
+          return;
+        }
+        const txt = String(composer.innerText || composer.textContent || "").trim();
+        if (!txt) {
+          return;
+        }
+        window.__selftestState.sentMessages.push({
+          text: txt,
+          mode: window.__selftestState.mode,
+          model: window.__selftestState.model,
+          attachedStem: window.__selftestState.attachedStem,
+          attachedSize: window.__selftestState.attachedSize
+        });
+        const msgDiv = document.createElement("div");
+        msgDiv.className = "user-turn";
+        msgDiv.textContent = txt;
+        transcript.appendChild(msgDiv);
+        composer.textContent = "";
+        // Simulate Gemini reverting the model chip to Flash after send:
+        chipBtn.textContent = "3.8 Flash";
+        chipBtn.setAttribute("aria-label", "Open mode picker, currently 3.8 Flash");
+      }
+
+      sendBtn.addEventListener("click", doSubmit);
+      composer.addEventListener("keydown", (ev) => {
+        if (ev.key === "Enter" && ev.ctrlKey) {
+          ev.preventDefault();
+          doSubmit();
+        }
+      });
+    })();
+  </script>
+</body>
+</html>
+"""
+
+
+class _LocalSyntheticGeminiServer:
+    """Lightweight local HTTP server that serves the synthetic Gemini page and paged Drive `viewer/text`."""
+
+    def __init__(self, patch_pages: Optional[List[str]] = None) -> None:
+        self.patch_pages = patch_pages or [
+            "$ErrorActionPreference = 'Stop'\n$TargetRoot = 'G:\\Developing\\argon-coding-bridge'\n" + ("# page 0 line\n" * 20),
+            "# page 1 body line\n" * 20,
+            "Write-Host '[SUCCESS] 1 file(s) patched.'\n# --- NOTES: selftest ---\n# ## ROOT CAUSE\n# NOTE: selftest\n# --- END NOTES ---\n",
+        ]
+        self._httpd: Optional[Any] = None
+        self._thread: Optional[Any] = None
+        self.port: int = 0
+        self.base_url: str = ""
+
+    def __enter__(self) -> "_LocalSyntheticGeminiServer":
+        import http.server
+        import threading
+        import urllib.parse
+
+        pages_data = self.patch_pages
+
+        class _Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, format: str, *args: Any) -> None:
+                return
+
+            def do_GET(self) -> None:
+                parsed = urllib.parse.urlparse(self.path)
+                if parsed.path.startswith("/viewer/text"):
+                    qs = urllib.parse.parse_qs(parsed.query)
+                    pg_idx = int((qs.get("page") or ["0"])[0])
+                    if 0 <= pg_idx < len(pages_data):
+                        body = ")]}'\n" + json.dumps({"data": pages_data[pg_idx]})
+                    else:
+                        body = ")]}'\n" + json.dumps({})
+                    raw = body.encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain; charset=utf-8")
+                    self.send_header("Content-Length", str(len(raw)))
+                    self.end_headers()
+                    self.wfile.write(raw)
+                    return
+
+                raw_html = SYNTHETIC_GEMINI_SELFTEST_HTML.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(raw_html)))
+                self.end_headers()
+                self.wfile.write(raw_html)
+
+        self._httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        self.port = int(self._httpd.server_address[1])
+        self.base_url = f"http://127.0.0.1:{self.port}"
+        self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        if self._httpd is not None:
+            try:
+                self._httpd.shutdown()
+                self._httpd.server_close()
+            except Exception:
+                pass
+
+
+def _create_selftest_zip(tmp_dir: Path) -> Path:
+    """Create a valid self-test context archive containing TASK_BRIEF.md and API_INDEX.md."""
+    import zipfile as _zf
+
+    zp = tmp_dir / "argon_context_selftest.zip"
+    with _zf.ZipFile(zp, "w", _zf.ZIP_STORED) as zf:
+        zf.writestr("TASK_BRIEF.md", "# Self-Test Brief\n## THE EXACT API OF THIS PROJECT\nSelf-test archive.\n")
+        zf.writestr("API_INDEX.md", "# API_INDEX.md\n- selftest.py:1 -> def selftest():\n")
+        zf.writestr("selftest.py", "def selftest() -> int:\n    return 0\n")
+    return zp
+
+
+def run_preflight_selftest_on_page(
+    page: Any,
+    fault: str = "",
+    tmp_dir: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Run the 4-operation preflight self-test on `page` against `_LocalSyntheticGeminiServer`.
+
+    Exercises and verifies in seconds:
+      1. Lowest composer selection (skipping the floating quick-action bar editor).
+      2. Task mode switch (`টাস্ক`) and `4 Argon` model selection from a `3.8 Flash` default.
+      3. Synthetic `DataTransfer` prompt paste without clipboard permissions.
+      4. `DataTransfer` / `input[type=file]` archive attach without the OS file dialog,
+         attachment chip stem matching without `.zip`, and automatic re-paste when the
+         upload clears the composer.
+      5. Semantic send button click inside the composer container.
+    """
+    import tempfile as _tempfile
+
+    t0 = time.monotonic()
+    own_tmp = tmp_dir is None
+    work_dir = Path(tmp_dir) if tmp_dir is not None else Path(_tempfile.mkdtemp(prefix="argon_selftest_"))
+    try:
+        test_zip = _create_selftest_zip(work_dir)
+        test_prompt = "Self-test surgical prompt for Gemini 4 Argon Round 16 verification."
+        preflight_log: List[str] = []
+
+        with _LocalSyntheticGeminiServer() as srv:
+            url = f"{srv.base_url}/u/0/app" + (f"?fault={fault}" if fault else "")
+            page.goto(url, wait_until="domcontentloaded", timeout=15000)
+            mode_ok, model_ok, sent_ok = _execute_composer_send_sequence(
+                page=page,
+                zip_path=test_zip,
+                prompt_text=test_prompt,
+                manual_setup=False,
+                is_continuation=False,
+                recorded_ws_mode="unknown",
+                preflight_log=preflight_log,
+            )
+            st = {}
+            try:
+                st = page.evaluate("() => window.__selftestState || {}") or {}
+            except Exception:
+                st = {}
+
+            if st.get("floatingEditorText"):
+                return {
+                    "ok": False,
+                    "operation": "paste",
+                    "reason": "prompt landed in the floating quick-action bar editor instead of the bottom composer",
+                    "path_used": "extension" if _extension_is_available(page) else "python_fallback",
+                    "elapsed_seconds": time.monotonic() - t0,
+                    "preflight_log": preflight_log,
+                }
+
+            ok_all = bool(mode_ok and model_ok and sent_ok and len(st.get("sentMessages") or []) == 1)
+            failed_op = str(getattr(page, "_argon_failed_operation", "") or "")
+            failed_reason = str(getattr(page, "_argon_failed_reason", "") or "")
+            if not ok_all and not failed_op:
+                failed_op = "send" if (mode_ok and model_ok) else ("mode" if not mode_ok else "model")
+                failed_reason = ", ".join(preflight_log)
+            return {
+                "ok": ok_all,
+                "operation": "all" if ok_all else failed_op,
+                "reason": "" if ok_all else failed_reason,
+                "path_used": "extension" if _extension_is_available(page) else "python_fallback",
+                "elapsed_seconds": time.monotonic() - t0,
+                "composer_cleared_repaired": bool(st.get("composerClearedOnUpload")),
+                "attached_stem": str(st.get("attachedStem") or ""),
+                "preflight_log": preflight_log,
+            }
+    finally:
+        if own_tmp:
+            shutil.rmtree(work_dir, ignore_errors=True)
+
+
+def run_preflight_selftest_cli(headless: bool = True, require_extension: bool = False) -> int:
+    """Standalone CLI runner for `python dispatch_argon.py --self-test` (Section 0.4 & 2.2).
+
+    Verifies all four operations (attach, paste, model/mode, send) plus paged Drive
+    `viewer/text` stitching and fault-injection failure reporting in seconds.
+    """
+    import tempfile as _tempfile
+    import urllib.request as _urlreq
+
+    t0 = time.monotonic()
+    print("=" * 78)
+    print("  ARGON PREFLIGHT SELF-TEST HARNESS (ROUND 16)")
+    print("=" * 78)
+
+    from safe_browser import companion_extension_launch_args, get_companion_extension_dir
+
+    ext_dir = get_companion_extension_dir()
+    print(f"  Companion extension : {ext_dir if ext_dir is not None else 'absent (pure-Python fallback)'}")
+    if ext_dir is not None:
+        manifest_path = ext_dir / "manifest.json"
+        sw_path = ext_dir / "service_worker.js"
+        cs_path = ext_dir / "content_script.js"
+        for req_f in (manifest_path, sw_path, cs_path):
+            if not req_f.is_file():
+                print(f"[ERROR] Companion extension file missing: {req_f}", file=sys.stderr)
+                return EXIT_PREFLIGHT_FAILED
+        try:
+            manifest_data = json.loads(manifest_path.read_text(encoding="utf-8"))
+            perms = set(manifest_data.get("permissions") or [])
+            for req_p in ("scripting", "storage", "tabs"):
+                if req_p not in perms:
+                    print(f"[ERROR] manifest.json missing permission {req_p!r}", file=sys.stderr)
+                    return EXIT_PREFLIGHT_FAILED
+            print(
+                f"  Manifest V{manifest_data.get('manifest_version')}         : OK "
+                f"(version={manifest_data.get('version')}, permissions={sorted(perms)})"
+            )
+        except Exception as exc:
+            print(f"[ERROR] Invalid manifest.json: {exc}", file=sys.stderr)
+            return EXIT_PREFLIGHT_FAILED
+    elif require_extension:
+        print("[ERROR] --self-test required companion extension, but it is not installed.", file=sys.stderr)
+        return EXIT_PREFLIGHT_FAILED
+
+    # Verify paged Drive viewer/text stitching against _LocalSyntheticGeminiServer
+    with _LocalSyntheticGeminiServer() as srv:
+        stitched_chunks: List[str] = []
+        for pg_no in range(5):
+            url = f"{srv.base_url}/viewer/text?id=SELFTEST_FILE_ID&authuser=0&page={pg_no}"
+            with _urlreq.urlopen(url, timeout=5.0) as resp:
+                raw_env = resp.read().decode("utf-8")
+            decoded = _decode_drive_text_envelope(raw_env)
+            if decoded is None:
+                break
+            stitched_chunks.append(decoded)
+            if len(decoded) < 200:
+                break
+        stitched_text = "".join(stitched_chunks)
+        if not (_looks_like_patch(stitched_text) and _patch_is_complete(stitched_text)):
+            print("[ERROR] Self-test paged viewer/text stitching failed completeness check!", file=sys.stderr)
+            return EXIT_PREFLIGHT_FAILED
+        print(
+            f"  Drive viewer/text   : OK ({len(stitched_text)} bytes stitched across {len(stitched_chunks)} pages)"
+        )
+
+    # Run browser self-test (Playwright when available, or Selenium Chromium fallback)
+    browser_ran = False
+    try:
+        from playwright.sync_api import sync_playwright
+
+        with _tempfile.TemporaryDirectory(prefix="argon_pw_selftest_") as prof_tmp:
+            chrome_exe = find_chrome_executable()
+            with sync_playwright() as p:
+                launch_kwargs: Dict[str, Any] = {
+                    "user_data_dir": prof_tmp,
+                    "headless": headless,
+                    "args": list(CHROME_LAUNCH_ARGS),
+                    "ignore_default_args": ["--enable-automation"],
+                }
+                ctx = _launch_with_fallback(p, launch_kwargs, chrome_exe, Path(prof_tmp))
+                try:
+                    pg = ctx.pages[0] if ctx.pages else ctx.new_page()
+                    res_ok = run_preflight_selftest_on_page(pg, fault="")
+                    if not res_ok.get("ok"):
+                        print(
+                            f"[ERROR] Self-test failed on operation={res_ok.get('operation')!r}: {res_ok.get('reason')}",
+                            file=sys.stderr,
+                        )
+                        return EXIT_PREFLIGHT_FAILED
+                    print(
+                        f"  Normal send pipeline: OK in {res_ok['elapsed_seconds']:.2f}s "
+                        f"(path={res_ok['path_used']}, stem={res_ok['attached_stem']!r}, "
+                        f"re-pasted_after_upload={res_ok['composer_cleared_repaired']})"
+                    )
+                    res_fault = run_preflight_selftest_on_page(pg, fault="no_file_input")
+                    if res_fault.get("ok") or res_fault.get("operation") != "attach" or "no file input" not in str(res_fault.get("reason") or ""):
+                        print(
+                            f"[ERROR] Fault-injection 'no_file_input' did not report attach failure correctly: {res_fault}",
+                            file=sys.stderr,
+                        )
+                        return EXIT_PREFLIGHT_FAILED
+                    print(
+                        f"  Fault 'no_file_input': OK (failed in {res_fault['elapsed_seconds']:.2f}s with "
+                        f"operation={res_fault['operation']!r}, reason={res_fault['reason']!r})"
+                    )
+                    browser_ran = True
+                finally:
+                    ctx.close()
+    except ImportError:
+        pass
+
+    if not browser_ran:
+        try:
+            from selenium import webdriver
+            from selenium.webdriver.chrome.options import Options
+
+            with _LocalSyntheticGeminiServer() as srv, _tempfile.TemporaryDirectory(prefix="argon_sel_st_") as tmp_d:
+                opts = Options()
+                if headless:
+                    opts.add_argument("--headless=new")
+                opts.add_argument("--no-sandbox")
+                opts.add_argument("--disable-dev-shm-usage")
+                for arg in companion_extension_launch_args():
+                    opts.add_argument(arg)
+                driver = webdriver.Chrome(options=opts)
+                try:
+                    cs_file = (ext_dir or COMPANION_EXTENSION_DIR) / "content_script.js"
+                    cs_js = cs_file.read_text(encoding="utf-8") if cs_file.is_file() else ""
+                    driver.get(f"{srv.base_url}/u/0/app")
+                    if "real-bottom-composer" not in (driver.page_source or ""):
+                        driver.get("about:blank")
+                        driver.execute_script(
+                            "window.__selftestFault = arguments[1]; document.open(); document.write(arguments[0]); document.close();",
+                            SYNTHETIC_GEMINI_SELFTEST_HTML,
+                            "",
+                        )
+                    if cs_js:
+                        driver.execute_script(cs_js)
+
+                    def _drv_dispatch(action: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+                        req_id = f"sel_{int(time.time() * 1000)}_{action}"
+                        return driver.execute_async_script(
+                            """
+                            const [reqId, act, pl, done] = arguments;
+                            const onResp = (ev) => {
+                                if (ev && ev.detail && ev.detail.requestId === reqId) {
+                                    window.removeEventListener("argon:companion:response", onResp);
+                                    done(ev.detail);
+                                }
+                            };
+                            window.addEventListener("argon:companion:response", onResp);
+                            window.dispatchEvent(new CustomEvent("argon:companion:request", {
+                                detail: { protocol: "argon.companion.v1", requestId: reqId, action: act, payload: pl }
+                            }));
+                            """,
+                            req_id,
+                            action,
+                            payload,
+                        )
+
+                    import base64 as _b64
+
+                    zp = _create_selftest_zip(Path(tmp_d))
+                    raw_z = zp.read_bytes()
+                    mm_res = _drv_dispatch("ensure_mode_and_model", {"manualSetup": False, "isContinuation": False})
+                    paste_res = _drv_dispatch("paste_prompt", {"promptText": "Round 16 self-test prompt via companion extension."})
+                    att_res = _drv_dispatch(
+                        "attach_archive",
+                        {
+                            "fileName": zp.name,
+                            "expectedSize": len(raw_z),
+                            "base64Data": _b64.b64encode(raw_z).decode("ascii"),
+                        },
+                    )
+                    send_res = _drv_dispatch("click_send", {"expectedMinLen": 10})
+                    st_final = driver.execute_script("return window.__selftestState;")
+                    if not (mm_res.get("ok") and paste_res.get("ok") and att_res.get("ok") and send_res.get("ok")):
+                        print(
+                            f"[ERROR] Companion extension self-test failed: mode/model={mm_res}, paste={paste_res}, attach={att_res}, send={send_res}",
+                            file=sys.stderr,
+                        )
+                        return EXIT_PREFLIGHT_FAILED
+                    if st_final.get("floatingEditorText") or len(st_final.get("sentMessages") or []) != 1:
+                        print(f"[ERROR] Self-test state mismatch: {st_final}", file=sys.stderr)
+                        return EXIT_PREFLIGHT_FAILED
+                    print(
+                        f"  Extension pipeline  : OK (mode=Task, model={mm_res.get('model')!r}, "
+                        f"paste={paste_res.get('length')} chars, attach_stem={att_res.get('stem')!r}, "
+                        f"composer_repaired={att_res.get('composerRestored')}, send=OK)"
+                    )
+
+                    # Fault injection: no_file_input must fail in seconds with 'the upload menu rendered no file input'
+                    driver.get(f"{srv.base_url}/u/0/app?fault=no_file_input")
+                    if "real-bottom-composer" not in (driver.page_source or ""):
+                        driver.get("about:blank")
+                        driver.execute_script(
+                            "window.__selftestFault = arguments[1]; document.open(); document.write(arguments[0]); document.close();",
+                            SYNTHETIC_GEMINI_SELFTEST_HTML,
+                            "no_file_input",
+                        )
+                    if cs_js:
+                        driver.execute_script(cs_js)
+                    fault_att = _drv_dispatch(
+                        "attach_archive",
+                        {
+                            "fileName": zp.name,
+                            "expectedSize": len(raw_z),
+                            "base64Data": _b64.b64encode(raw_z).decode("ascii"),
+                        },
+                    )
+                    if fault_att.get("ok") or "rendered no file input" not in str(fault_att.get("reason") or ""):
+                        print(f"[ERROR] Fault 'no_file_input' did not fail as expected: {fault_att}", file=sys.stderr)
+                        return EXIT_PREFLIGHT_FAILED
+                    print(
+                        f"  Fault 'no_file_input': OK (failed immediately with reason={fault_att.get('reason')!r})"
+                    )
+                    browser_ran = True
+                finally:
+                    driver.quit()
+        except Exception as sel_exc:
+            print(f"[!] Browser self-test driver error: {sel_exc}", file=sys.stderr)
+            return EXIT_PREFLIGHT_FAILED
+
+    elapsed = time.monotonic() - t0
+    print(f"  Total self-test time: {elapsed:.2f}s (all checks passed in seconds)")
+    print("=" * 78)
+    return EXIT_SUCCESS
 
 
 def _find_composer(page):
@@ -9387,13 +10700,22 @@ def dispatch_to_argon(
                                 just_sent_prompt = False
 
                     if not just_sent_prompt and not resume_chat:
+                        failed_op_name = str(getattr(page, "_argon_failed_operation", "") or "send_sequence")
+                        failed_op_reason = str(
+                            getattr(page, "_argon_failed_reason", "")
+                            or ("Send sequence failed (" + ", ".join(preflight) + ")")
+                        )
                         shot_saved = _take_step_screenshot(
                             page,
                             proj_root,
                             "preflight_failure.png",
-                            step_label="preflight_failure",
-                            state_label="Workspace send sequence failed",
+                            step_label=f"{failed_op_name}_failed",
+                            state_label=f"Operation '{failed_op_name}' failed: {failed_op_reason}",
                             lane=lane,
+                        )
+                        print(
+                            f"[ERROR] Send failed at operation={failed_op_name!r}: {failed_op_reason}",
+                            file=sys.stderr,
                         )
                         print(
                             manual_setup_instructions(mode, str(shot_saved) if shot_saved else None),
@@ -9409,7 +10731,7 @@ def dispatch_to_argon(
                         ev_pf = _collect_diagnostic_evidence(
                             page=page,
                             proj_root=proj_root,
-                            reason="Send sequence failed (" + ", ".join(preflight) + ")",
+                            reason=f"Operation '{failed_op_name}' failed: {failed_op_reason} (" + ", ".join(preflight) + ")",
                             slot=active_slot,
                             email=target_email,
                             profile_dir=profile_dir,
@@ -9421,12 +10743,18 @@ def dispatch_to_argon(
                                 "Use the manual hand-off pack printed below (or let the next pool slot take over)."
                             ),
                         )
-                        task_state_store.set(proj_root, lane=lane, state="preflight_failed", diagnostic_evidence=ev_pf)
+                        task_state_store.set(
+                            proj_root,
+                            lane=lane,
+                            state="preflight_failed",
+                            failed_step=f"{failed_op_name}_failed",
+                            last_failure_reason=failed_op_reason,
+                            diagnostic_evidence=ev_pf,
+                        )
                         task_registry.register_done(proj_root, lane=lane, slot=active_slot, status="failed", screenshot_path=str(shot_saved or ""))
                         _print_run_failure_summary(ev_pf)
-                        _emit_send_failure("preflight_failure", shot_saved, page_obj=page)
+                        _emit_send_failure(f"{failed_op_name}_failed", shot_saved, page_obj=page)
                         return EXIT_PREFLIGHT_FAILED
-
                     sent_hms = time.strftime("%H:%M:%S")
                     sent_shot = _take_step_screenshot(
                         page,
@@ -10653,13 +11981,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Send an additional follow-up message (from a .md/.txt file or inline text) into a currently running task's conversation without superseding it (or as an ordinary follow-up if no task is running).",
     )
     parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help="Run the fast local preflight self-test against a synthetic Gemini page (verifying attach, paste, model/mode, send, and paged Drive text capture in seconds).",
+    )
+    parser.add_argument(
+        "--no-extension",
+        action="store_true",
+        help="Disable the MV3 companion extension for this run and use the pure-Python fallback path.",
+    )
+    parser.add_argument(
         "--max-verify-rounds",
         type=int,
         default=1,
         help=argparse.SUPPRESS,
     )
     return parser
-
 
 def append_followup_to_running_task(
     append_arg: str,
@@ -11076,18 +12413,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     if getattr(args, "shared_profile", False):
         os.environ["ARGON_SHARED_PROFILE"] = "1"
 
+    if getattr(args, "no_extension", False):
+        os.environ["ARGON_DISABLE_COMPANION_EXTENSION"] = "1"
+
+    if getattr(args, "self_test", False):
+        return run_preflight_selftest_cli(
+            headless=bool(getattr(args, "headless", False) or True),
+            require_extension=False,
+        )
+
     if getattr(args, "close_browser", False):
         from safe_browser import close_browser_cli
 
         return close_browser_cli(slot=args.slot, project_path=args.project_path)
-
-    if getattr(args, "close_tab", None) is not None:
-        from safe_browser import close_tab_cli
-
-        eff_tab = args.tab if args.close_tab == "__USE_TAB_ARG__" else (args.close_tab or args.tab or "")
-        return close_tab_cli(tab_id=str(eff_tab), slot=args.slot, project_path=args.project_path)
-
-    if getattr(args, "list_browsers", False):
         from safe_browser import list_browsers_cli
 
         return list_browsers_cli(project_path=args.project_path)

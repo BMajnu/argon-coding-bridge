@@ -139,12 +139,14 @@ def _score_candidate_for_cap(rel: Path, full_path: Path, size_bytes: int, task_t
     """Rank candidate files so the archive cap keeps the largest, most relevant source files (E1.2)."""
     rel_posix = rel.as_posix().lower()
     ext = rel.suffix.lower()
-    is_decl_src = 1 if ext in DECLARATION_EXTENSIONS else 0
+    is_companion_ext = 1 if "skills/argon-coding-bridge/extension/" in rel_posix else 0
+    is_decl_src = 1 if (ext in DECLARATION_EXTENSIONS or is_companion_ext) else 0
     is_src = 1 if is_source_file(full_path) else 0
     task_hits = sum(1 for tok in task_tokens if tok in rel_posix)
     parts_low = {p.lower() for p in rel.parts[:-1]}
     in_low_priority = 1 if (parts_low & {"test", "tests", "__tests__", "examples", "example", "docs", "fixtures", "benchmarks"}) else 0
     return (
+        is_companion_ext,
         is_decl_src,
         is_src,
         task_hits,
@@ -152,7 +154,6 @@ def _score_candidate_for_cap(rel: Path, full_path: Path, size_bytes: int, task_t
         size_bytes,
         -len(rel.parts),
     )
-
 NO_GUESSING_DIRECTIVE = (
     "If something you need is not in this archive - a file, an API endpoint, a\n"
     "function, a configuration - DO NOT GUESS and DO NOT INVENT it. Say exactly\n"

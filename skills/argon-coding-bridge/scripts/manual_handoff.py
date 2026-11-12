@@ -80,10 +80,19 @@ def compute_manual_commands(
 ) -> List[str]:
     cmds: List[str] = []
     if chrome_exe and profile_dir:
+        ext_flags = ""
+        try:
+            from safe_browser import get_companion_extension_dir
+
+            ext_dir = get_companion_extension_dir()
+            if ext_dir is not None:
+                ext_flags = f'--disable-extensions-except="{ext_dir}" --load-extension="{ext_dir}" '
+        except Exception:
+            ext_flags = ""
         cmds.append(
             f'"{chrome_exe}" --user-data-dir="{profile_dir.resolve()}" '
             '--disable-blink-features=AutomationControlled --no-default-browser-check '
-            f'--no-first-run "{chat_url}"'
+            f'--no-first-run {ext_flags}"{chat_url}"'
         )
     cmds.append(
         f'python skills/argon-coding-bridge/scripts/dispatch_argon.py --project-path "{proj_root.resolve()}" '
@@ -93,7 +102,6 @@ def compute_manual_commands(
         f'powershell -ExecutionPolicy Bypass -File "{(delivery_folder / "apply_changes.ps1").resolve()}"'
     )
     return cmds
-
 
 def write_manual_handoff_pack(
     proj_root: Path,

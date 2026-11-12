@@ -195,7 +195,8 @@ it down so it survives.
    braces balanced in every replacement block.
 7. Verification command:
    Name the exact command that builds/lints/tests this project under VERIFICATION COMMAND
-   in your reply and in the NOTES block so the bridge can run it after applying the patch.
+   in your reply and in the NOTES block so the bridge can run it after applying the patch
+   - for the bridge repository itself, run python -m py_compile on the bridge scripts and python skills/argon-coding-bridge/scripts/dispatch_argon.py --self-test.
 
 ### 📝 SUMMARY SECTION:
 Keep the chat reply brief — it is a summary of the change, NOT the patch itself:

@@ -145,6 +145,17 @@ Handing the material over first is what saves the long wait: when the automatic 
 stalls, the operator can send by hand immediately instead of waiting for the retries
 to run out.
 
+### 11. Companion MV3 Extension Accelerator, Preflight Self-Test, and the Custom Chromium Build Option (Round 16)
+
+- **Why the Companion Extension Fixes the Four Fragile Operations (`skills/argon-coding-bridge/extension/`)**:
+  Moving file attachment (`DataTransfer` `File` injection into `input[type=file]` without opening the Windows OS file dialog), prompt pasting (synthetic `ClipboardEvent('paste')` with `text/plain` in a `DataTransfer` without origin clipboard permissions), semantic model/mode/send matching (`MutationObserver` + composer-scoped semantic matchers instead of brittle CSS classes), and paged Drive `viewer/text` delivery capture into the unpacked MV3 companion extension fixes all four recurring DOM and OS failures inside existing Chrome today.
+- **What a Custom Chromium Build Would Add (Documented Option, Not the DOM Fix)**:
+  A custom Chromium build does not fix Gemini's DOM or the Windows file dialog on its own, so it is documented strictly as an optional hardening layer that would only add browser version pinning, a pre-installed companion extension immune to Chrome auto-update permission changes, and `--remote-debugging-pipe` transport in place of a local TCP debugging port.
+- **Automatic Pure-Python Fallback**:
+  The companion extension is loaded automatically when `skills/argon-coding-bridge/extension/manifest.json` is present, and the bridge logs which path (`extension` vs `python_fallback`) executed each step. If the extension is absent or `--no-extension` (`ARGON_DISABLE_COMPANION_EXTENSION=1`) is passed, the bridge falls back cleanly to the pure-Python path.
+- **Preflight Self-Test in Seconds (`--self-test`)**:
+  Run `python ./skills/argon-coding-bridge/scripts/dispatch_argon.py --self-test` to verify all four operations (attach without OS dialog, synthetic paste into the lowest composer skipping the floating bar, `3.8 Flash` -> `4 Argon` switch, semantic send after upload clears the composer, and paged Drive `viewer/text` stitching) plus fault-injection checks (`no_file_input`) in seconds.
+
 ---
 
 ## The production workflow

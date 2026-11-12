@@ -1,0 +1,33 @@
+{
+  "manifest_version": 3,
+  "name": "Argon Coding Bridge Companion",
+  "version": "1.16.0",
+  "description": "MV3 companion extension for the Gemini 4 Argon Coding Bridge: DOM-independent file attach via DataTransfer, synthetic paste without clipboard permissions, semantic model/mode/send with MutationObserver, paged Drive viewer/text delivery capture, and chrome.storage.local state.",
+  "permissions": [
+    "scripting",
+    "storage",
+    "tabs"
+  ],
+  "host_permissions": [
+    "https://gemini.google.com/*",
+    "https://drive.google.com/*",
+    "http://127.0.0.1/*",
+    "http://localhost/*"
+  ],
+  "background": {
+    "service_worker": "service_worker.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://gemini.google.com/*",
+        "http://127.0.0.1/*",
+        "http://localhost/*"
+      ],
+      "js": [
+        "content_script.js"
+      ],
+      "run_at": "document_start"
+    }
+  ]
+}

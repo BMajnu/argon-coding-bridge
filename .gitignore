@@ -39,3 +39,4 @@ login_report.json
 Thumbs.db
 .idea/
 .vscode/
+.argon_quarantine/

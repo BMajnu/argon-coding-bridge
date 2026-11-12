@@ -129,13 +129,15 @@ operator can send by hand immediately instead of waiting for the retries to run 
 
 ---
 
-## 🛡️ 5. The Dispatcher Pre-Flight Gate & Per-Step Rule Verification (Rule 7)
+## 🛡️ 5. The Dispatcher Pre-Flight Gate, Companion Extension & Per-Step Rule Verification (Rule 7 & Round 16)
 
 `dispatch_argon.py` never sends a prompt into an unverified workspace. Before each step finishes, its rules are re-read and verified, and the file-send, file-download, and patch-accept steps verify their own rules every time:
 
 1. **Mode & Model (1st step)** — `mode = Task` (`টাস্ক`) and `4 Argon (Complex tasks)` verified on the model chip (hard Flash guard aborts if the chip is Flash).
-2. **Prompt Paste (2nd step)** — prompt pasted into the bottom-most composer and verified present.
-3. **Attachment & Immediate Send (3rd & 4th steps)** — `argon_context.zip` (<= 100 MB, with `TASK_BRIEF.md` and `API_INDEX.md`) attached, upload spinner cleared within the size-scaled window, and Send clicked immediately.
+2. **Prompt Paste (2nd step)** — prompt pasted into the bottom-most composer via synthetic `DataTransfer` `ClipboardEvent('paste')` (companion extension / DOM `DataTransfer` first, clipboard `Control+V` fallback) and verified present.
+3. **Attachment & Immediate Send (3rd & 4th steps)** — `argon_context.zip` (<= 100 MB, with `TASK_BRIEF.md` and `API_INDEX.md`) attached via `DataTransfer` `File` injection into `input[type=file]` without opening the Windows OS file dialog, upload spinner cleared within the size-scaled window, composer re-verified if cleared by upload, and Send clicked semantically inside the composer container.
+4. **Companion Extension vs. Custom Chromium Build Option** — Moving attach, paste, semantic model/mode/send, and paged Drive `viewer/text` capture into `skills/argon-coding-bridge/extension/` fixes the four recurring DOM/OS failures in existing Chrome today (with automatic fallback to pure Python when the extension is absent). A custom Chromium build is an optional hardening step (adding browser version pinning, a pre-installed extension, and `--remote-debugging-pipe`), not the fix for Gemini's DOM.
+5. **Preflight Self-Test (`--self-test`)** — `python skills/argon-coding-bridge/scripts/dispatch_argon.py --self-test` serves a local synthetic Gemini page and tests all four operations and fault injection (`the upload menu rendered no file input`, floating quick-action bar editor, Flash model chip, attachment chip without `.zip`, composer cleared by upload) in seconds.
 ### The prompt is PASTED, never typed - the hang rule
 
 Typing a prompt into Gemini's Quill editor is what makes a run hang. Quill
@@ -145,16 +147,15 @@ then sits there. It is not a network problem - it is the typing.
 
 | step | rule |
 |---|---|
-| the text | pasted with ``Control+V`` (ONE event, same speed at any size) |
+| the text | pasted via synthetic ``DataTransfer`` ``paste`` event (companion extension) or ``Control+V`` fallback (ONE event, same speed at any size) |
 | a big prompt | pasted in 8 KB chunks, every chunk verified |
 | typing | only as a fallback for a prompt of 2 KB or less |
-| the send | the keyboard (``Control+Enter``) - it never waits for the editor to settle |
+| the send | semantic composer container send button + ``Control+Enter`` - never waits for the editor to settle |
 | the fallback send | the composer's **send button** - a plain button, so it is quick |
-| the deadline | the whole send is bounded; on expiry the run fails loudly |
+| the deadline | the whole send is bounded; on expiry each operation names its own failure in seconds |
 
 Measured on the mock that behaves like Quill (pasting fast, typing slow): a
 55 KB prompt is delivered in ~7 seconds and arrives complete.
-### The session book - a run is always findable again
 
 Every run writes its session down **the moment it starts**, with the conversation
 name, the exact link, the account, the profile number and the browser profile

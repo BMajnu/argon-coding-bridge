@@ -39,6 +39,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 ENDPOINT_FILENAME = ".argon_browser_endpoint"
 COOKIE_SNAPSHOT_DIRNAME = ".argon_cookie_snapshot"
 QUARANTINE_DIRNAME = ".argon_quarantine"
+COMPANION_EXTENSION_DIR = Path(__file__).resolve().parent.parent / "extension"
 
 DEFAULT_HOST_ARGS = [
     "--disable-blink-features=AutomationControlled",
@@ -46,6 +47,35 @@ DEFAULT_HOST_ARGS = [
     "--no-first-run",
 ]
 
+
+def get_companion_extension_dir(ext_dir: Optional[Union[str, Path]] = None) -> Optional[Path]:
+    """Return the unpacked MV3 companion extension directory when `manifest.json` exists, else None.
+
+    Setting `ARGON_DISABLE_COMPANION_EXTENSION=1` forces the pure-Python fallback path even when
+    `skills/argon-coding-bridge/extension/manifest.json` is present on disk.
+    """
+    if str(os.environ.get("ARGON_DISABLE_COMPANION_EXTENSION") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        return None
+    cand = Path(ext_dir).expanduser().resolve() if ext_dir else COMPANION_EXTENSION_DIR.resolve()
+    if cand.is_dir() and (cand / "manifest.json").is_file():
+        return cand
+    return None
+
+
+def companion_extension_launch_args(ext_dir: Optional[Union[str, Path]] = None) -> List[str]:
+    """Return Chrome launch flags to load the unpacked companion extension, or `[]` when absent."""
+    resolved = get_companion_extension_dir(ext_dir)
+    if resolved is None:
+        return []
+    ext_str = str(resolved)
+    return [
+        f"--disable-extensions-except={ext_str}",
+        f"--load-extension={ext_str}",
+    ]
 
 def pid_is_alive(pid: int) -> bool:
     """Return True when a process with the given PID is currently running."""
@@ -651,12 +681,16 @@ def ensure_browser_host(
 
     port = _allocate_free_port()
     http_endpoint = f"http://127.0.0.1:{port}"
+    base_extra = list(extra_args or DEFAULT_HOST_ARGS)
+    ext_dir = get_companion_extension_dir()
+    if ext_dir is not None and not any("--load-extension=" in str(a) for a in base_extra):
+        base_extra.extend(companion_extension_launch_args(ext_dir))
     cmd = [
         str(chrome_exe),
         f"--user-data-dir={prof}",
         f"--remote-debugging-port={port}",
         "--remote-debugging-address=127.0.0.1",
-        *(extra_args or DEFAULT_HOST_ARGS),
+        *base_extra,
     ]
     if headless:
         cmd.append("--headless=new")
@@ -703,16 +737,17 @@ def ensure_browser_host(
         "port": port,
         "http_endpoint": http_endpoint,
         "ws_endpoint": str(probed_info.get("ws_endpoint") or ""),
+        "companion_extension": str(ext_dir) if ext_dir is not None else "",
         "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "tabs": {},
     }
     write_host_state(prof, host_state)
+    ext_status = f"extension={ext_dir}" if ext_dir is not None else "extension=none (pure-Python fallback)"
     print(
         f"[+] Browser host started for profile {prof} "
-        f"(pid={proc.pid}, endpoint={http_endpoint}, open_tabs=0, owning_tasks=none)"
+        f"(pid={proc.pid}, endpoint={http_endpoint}, {ext_status}, open_tabs=0, owning_tasks=none)"
     )
     return host_state
-
 
 def reap_dead_tabs(context: Any, profile_dir: Union[str, Path]) -> List[str]:
     """Close any tab in `context` whose owning task PID is no longer alive (Section 2.3.B)."""
@@ -1494,8 +1529,13 @@ def open_browser_cli(
         print(f"[!] The browser host started but the tab could not be opened ({exc}).", file=sys.stderr)
         return 1
 
+    ext_dir_now = get_companion_extension_dir()
     print(f"  Opened URL      : {page_url}")
     print(f"  Page title      : {title}")
+    print(
+        f"  Extension       : "
+        f"{f'loaded ({ext_dir_now})' if ext_dir_now is not None else 'not installed (pure-Python fallback active)'}"
+    )
     print(f"  Session         : {'signed in' if profile_has_signed_in_account(prof) else 'NOT signed in'}")
     print("  Browser status  : OPEN and reachable - a prompt can be sent now")
     print("=" * 78)
