@@ -240,6 +240,8 @@ GENERATED_ARTEFACTS = {
     "apply_changes.ps1",
     "argon_context.zip",
     "argon_package.zip",
+    "argon_delivery.zip",
+    "delivery_manifest.md",
     "argon_task_prompt.md",
     "argon_response.txt",
     "argon_response.md",

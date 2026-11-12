@@ -13,9 +13,10 @@ Rules implemented (R1-R7, D1-D5, Section 3.2):
      winning conversation on the winning slot;
    - NEW-SESSION prompt (`new_prompt.md`), opening a brand-new conversation on a
      DIFFERENT free pool slot (`--new-session`).
-4. Package `argon_context.zip` ONCE for both lanes, launch both lanes as separate
-   OS processes concurrently so each runs in its own isolated slot browser
-   profile, and save deliveries into:
+4. Package `argon_context.zip` ONCE for both lanes, launch both lanes concurrently
+   as separate tabs inside the ONE Argon browser (`~/.gemini/argon_browser_profile`,
+   switched via verified `/u/<index>/` paths), and save deliveries (including
+   `apply_changes.ps1`, `argon_delivery.zip`, and `DELIVERY_MANIFEST.md`) into:
    - `downloads/dual/<round-id>/followup/apply_changes.ps1`
    - `downloads/dual/<round-id>/new/apply_changes.ps1`
 5. Record both lanes in `~/.gemini/argon_sessions.json` and run
@@ -328,7 +329,8 @@ def run_dual_dispatch(
     followup_prompt_path: Path = round_meta["followup_prompt_path"]
     new_prompt_path: Path = round_meta["new_prompt_path"]
 
-    new_initial_url = "https://gemini.google.com/u/0/app (fresh chat via --new-session)"
+    new_url_slot = _url_slot_for_account(new_slot, isolated_profile=False)
+    new_initial_url = f"https://gemini.google.com{new_url_slot}app (fresh chat via --new-session)"
     print(
         f"[+] Lane FOLLOW-UP : slot={followup_slot} | chat_id={followup_chat_id} | url={followup_chat_url} | delivery_dir={followup_dir}"
     )

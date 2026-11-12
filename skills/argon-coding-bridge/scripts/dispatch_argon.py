@@ -1114,17 +1114,191 @@ def apply_delivered_patch(project_path: Path, patch_path: Path) -> bool:
     return True
 
 
-def _chip_matches_patch_name(chip) -> bool:
-    """True when the chip carries the delivery file.
+PRE_TEXT_CONTENT_HIDE_INIT_SCRIPT = """() => {
+    const injectArgonPreHide = () => {
+        try {
+            const root = document.head || document.documentElement;
+            if (!root) return;
+            if (!document.getElementById('argon-hide-pre-text-content')) {
+                const style = document.createElement('style');
+                style.id = 'argon-hide-pre-text-content';
+                style.textContent = 'pre.text-content { display: none !important; max-height: 0 !important; overflow: hidden !important; }';
+                root.appendChild(style);
+            }
+        } catch (e) {}
+    };
+    injectArgonPreHide();
+    if (typeof document !== 'undefined' && document.addEventListener) {
+        document.addEventListener('DOMContentLoaded', injectArgonPreHide, { once: true });
+    }
+}"""
 
-    EVERY name source is read on its own. A missing element must never abort the whole
-    lookup. Gemini renders the name of a generated file differently from time to time
-    (the `.file-name-lr` class existed once and then did not), and when that single
-    lookup raised, the fallbacks below it NEVER RAN - the name ended up empty and the
-    matcher returned False for a chip whose own text plainly began with
-    "apply_changes". The delivery was then never opened, and the run reported that no
-    delivery chip existed while the chip was sitting in the chat.
+
+def _install_pre_text_content_hide_script(page) -> None:
+    """Inject `pre.text-content{display:none!important}` via `page.add_init_script` BEFORE navigation (Round 18 Section 2.2).
+
+    For a 216 KB patch, Gemini's in-page `generated-file-senna-preview` > `gem-popover` > `div.content` >
+    `pre.text-content` is 116,892 px tall and crashes headless Chrome ('Page crashed' / TargetClosedError).
+    Hiding `pre.text-content` via `add_init_script` prevents layout rendering while keeping `.textContent`
+    readable in the DOM for byte-exact SHA-256 cross-checking.
     """
+    if page is None:
+        return
+    try:
+        if not getattr(page, "_argon_pre_hide_installed", False):
+            page.add_init_script(PRE_TEXT_CONTENT_HIDE_INIT_SCRIPT)
+            setattr(page, "_argon_pre_hide_installed", True)
+    except Exception:
+        pass
+    try:
+        ctx = getattr(page, "context", None)
+        if ctx is not None and not getattr(ctx, "_argon_pre_hide_installed", False):
+            ctx.add_init_script(PRE_TEXT_CONTENT_HIDE_INIT_SCRIPT)
+            setattr(ctx, "_argon_pre_hide_installed", True)
+    except Exception:
+        pass
+    try:
+        page.evaluate(PRE_TEXT_CONTENT_HIDE_INIT_SCRIPT)
+    except Exception:
+        pass
+
+
+_CHIP_CONTROL_WORDS = {
+    "export",
+    "download",
+    "drive",
+    "fullscreen",
+    "close",
+    "open",
+    "copy",
+    "এক্সপোর্ট",
+    "ডাউনলোড",
+    "ডাউনলোড করুন",
+    "বন্ধ",
+}
+
+
+def _extract_chip_filename(chip) -> str:
+    """Extract the file name from a `generated-file` chip (`generated-file-senna-preview > div.title-container`, etc.)."""
+    candidates: List[str] = []
+    for sub_sel in (
+        "generated-file-senna-preview .title-container [title]",
+        ".title-container [title]",
+        "[data-file-name]",
+        ".file-name-lr",
+        ".title-container",
+    ):
+        try:
+            loc = chip.locator(sub_sel)
+            cnt = min(loc.count(), 6)
+            for idx in range(cnt):
+                node = loc.nth(idx)
+                for attr in ("title", "data-file-name", "aria-label"):
+                    try:
+                        v = str(node.get_attribute(attr) or "").strip()
+                        if v and v.lower() not in _CHIP_CONTROL_WORDS:
+                            candidates.append(v)
+                    except Exception:
+                        pass
+                try:
+                    t = (node.inner_text(timeout=500) or "").strip()
+                    if t:
+                        candidates.append(t)
+                except Exception:
+                    pass
+        except Exception:
+            continue
+    for attr in ("title", "data-file-name", "aria-label"):
+        try:
+            v = str(chip.get_attribute(attr) or "").strip()
+            if v and v.lower() not in _CHIP_CONTROL_WORDS:
+                candidates.append(v)
+        except Exception:
+            pass
+    try:
+        raw_txt = str(
+            chip.evaluate(
+                """el => {
+                    const tc = el.querySelector && (el.querySelector('.title-container') || el);
+                    if (!tc) return '';
+                    const titled = tc.querySelector && tc.querySelector('[title]');
+                    if (titled) {
+                        const tv = (titled.getAttribute('title') || '').trim();
+                        if (tv && !/^(export|fullscreen|close|download|drive)$/i.test(tv)) return tv;
+                    }
+                    return (tc.innerText || tc.textContent || '').trim();
+                }"""
+            )
+            or ""
+        ).strip()
+        if raw_txt:
+            candidates.insert(0, raw_txt)
+    except Exception:
+        pass
+
+    file_re = re.compile(r"([A-Za-z0-9_.\- ()]+\.[A-Za-z0-9]{1,8})")
+    for cand in candidates:
+        for ln in cand.splitlines():
+            s = ln.strip()
+            if not s or s.lower() in _CHIP_CONTROL_WORDS:
+                continue
+            m = file_re.search(s)
+            if m:
+                matched = m.group(1).strip()
+                if matched.lower() not in _CHIP_CONTROL_WORDS:
+                    return matched
+            if "apply_changes" in s.lower():
+                return "apply_changes.ps1"
+    return ""
+
+
+def _classify_artifact_kind(filename: str, mime_type: str = "") -> str:
+    """Classify a generated artifact filename into `'patch'`, `'image'`, `'svg'`, `'audio'`, or `'other'`."""
+    low = (filename or "").strip().lower()
+    mime_low = (mime_type or "").strip().lower()
+    if "apply_changes" in low or low.endswith(".ps1"):
+        return "patch"
+    if low.endswith(".svg") or "image/svg" in mime_low:
+        return "svg"
+    if any(low.endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".ico", ".avif")) or mime_low.startswith("image/"):
+        return "image"
+    if any(low.endswith(ext) for ext in (".wav", ".mp3", ".ogg", ".m4a", ".flac", ".aac", ".opus")) or mime_low.startswith("audio/"):
+        return "audio"
+    return "other"
+
+
+def _enumerate_generated_file_chips(page, after_last_user: bool = True) -> List[Dict[str, Any]]:
+    """Enumerate ALL `generated-file` chips in the conversation (or after the last user turn), with each chip's name and kind (Round 18 Section 2.2)."""
+    results: List[Dict[str, Any]] = []
+    try:
+        chips = page.locator("generated-file")
+        total = min(chips.count(), 60)
+        for i in range(total):
+            chip = chips.nth(i)
+            if not _safe_visible(chip):
+                continue
+            if after_last_user and not _element_is_after_last_user_turn(chip):
+                continue
+            fname = _extract_chip_filename(chip) or f"artifact_{i + 1}"
+            kind = _classify_artifact_kind(fname)
+            results.append(
+                {
+                    "index": i,
+                    "chip": chip,
+                    "filename": fname,
+                    "kind": kind,
+                }
+            )
+    except Exception:
+        pass
+    return results
+
+
+def _chip_matches_patch_name(chip) -> bool:
+    """True when the chip carries the apply_changes.ps1 delivery file."""
+    fname = _extract_chip_filename(chip).lower()
+    if "apply_changes" in fname or fname.endswith(".ps1"):
+        return True
     names: List[str] = []
     try:
         loc = chip.locator(".file-name-lr")
@@ -1187,36 +1361,20 @@ def _element_is_after_last_user_turn(el) -> bool:
 
 def _generated_file_chip_indices_after_user(page) -> List[int]:
     """Return indices of visible apply_changes chips that sit after the last user message."""
-    try:
-        chips = page.locator("generated-file")
-        found: List[int] = []
-        for i in range(min(chips.count(), 40)):
-            chip = chips.nth(i)
-            if not _safe_visible(chip):
-                continue
-            if not _element_is_after_last_user_turn(chip):
-                continue
-            if _chip_matches_patch_name(chip):
-                found.append(i)
-        return found
-    except Exception:
-        return []
+    return [
+        int(item["index"])
+        for item in _enumerate_generated_file_chips(page, after_last_user=True)
+        if item.get("kind") == "patch"
+    ]
 
 
 def _generated_file_chip_indices(page) -> List[int]:
     """Return the indices of every visible apply_changes delivery chip."""
-    try:
-        chips = page.locator("generated-file")
-        found: List[int] = []
-        for i in range(min(chips.count(), 40)):
-            chip = chips.nth(i)
-            if not _safe_visible(chip):
-                continue
-            if _chip_matches_patch_name(chip):
-                found.append(i)
-        return found
-    except Exception:
-        return []
+    return [
+        int(item["index"])
+        for item in _enumerate_generated_file_chips(page, after_last_user=False)
+        if item.get("kind") == "patch"
+    ]
 
 
 def _generated_file_chip(page):
@@ -1234,7 +1392,7 @@ def _generated_file_chip(page):
         try:
             chips = newest_turn.locator("generated-file")
             matched_in_turn = []
-            for i in range(min(chips.count(), 10)):
+            for i in range(min(chips.count(), 15)):
                 chip = chips.nth(i)
                 if not _safe_visible(chip):
                     continue
@@ -1247,22 +1405,12 @@ def _generated_file_chip(page):
         except Exception:
             pass
 
-    try:
-        chips = page.locator("generated-file")
-        matched = []
-        for i in range(min(chips.count(), 40)):
-            chip = chips.nth(i)
-            if not _safe_visible(chip):
-                continue
-            if not _element_is_after_last_user_turn(chip):
-                continue
-            if _chip_matches_patch_name(chip):
-                matched.append(chip)
-        if matched:
-            return matched[-1]
-    except Exception:
-        pass
-    return None
+    patch_items = [
+        item["chip"]
+        for item in _enumerate_generated_file_chips(page, after_last_user=True)
+        if item.get("kind") == "patch"
+    ]
+    return patch_items[-1] if patch_items else None
 
 
 def _slot_number(slot: Optional[str]) -> int:
@@ -1390,17 +1538,15 @@ def _new_delivery_chip(page, chips_before: int, responses_before: int):
 
 
 def _open_generated_file(page, chip_index: Optional[int] = None, chip=None) -> bool:
-    """Click the chip so Gemini opens its Drive preview.
+    """Ensure the chip's in-Gemini Senna preview (`generated-file-senna-preview`) or Drive preview is open.
 
-    The chip renders a <gem-button class="open-button"> wrapper around a real
-    <button>; the click has to land on the inner <button> for the handler to
-    fire, so that selector is tried first.
-
-    `chip_index` selects one specific delivery chip (the index into the
-    generated-file elements) so a run can capture exactly the delivery it is
-    waiting for instead of "the last one that happens to be there". `chip`
-    selects it directly, which is even safer.
+    Round 18 Section 2.2: Clicking a `generated-file` chip opens an in-Gemini preview
+    (`generated-file-senna-preview` > `div.title-container` with `gem-button` "Export",
+    `button aria="Fullscreen"`, `button aria="Close"` and `gem-popover` > `div.content` > `pre.text-content`).
+    If the chip already renders `generated-file-senna-preview` / `.title-container` with the Export button,
+    it is already open and ready for Export -> Download without clicking Close.
     """
+    _install_pre_text_content_hide_script(page)
     if chip is None and chip_index is not None:
         try:
             cand = page.locator("generated-file").nth(chip_index)
@@ -1417,18 +1563,49 @@ def _open_generated_file(page, chip_index: Optional[int] = None, chip=None) -> b
             file=sys.stderr,
         )
         return False
-    for sel in ("button", ".open-button", "gem-button"):
+
+    try:
+        already_senna = bool(
+            chip.evaluate(
+                """el => {
+                    const sp = el.querySelector && el.querySelector('generated-file-senna-preview, .title-container');
+                    if (!sp) return false;
+                    const btns = Array.from(el.querySelectorAll('gem-button, button'));
+                    return btns.some(b => /export|এক্সপোর্ট/i.test((b.innerText || b.textContent || b.getAttribute('aria-label') || b.getAttribute('title') || '').trim()));
+                }"""
+            )
+        )
+        if already_senna:
+            return True
+    except Exception:
+        pass
+
+    for sel in (".open-button button", ".open-button", ".title-container [title]", "button", "gem-button"):
         try:
-            btn = chip.locator(sel).first
-            if btn.count() > 0:
+            loc = chip.locator(sel)
+            for idx in range(min(loc.count(), 4)):
+                btn = loc.nth(idx)
+                lbl = ""
+                try:
+                    lbl = (
+                        (btn.inner_text(timeout=300) or "")
+                        + " "
+                        + str(btn.get_attribute("aria-label") or "")
+                        + " "
+                        + str(btn.get_attribute("title") or "")
+                    ).strip().lower()
+                except Exception:
+                    lbl = ""
+                if any(skip_w in lbl for skip_w in ("close", "fullscreen", "বন্ধ")):
+                    continue
                 btn.click(timeout=6000)
-                page.wait_for_timeout(3000)
+                page.wait_for_timeout(1200)
                 return True
         except Exception:
             continue
     try:
         chip.click(timeout=6000)
-        page.wait_for_timeout(3000)
+        page.wait_for_timeout(1200)
         return True
     except Exception:
         return False
@@ -1458,8 +1635,47 @@ def _strip_viewer_tail_artefacts(text: str) -> str:
     return "\n".join(lines)
 
 
+def _read_senna_preview_text(page, chip=None) -> Optional[str]:
+    """Read the byte-exact preview text from `pre.text-content` via DOM `textContent` (Round 18 Section 2.2).
+
+    Because `pre.text-content` is hidden with `display:none!important` via `add_init_script` so
+    headless Chrome never lays out a 116,892 px tall `<pre>`, reading `.textContent` in JS retrieves
+    the exact text in memory without layout rendering. Used to cross-check the SHA-256 of the
+    downloaded file while keeping the Export -> Download button as the source of truth.
+    """
+    try:
+        if chip is not None:
+            raw = chip.evaluate(
+                """el => {
+                    const pre = el.querySelector && el.querySelector('pre.text-content, gem-popover .content pre, pre');
+                    return pre ? (pre.textContent || '') : '';
+                }"""
+            )
+            if raw and isinstance(raw, str) and raw.strip():
+                return raw
+    except Exception:
+        pass
+    try:
+        raw_page = page.evaluate(
+            """() => {
+                const pres = Array.from(document.querySelectorAll('generated-file pre.text-content, generated-file-senna-preview pre.text-content, gem-popover div.content pre.text-content, pre.text-content'));
+                if (!pres.length) return '';
+                const lastPre = pres[pres.length - 1];
+                return lastPre ? (lastPre.textContent || '') : '';
+            }"""
+        )
+        if raw_page and isinstance(raw_page, str) and raw_page.strip():
+            return raw_page
+    except Exception:
+        pass
+    return None
+
+
 def _read_previewed_file(page) -> Optional[str]:
-    """Read the file content out of Gemini's Drive viewer preview."""
+    """Read the file content out of Gemini's in-page Senna preview or Drive viewer preview."""
+    senna_txt = _read_senna_preview_text(page)
+    if senna_txt and "$TargetRoot" in senna_txt:
+        return _strip_viewer_tail_artefacts(senna_txt)
     for sel in (
         ".drive-viewer-carousel",
         ".drive-viewer",
@@ -2056,6 +2272,432 @@ def _download_from_drive_text(page, dest_dir: Path, max_pages: int = 12) -> tupl
     )
     return dest, ""
 
+def _validate_and_save_artifact_download(
+    dl,
+    dest_dir: Path,
+    expected_filename: str = "",
+) -> tuple[Optional[Path], str]:
+    """Validate and save a non-patch artifact download (PNG, SVG, WAV, MP3, JSON, etc.) into `dest_dir` (Round 18 Section 2)."""
+    dest_dir = Path(dest_dir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dl_url = ""
+    try:
+        dl_url = str(getattr(dl, "url", "") or "")
+    except Exception:
+        dl_url = ""
+    low_url = dl_url.lower()
+    if "contribservice" in low_url or "print" in low_url:
+        return None, f"browser handed over a print preview URL ({dl_url})"
+
+    suggested = ""
+    try:
+        suggested = str(getattr(dl, "suggested_filename", "") or "").strip()
+    except Exception:
+        suggested = ""
+    chosen_name = Path(suggested or expected_filename or "artifact.bin").name
+    staging = dest_dir / f".staging_art_{os.getpid()}_{int(time.time() * 1000)}_{chosen_name}"
+    dest = dest_dir / chosen_name
+    try:
+        dl.save_as(str(staging))
+    except Exception as exc:
+        return None, f"could not save artifact download ({exc})"
+
+    try:
+        sz = staging.stat().st_size if staging.is_file() else 0
+    except OSError:
+        sz = 0
+    if sz <= 0:
+        try:
+            staging.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return None, f"downloaded artifact {chosen_name} is empty (0 bytes)"
+
+    os.replace(str(staging), str(dest))
+    return dest, ""
+
+
+def _click_chip_export_and_leaf_download(
+    page,
+    chip,
+    dest_dir: Path,
+    expected_filename: str = "",
+    allow_non_ps1: bool = False,
+    timeout_ms: int = 15000,
+) -> tuple[Optional[Path], str]:
+    """Download a `generated-file` chip via its in-Gemini `Export` `gem-button` -> leaf `Download` menu item (Round 18 Section 2.2).
+
+    Measured DOM on the owner's machine:
+      - `generated-file` > `generated-file-senna-preview` > `div.title-container` holds a `gem-button` "Export".
+      - Clicking "Export" opens a menu containing "Download" and "Drive".
+      - Clicking a container whose aggregated text contains "Download" times out; the click MUST land
+        on the LEAF element whose trimmed text is `"Download"` (`"ডাউনলোড"` / `"ডাউনলোড করুন"`).
+    """
+    dest_dir = Path(dest_dir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    if chip is None:
+        chip = _generated_file_chip(page)
+    if chip is None:
+        return None, "no generated-file chip present"
+
+    export_clicked = False
+    for exp_sel in (
+        "generated-file-senna-preview .title-container gem-button:has-text('Export') button",
+        "generated-file-senna-preview .title-container gem-button:has-text('Export')",
+        ".title-container gem-button:has-text('Export') button",
+        ".title-container gem-button:has-text('Export')",
+        "gem-button:has-text('Export') button",
+        "gem-button:has-text('Export')",
+        "button:has-text('Export')",
+        "[aria-label*='Export' i]",
+        "[title*='Export' i]",
+        "gem-button:has-text('এক্সপোর্ট') button",
+        "gem-button:has-text('এক্সপোর্ট')",
+        "button:has-text('এক্সপোর্ট')",
+    ):
+        try:
+            loc = chip.locator(exp_sel)
+            if loc.count() > 0 and _safe_visible(loc.first):
+                loc.first.click(timeout=5000)
+                export_clicked = True
+                break
+        except Exception:
+            continue
+
+    if not export_clicked:
+        try:
+            export_clicked = bool(
+                chip.evaluate(
+                    """el => {
+                        const candidates = Array.from(el.querySelectorAll('gem-button button, gem-button, button, [role="button"]'));
+                        for (const node of candidates) {
+                            const txt = (node.innerText || node.textContent || node.getAttribute('aria-label') || node.getAttribute('title') || '').trim();
+                            if (/^(export|এক্সপোর্ট)$/i.test(txt)) {
+                                node.click();
+                                return true;
+                            }
+                        }
+                        return false;
+                    }"""
+                )
+            )
+        except Exception:
+            export_clicked = False
+
+    if not export_clicked:
+        return None, "the chip did not expose an Export button"
+
+    try:
+        page.wait_for_timeout(450)
+    except Exception:
+        time.sleep(0.45)
+
+    marker_attr = f"data-argon-leaf-dl-{int(time.time() * 1000) % 100000}"
+    found_leaf = False
+    try:
+        found_leaf = bool(
+            page.evaluate(
+                r"""(attrName) => {
+                    document.querySelectorAll('[' + attrName + ']').forEach(n => n.removeAttribute(attrName));
+                    const isDownloadText = (s) => /^(download|ডাউনলোড(?:\s*করুন)?)$/i.test((s || '').trim());
+                    const all = Array.from(document.querySelectorAll('*'));
+                    const leaves = [];
+                    for (const el of all) {
+                        const tag = (el.tagName || '').toLowerCase();
+                        if (tag === 'script' || tag === 'style' || tag === 'pre') continue;
+                        if (el.closest && el.closest('user-query')) continue;
+                        const rect = el.getBoundingClientRect ? el.getBoundingClientRect() : { width: 0, height: 0 };
+                        if (rect.width <= 0 || rect.height <= 0) continue;
+                        const ownTxt = (el.innerText || el.textContent || '').trim();
+                        if (!isDownloadText(ownTxt)) continue;
+                        const childHasDownload = Array.from(el.children || []).some(c => isDownloadText(c.innerText || c.textContent || ''));
+                        if (childHasDownload) continue;
+                        leaves.push(el);
+                    }
+                    if (!leaves.length) return false;
+                    leaves[leaves.length - 1].setAttribute(attrName, '1');
+                    return true;
+                }""",
+                marker_attr,
+            )
+        )
+    except Exception:
+        found_leaf = False
+
+    if not found_leaf:
+        return None, "Export menu opened but no leaf 'Download' element was found"
+
+    leaf_loc = page.locator(f"[{marker_attr}='1']").last
+    setattr(page, "_argon_saw_download_button", True)
+    try:
+        with page.expect_download(timeout=timeout_ms) as dl_info:
+            leaf_loc.click(timeout=5000)
+        if allow_non_ps1:
+            return _validate_and_save_artifact_download(dl_info.value, dest_dir, expected_filename=expected_filename)
+        saved, discard_reason = _validate_and_save_download(dl_info.value, dest_dir)
+        if saved is not None and saved.is_file():
+            preview_txt = _read_senna_preview_text(page, chip=chip)
+            if preview_txt:
+                dl_txt = saved.read_text(encoding="utf-8", errors="replace")
+                sha_dl = _sha256_full(dl_txt)
+                sha_pre = _sha256_full(preview_txt)
+                if sha_dl == sha_pre:
+                    print(f"[+] In-Gemini Export->Download verified byte-exact against pre.text-content (sha256={sha_dl}).")
+        return saved, discard_reason
+    except Exception as exc:
+        return None, f"clicking Export -> leaf 'Download' did not trigger a browser download ({exc})"
+
+
+def _download_from_drive_binary(
+    page,
+    file_id: str,
+    dest_path: Path,
+) -> tuple[Optional[Path], str]:
+    """Fetch binary bytes (PNG, SVG, WAV, MP3, etc.) from Drive's download endpoint (Round 18 Section 2.2)."""
+    if not file_id:
+        return None, "missing Drive file_id for binary download"
+    dest_path = Path(dest_path)
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    auth_user = "0"
+    try:
+        m_au = re.search(r"/u/(\d+)/", str(getattr(page, "url", "") or ""))
+        if m_au:
+            auth_user = str(int(m_au.group(1)))
+    except Exception:
+        auth_user = "0"
+
+    try:
+        api = page.context.request
+    except Exception:
+        return None, "browser context has no request API"
+
+    candidate_urls = [
+        f"https://drive.google.com/uc?export=download&id={file_id}&authuser={auth_user}",
+        f"https://drive.usercontent.google.com/download?id={file_id}&export=download&authuser={auth_user}&confirm=t",
+        f"https://drive.google.com/uc?export=download&id={file_id}&authuser=0",
+    ]
+    for url in candidate_urls:
+        try:
+            resp = api.get(url, timeout=120000)
+            if not getattr(resp, "ok", False):
+                continue
+            raw_bytes = resp.body()
+            if not raw_bytes:
+                continue
+            head_low = raw_bytes[:256].lstrip().lower()
+            if head_low.startswith(b"<!doctype html") or head_low.startswith(b"<html"):
+                continue
+            staging = dest_path.parent / f".staging_bin_{os.getpid()}_{dest_path.name}"
+            staging.write_bytes(raw_bytes)
+            os.replace(str(staging), str(dest_path))
+            return dest_path, ""
+        except Exception:
+            continue
+    return None, f"Drive binary download endpoint did not return binary bytes for file_id={file_id}"
+
+
+def _sha256_bytes(data: bytes) -> str:
+    """Return full 64-character lowercase SHA-256 hex digest of `data`."""
+    return hashlib.sha256(data).hexdigest()
+
+
+def _describe_delivery_artifact(file_path: Path, raw_bytes: Optional[bytes] = None) -> str:
+    """Return a concise one-line human/agent description of a delivered file for `DELIVERY_MANIFEST.md` (Round 18 Section 2.1)."""
+    import struct
+
+    name = file_path.name
+    stem_label = file_path.stem.replace("_", " ").replace("-", " ").strip() or name
+    ext = file_path.suffix.lower()
+    data = raw_bytes if raw_bytes is not None else (file_path.read_bytes() if file_path.is_file() else b"")
+
+    if ext == ".ps1" or "apply_changes" in name.lower():
+        line_cnt = len(data.decode("utf-8", errors="replace").splitlines())
+        return f"PowerShell surgical patch script ({line_cnt} lines)"
+
+    if ext == ".png" and len(data) >= 24 and data[:8] == b"\x89PNG\r\n\x1a\n":
+        try:
+            w, h = struct.unpack(">II", data[16:24])
+            return f"{stem_label}, {w}x{h} PNG"
+        except Exception:
+            return f"{stem_label}, PNG image"
+
+    if ext in (".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".ico"):
+        return f"{stem_label}, {ext.lstrip('.').upper()} image"
+
+    if ext == ".svg":
+        txt_svg = data.decode("utf-8", errors="replace")
+        m_vb = re.search(r'viewBox=["\']\s*[\d.\-]+\s+[\d.\-]+\s+([\d.]+)\s+([\d.]+)', txt_svg, re.IGNORECASE)
+        if m_vb:
+            return f"{stem_label} SVG ({m_vb.group(1)}x{m_vb.group(2)})"
+        return f"{stem_label} SVG"
+
+    if ext == ".wav" and len(data) >= 36 and data[:4] == b"RIFF" and data[8:12] == b"WAVE":
+        try:
+            channels = struct.unpack("<H", data[22:24])[0]
+            sample_rate = struct.unpack("<I", data[24:28])[0]
+            bits = struct.unpack("<H", data[34:36])[0]
+            return f"{stem_label} WAV ({sample_rate} Hz, {bits}-bit, {channels}ch)"
+        except Exception:
+            return f"{stem_label} WAV"
+
+    if ext in (".mp3", ".ogg", ".m4a", ".flac", ".aac", ".opus"):
+        return f"{stem_label} {ext.lstrip('.').upper()}"
+
+    return f"{stem_label} ({ext.lstrip('.').upper() or 'file'} artifact)"
+
+
+def write_delivery_bundle(
+    dest_dir: Path,
+    patch_path: Optional[Path] = None,
+    asset_paths: Optional[List[Path]] = None,
+) -> Dict[str, Any]:
+    """Build `<dest_dir>/argon_delivery.zip` and `<dest_dir>/DELIVERY_MANIFEST.md` next to `apply_changes.ps1` (Round 18 Section 2.1).
+
+    Layout on disk:
+      `<dest_dir>/apply_changes.ps1`
+      `<dest_dir>/argon_delivery.zip`
+      `<dest_dir>/DELIVERY_MANIFEST.md`
+      `<dest_dir>/assets/<generated images / svg / audio / ...>`
+
+    Layout inside `argon_delivery.zip`:
+      `apply_changes.ps1`
+      `assets/<the generated image / svg / audio / ...>`
+      `DELIVERY_MANIFEST.md`
+    """
+    import zipfile as _zipfile
+
+    dest_dir = Path(dest_dir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    assets_dir = dest_dir / "assets"
+
+    eff_patch = patch_path if (patch_path and Path(patch_path).is_file()) else (dest_dir / "apply_changes.ps1")
+    collected_assets: List[Path] = []
+    seen_names: set = set()
+
+    for ap in (asset_paths or []):
+        p_obj = Path(ap)
+        if not p_obj.is_file() or p_obj.name.startswith("."):
+            continue
+        if p_obj.name.lower() in ("apply_changes.ps1", "argon_delivery.zip", "delivery_manifest.md"):
+            continue
+        assets_dir.mkdir(parents=True, exist_ok=True)
+        target_asset = assets_dir / p_obj.name
+        if p_obj.resolve() != target_asset.resolve():
+            shutil.copy2(str(p_obj), str(target_asset))
+        if target_asset.name not in seen_names:
+            seen_names.add(target_asset.name)
+            collected_assets.append(target_asset)
+
+    if assets_dir.is_dir():
+        for existing_asset in sorted(assets_dir.iterdir()):
+            if existing_asset.is_file() and not existing_asset.name.startswith(".") and existing_asset.name not in seen_names:
+                seen_names.add(existing_asset.name)
+                collected_assets.append(existing_asset)
+
+    manifest_entries: List[Dict[str, Any]] = []
+    if eff_patch.is_file():
+        raw_p = eff_patch.read_bytes()
+        manifest_entries.append(
+            {
+                "rel_path": "apply_changes.ps1",
+                "disk_path": eff_patch,
+                "size": len(raw_p),
+                "sha256": _sha256_bytes(raw_p),
+                "description": _describe_delivery_artifact(eff_patch, raw_p),
+            }
+        )
+
+    for asset_file in collected_assets:
+        raw_a = asset_file.read_bytes()
+        manifest_entries.append(
+            {
+                "rel_path": f"assets/{asset_file.name}",
+                "disk_path": asset_file,
+                "size": len(raw_a),
+                "sha256": _sha256_bytes(raw_a),
+                "description": _describe_delivery_artifact(asset_file, raw_a),
+            }
+        )
+
+    manifest_lines: List[str] = [
+        "# Argon Delivery Manifest",
+        "",
+        "| File | Size (bytes) | SHA-256 | Description |",
+        "|---|---:|---|---|",
+    ]
+    for item in manifest_entries:
+        manifest_lines.append(
+            f"| `{item['rel_path']}` | {item['size']} | `{item['sha256']}` | {item['description']} |"
+        )
+    manifest_text = "\n".join(manifest_lines) + "\n"
+
+    manifest_path = dest_dir / "DELIVERY_MANIFEST.md"
+    manifest_path.write_text(manifest_text, encoding="utf-8", newline="\n")
+
+    bundle_zip_path = dest_dir / "argon_delivery.zip"
+    staging_zip = dest_dir / f".staging_bundle_{os.getpid()}_{int(time.time() * 1000)}.zip"
+    with _zipfile.ZipFile(staging_zip, "w", compression=_zipfile.ZIP_DEFLATED) as zf:
+        for item in manifest_entries:
+            zf.write(str(item["disk_path"]), arcname=str(item["rel_path"]))
+        zf.write(str(manifest_path), arcname="DELIVERY_MANIFEST.md")
+    os.replace(str(staging_zip), str(bundle_zip_path))
+
+    with _zipfile.ZipFile(bundle_zip_path, "r") as zf_chk:
+        names_in_zip = set(zf_chk.namelist())
+        for item in manifest_entries:
+            rel_n = str(item["rel_path"])
+            if rel_n not in names_in_zip:
+                raise RuntimeError(f"Bundle verification failed: {rel_n} missing from {bundle_zip_path}")
+            zip_bytes = zf_chk.read(rel_n)
+            if len(zip_bytes) != int(item["size"]) or _sha256_bytes(zip_bytes) != str(item["sha256"]):
+                raise RuntimeError(f"Bundle verification failed: SHA-256/size mismatch for {rel_n} in {bundle_zip_path}")
+
+    return {
+        "bundle_zip": bundle_zip_path,
+        "manifest_path": manifest_path,
+        "files": manifest_entries,
+    }
+
+
+def capture_additional_round_artifacts(page, dest_dir: Path) -> List[Path]:
+    """Collect all non-patch generated-file chips and inline SVG/image/audio artifacts in the newest assistant turn (Round 18 Section 2)."""
+    dest_dir = Path(dest_dir)
+    assets_dir = dest_dir / "assets"
+    saved_assets: List[Path] = []
+    if page is None:
+        return saved_assets
+
+    all_chips = _enumerate_generated_file_chips(page, after_last_user=True)
+    for chip_info in all_chips:
+        if chip_info.get("kind") == "patch":
+            continue
+        chip = chip_info.get("chip")
+        fname = str(chip_info.get("filename") or f"artifact_{chip_info.get('index', 0)}")
+        assets_dir.mkdir(parents=True, exist_ok=True)
+        got_path, _ = _click_chip_export_and_leaf_download(
+            page,
+            chip,
+            assets_dir,
+            expected_filename=fname,
+            allow_non_ps1=True,
+            timeout_ms=12000,
+        )
+        if got_path is None:
+            senna_txt = _read_senna_preview_text(page, chip=chip)
+            if senna_txt and (fname.lower().endswith(".svg") or fname.lower().endswith(".json") or fname.lower().endswith(".txt")):
+                target_f = assets_dir / Path(fname).name
+                target_f.write_text(senna_txt, encoding="utf-8", newline="\n")
+                got_path = target_f
+            else:
+                fid = _drive_viewer_file_id(page, wait_seconds=2.0)
+                if fid:
+                    got_path, _ = _download_from_drive_binary(page, fid, assets_dir / Path(fname).name)
+        if got_path is not None and got_path.is_file() and got_path.stat().st_size > 0:
+            saved_assets.append(got_path)
+
+    return saved_assets
+
+
 def _download_from_viewer(page, dest_dir: Path, timeout_ms: int = 12000) -> Optional[Path]:
     """Find the viewer's verified toolbar download button, click ONLY that button, and validate the file.
 
@@ -2085,11 +2727,11 @@ def _download_from_viewer(page, dest_dir: Path, timeout_ms: int = 12000) -> Opti
 
 
 def _close_preview(page) -> None:
-    """Close the Drive viewer preview without ever cancelling an active Argon response (D10.1)."""
+    """Close the in-Gemini Senna preview or Drive viewer preview without ever cancelling an active Argon response (D10.1)."""
     try:
-        if not _viewer_is_open(page):
-            return
         for close_sel in (
+            "generated-file-senna-preview .title-container button[aria-label='Close' i]",
+            ".title-container button[aria-label='Close' i]",
             ".drive-viewer [aria-label*='Close' i]",
             ".drive-viewer [aria-label*='বন্ধ']",
             "div.drive-viewer-toolstrip [aria-label*='Close' i]",
@@ -2449,8 +3091,9 @@ def capture_generated_file(
         return None
 
     # The Drive file id only ever appears in the request the Gemini page fires when the
-    # chip is clicked, and the Drive viewer crashes headless - so the listener has to be
-    # in place BEFORE the chip is opened.
+    # chip is clicked, and the Drive viewer crashes headless - so the listener and the
+    # pre.text-content hide style must be in place BEFORE the chip is opened.
+    _install_pre_text_content_hide_script(page)
     _install_drive_id_listener(page)
 
     # Resolve the chip ONCE and hand that exact element to the opener. If the chip is
@@ -2468,7 +3111,7 @@ def capture_generated_file(
     poll_count = 0
     last_quarantined: Optional[Path] = None
     saw_download_button = False
-    failure_reason = "the viewer's toolbar download button was not reachable (a print control was never clicked)"
+    failure_reason = "the chip's Export -> Download button and Drive viewer were not reachable (a print control was never clicked)"
     setattr(page, "_argon_chip_capture_exhausted", False)
     setattr(page, "_argon_last_capture_failure_reason", "")
     setattr(page, "_argon_last_quarantined_path", "")
@@ -2477,48 +3120,65 @@ def capture_generated_file(
         poll_count += 1
         _dismiss_print_preview_if_any(page)
         try:
-            page.wait_for_timeout(1500)
+            page.wait_for_timeout(1200)
         except Exception:
-            time.sleep(1.5)
+            time.sleep(1.2)
 
         if poll_count > 1 and not _viewer_is_open(page):
             if not _open_generated_file(page, chip_index=chip_index, chip=chip):
                 break
 
-        dl_btn = _find_viewer_download_button(page)
         downloaded: Optional[Path] = None
-        if dl_btn is not None:
+
+        # Route 1 (PROVEN Round 18 Section 2.2): In-Gemini Senna preview Export gem-button -> leaf "Download"
+        senna_dl, senna_reason = _click_chip_export_and_leaf_download(
+            page,
+            chip,
+            dest_dir,
+            expected_filename="apply_changes.ps1",
+            allow_non_ps1=False,
+            timeout_ms=12000,
+        )
+        if senna_dl is not None:
             saw_download_button = True
             attempt += 1
-            print(f"[i] Download attempt {attempt} of {MAX_CHIP_DOWNLOAD_ATTEMPTS} for this chip...")
-            downloaded = _download_from_viewer(page, dest_dir, timeout_ms=12000)
-            discard_reason = str(getattr(page, "_argon_last_download_reason", "") or "")
-            if discard_reason:
-                failure_reason = discard_reason
+            print(f"[i] Download attempt {attempt} of {MAX_CHIP_DOWNLOAD_ATTEMPTS} for this chip (in-Gemini Export -> Download)...")
+            downloaded = senna_dl
+            failure_reason = ""
+        elif senna_reason and "did not expose an Export button" not in senna_reason:
+            failure_reason = senna_reason
+
+        # Route 2: Legacy Drive viewer toolbar Download button
+        if downloaded is None:
+            dl_btn = _find_viewer_download_button(page)
+            if dl_btn is not None:
+                saw_download_button = True
+                attempt += 1
+                print(f"[i] Download attempt {attempt} of {MAX_CHIP_DOWNLOAD_ATTEMPTS} for this chip...")
+                downloaded = _download_from_viewer(page, dest_dir, timeout_ms=12000)
+                discard_reason = str(getattr(page, "_argon_last_download_reason", "") or "")
+                if discard_reason:
+                    failure_reason = discard_reason
 
         if downloaded is None:
             cand = find_delivered_patch([dest_dir], newer_than=capture_started - 1.0)
             if cand is not None and cand.suffix.lower() == ".ps1" and cand.stat().st_size >= MIN_PATCH_FILE_BYTES:
-                if dl_btn is None:
-                    attempt += 1
-                    print(f"[i] Download attempt {attempt} of {MAX_CHIP_DOWNLOAD_ATTEMPTS} for this chip...")
+                attempt += 1
+                print(f"[i] Download attempt {attempt} of {MAX_CHIP_DOWNLOAD_ATTEMPTS} for this chip...")
                 downloaded = cand
 
+        # Route 3: Drive viewer/text paged endpoint (for Drive-hosted text deliveries)
         if downloaded is None:
-            # The viewer's toolbar button is not always reachable, and the preview text
-            # is a SILENT TRUNCATION (page 0 of the Drive text endpoint just stops
-            # mid-statement). The text endpoint serves the WHOLE file page by page, so
-            # it is the reliable way to get the delivery.
             text_file, text_reason = _download_from_drive_text(page, dest_dir)
             if text_file is not None:
                 downloaded = text_file
                 failure_reason = ""
                 attempt += 1
             elif text_reason:
-                failure_reason = text_reason
-                if dl_btn is None:
-                    attempt += 1
-                    print(f"[i] Download attempt {attempt} of {MAX_CHIP_DOWNLOAD_ATTEMPTS} for this chip...")
+                if "did not expose an Export button" in failure_reason or "not reachable" in failure_reason:
+                    failure_reason = text_reason
+                attempt += 1
+                print(f"[i] Download attempt {attempt} of {MAX_CHIP_DOWNLOAD_ATTEMPTS} for this chip...")
 
         if downloaded is not None and downloaded.is_file():
             try:
@@ -2560,6 +3220,13 @@ def capture_generated_file(
                         downloaded.write_text(dl_text + "\n", encoding="utf-8", newline="\n")
                     except Exception:
                         pass
+                canonical_dest = dest_dir / "apply_changes.ps1"
+                try:
+                    if downloaded.resolve() != canonical_dest.resolve():
+                        shutil.copy2(str(downloaded), str(canonical_dest))
+                        downloaded = canonical_dest
+                except Exception:
+                    pass
                 if proj_for_ledger is not None:
                     try:
                         cid_now = _extract_chat_id(str(getattr(page, "url", "") or "")) or ""
@@ -2571,6 +3238,15 @@ def capture_generated_file(
                         )
                     except Exception:
                         pass
+                try:
+                    extra_assets = capture_additional_round_artifacts(page, dest_dir)
+                    bundle_info = write_delivery_bundle(dest_dir, patch_path=downloaded, asset_paths=extra_assets)
+                    print(
+                        f"[+] Built delivery bundle: {bundle_info['bundle_zip'].name} "
+                        f"({len(bundle_info['files'])} artifact(s) indexed in {bundle_info['manifest_path'].name})"
+                    )
+                except Exception as bundle_exc:
+                    print(f"[!] Warning while building delivery bundle: {bundle_exc}", file=sys.stderr)
                 print(
                     f"[+] Captured delivery file: {downloaded.name} "
                     f"(bytes={len(dl_text.encode('utf-8'))}, sha256={_sha256_full(dl_text)}, "
@@ -3187,12 +3863,17 @@ def _url_slot_for_account(slot: Optional[str], isolated_profile: bool = False) -
 
 
 def _profile_is_isolated_slot(profile_dir: Any) -> bool:
-    """True ONLY when `profile_dir` is an isolated per-slot profile (`argon_profiles/slot-uN`)."""
+    """True ONLY when `profile_dir` is an emergency isolated per-slot profile (`argon_profiles/slot-uN`).
+
+    Never classifies the Argon browser's own profile (`~/.gemini/argon_browser_profile`) as isolated (Round 18 Section 1.1).
+    """
     if not profile_dir or not str(profile_dir).strip():
         return False
     try:
         resolved = Path(str(profile_dir)).expanduser().resolve()
-        return resolved.parent.name == "argon_profiles" or resolved.name.startswith("slot-")
+        if resolved.name.lower() == "argon_browser_profile":
+            return False
+        return resolved.parent.name == "argon_profiles" and resolved.name.startswith("slot-")
     except Exception:
         return False
 
@@ -3573,14 +4254,13 @@ class SlotLock:
 
 
 def _profile_dir_for_slot(base_profile: Path, slot: Optional[str]) -> Path:
-    """Return the browser profile directory for `slot` (the shared Argon Bridge browser profile by default)."""
+    """Return the Argon browser's own profile directory (`base_profile` = `~/.gemini/argon_browser_profile`).
+
+    Round 18 Section 1.1: The Argon browser is the ONLY place; per-slot profile directories are removed
+    from the normal resolution path and only used when `--isolated-profile` (`ARGON_PROFILE_MODE=isolated`)
+    is explicitly set.
+    """
     base_profile = Path(base_profile).expanduser().resolve()
-    try:
-        cfg = PoolConfig(profile_dir_override=base_profile)
-        if cfg.is_shared_profile_slot(slot):
-            return cfg.profile_dir_for_slot(slot)
-    except Exception:
-        pass
     env_shared = (os.environ.get("ARGON_SHARED_PROFILE") or "").strip().lower()
     env_mode = (os.environ.get("ARGON_PROFILE_MODE") or "").strip().lower()
     if env_shared in ("0", "false", "no") or env_mode == "isolated":
@@ -3589,6 +4269,8 @@ def _profile_dir_for_slot(base_profile: Path, slot: Optional[str]) -> Path:
         else:
             root = base_profile.parent / "argon_profiles"
         return root / f"slot-{_slot_key(slot)}"
+    if base_profile.parent.name == "argon_profiles" and base_profile.name.startswith("slot-"):
+        return base_profile.parent.parent / "argon_browser_profile"
     return base_profile
 
 
@@ -7442,40 +8124,118 @@ def run_preflight_selftest_cli(headless: bool = True, require_extension: bool = 
             f"  Drive viewer/text   : OK ({len(stitched_text)} bytes stitched across {len(stitched_chunks)} pages)"
         )
 
-    # Verify Round 17 shared Argon Bridge browser profile & /u/<account_index>/ URL resolution
-    with _tempfile.TemporaryDirectory(prefix="argon_r17_st_") as r17_tmp:
-        r17_root = Path(r17_tmp)
-        r17_shared = r17_root / "argon_browser_profile"
-        (r17_shared / "Default" / "Network").mkdir(parents=True, exist_ok=True)
-        (r17_shared / "Default" / "Network" / "Cookies").write_bytes(b"SQLite format 3\x00" + b"\x01" * 128)
-        (r17_shared / "Default" / "Preferences").write_text(
-            json.dumps(
-                {
-                    "account_info": [
-                        {"email": "first@example.com", "gaia": "111"},
-                        {"email": "second@example.com", "gaia": "222"},
-                        {"email": "slot5@example.com", "gaia": "555"},
-                    ]
-                }
-            ),
+    # Verify Round 17 & Round 18 Argon browser profile, session migration, leftover deletion, and multi-artifact bundle
+    with _tempfile.TemporaryDirectory(prefix="argon_r18_st_") as r18_tmp:
+        import sqlite3
+        from safe_browser import reclaim_isolated_slot_profiles
+
+        r18_root = Path(r18_tmp)
+        r18_argon = r18_root / "argon_browser_profile"
+        r18_profiles = r18_root / "argon_profiles"
+        for s_name, s_email, s_gaia in (
+            ("slot-u0", "first@example.com", "111"),
+            ("slot-u5", "slot5@example.com", "555"),
+        ):
+            s_dir = r18_profiles / s_name
+            (s_dir / "Default" / "Network").mkdir(parents=True, exist_ok=True)
+            (s_dir / "Local State").write_text(
+                json.dumps({"os_crypt": {"encrypted_key": "DPAPI_TEST_KEY_R18"}}),
+                encoding="utf-8",
+            )
+            ck_db = s_dir / "Default" / "Network" / "Cookies"
+            conn_s = sqlite3.connect(str(ck_db))
+            conn_s.execute(
+                "CREATE TABLE cookies (host_key TEXT, name TEXT, value TEXT, path TEXT, encrypted_value BLOB, PRIMARY KEY (host_key, name, path))"
+            )
+            conn_s.execute(
+                "INSERT INTO cookies VALUES ('.google.com', 'SID', ?, '/', ?)",
+                (f"sid_{s_name}", f"enc_{s_name}".encode("utf-8")),
+            )
+            conn_s.commit()
+            conn_s.close()
+            (s_dir / "Default" / "Preferences").write_text(
+                json.dumps({"account_info": [{"email": s_email, "gaia": s_gaia, "account_id": s_gaia}]}),
+                encoding="utf-8",
+            )
+
+        unverified_slot = r18_profiles / "slot-u9"
+        (unverified_slot / "Default").mkdir(parents=True, exist_ok=True)
+        (unverified_slot / "Default" / "Preferences").write_text(
+            json.dumps({"account_info": [{"email": "unverified9@example.com", "gaia": "999"}]}),
             encoding="utf-8",
         )
-        r17_cfg_path = r17_root / "accounts_pool.json"
-        r17_cfg_path.write_text(
+
+        for lf_name in ("run-14180-1793594378", "slot-u0-concurrent-16712", "slot-u4-cap2", "slot-u-0"):
+            lf_dir = r18_profiles / lf_name
+            lf_dir.mkdir(parents=True, exist_ok=True)
+            (lf_dir / "waste.bin").write_bytes(b"W" * 4096)
+
+        r18_cfg_path = r18_root / "accounts_pool.json"
+        r18_cfg_path.write_text(
             json.dumps(
                 {
-                    "profile_dir": str(r17_shared),
+                    "profile_dir": str(r18_argon),
                     "active_slot": "/u/5/",
-                    "accounts": [{"index": 5, "slot": "/u/5/", "email": "slot5@example.com", "status": "active"}],
+                    "accounts": [
+                        {"index": 0, "slot": "/u/0/", "email": "first@example.com", "status": "active"},
+                        {"index": 5, "slot": "/u/5/", "email": "slot5@example.com", "status": "active"},
+                        {"index": 9, "slot": "/u/9/", "email": "unverified9@example.com", "status": "configured"},
+                    ],
                 }
             ),
             encoding="utf-8",
         )
-        r17_cfg = PoolConfig(config_path=r17_cfg_path)
-        if not r17_cfg.is_shared_profile_slot("/u/5/") or r17_cfg.get_account_index("/u/5/") != 2:
-            print("[ERROR] Round 17 shared profile account_index verification failed!", file=sys.stderr)
+        rep_mig = reclaim_isolated_slot_profiles(
+            shared_profile_dir=r18_argon,
+            profiles_root=r18_profiles,
+            config_path=r18_cfg_path,
+            keep_archive=False,
+            migrate_sessions=True,
+            verify_live=False,
+        )
+        r18_cfg = PoolConfig(config_path=r18_cfg_path)
+        if (
+            r18_cfg.profile_dir_for_slot("/u/5/").resolve() != r18_argon.resolve()
+            or _profile_is_isolated_slot(r18_argon)
+            or r18_cfg.get_account_index("/u/5/") != 1
+            or len(rep_mig["reclaimed"]) != 2
+            or len(rep_mig["leftovers_removed"]) != 4
+            or len(rep_mig["skipped"]) != 1
+            or (r18_profiles / "slot-u0").exists()
+            or (r18_profiles / "slot-u5").exists()
+            or (r18_profiles / "run-14180-1793594378").exists()
+            or not unverified_slot.exists()
+        ):
+            print(f"[ERROR] Round 18 migration & complete deletion self-test failed: {rep_mig}", file=sys.stderr)
             return EXIT_PREFLIGHT_FAILED
-        print("  Shared /u/<index>/  : OK (shared_profile=True by default, /u/5/ verified at browser index /u/2/)")
+
+        bundle_dir = r18_root / "delivery_test"
+        bundle_dir.mkdir(parents=True, exist_ok=True)
+        patch_f = bundle_dir / "apply_changes.ps1"
+        patch_f.write_text(stitched_text, encoding="utf-8", newline="\n")
+        png_f = bundle_dir / "logo_mark.png"
+        png_f.write_bytes(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x08\x00\x00\x00\x08\x00\x08\x06\x00\x00\x00")
+        svg_f = bundle_dir / "card_background.svg"
+        svg_f.write_text('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 600"><rect width="800" height="600"/></svg>\n', encoding="utf-8")
+        wav_f = bundle_dir / "voice_over.wav"
+        wav_f.write_bytes(b"RIFF\x24\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00\x44\xac\x00\x00\x88\x58\x01\x00\x02\x00\x10\x00data\x00\x00\x00\x00")
+        b_res = write_delivery_bundle(bundle_dir, patch_path=patch_f, asset_paths=[png_f, svg_f, wav_f])
+        manifest_txt = b_res["manifest_path"].read_text(encoding="utf-8")
+        if (
+            not b_res["bundle_zip"].is_file()
+            or len(b_res["files"]) != 4
+            or "2048x2048 PNG" not in manifest_txt
+            or "assets/card_background.svg" not in manifest_txt
+            or "assets/voice_over.wav" not in manifest_txt
+        ):
+            print(f"[ERROR] Round 18 delivery bundle self-test failed: {manifest_txt}", file=sys.stderr)
+            return EXIT_PREFLIGHT_FAILED
+        print(
+            "  Round 18 migration  : OK (2 slot sessions migrated via DPAPI/SQLite & deleted, 4 leftovers deleted, 1 unverified slot refused)"
+        )
+        print(
+            "  Round 18 bundle     : OK (argon_delivery.zip + DELIVERY_MANIFEST.md verified with PS1, 2048x2048 PNG, SVG, and WAV)"
+        )
 
     # Run browser self-test (Playwright when available, or Selenium Chromium fallback)
     browser_ran = False
@@ -10117,37 +10877,20 @@ def dispatch_to_argon(
     try:
         profile_dir = slot_profile
         try:
-            if not (slot_profile.is_dir() and (slot_profile / "Default").is_dir()):
-                print(f"[+] Preparing a browser profile for slot {active_slot}: {slot_profile}")
-                seeded_ok = _seed_profile(base_profile, slot_profile)
-            elif not _has_cookie_db(slot_profile):
-                if profile_has_signed_in_account(slot_profile):
-                    print(
-                        f"[+] Slot profile {slot_profile} holds a registered account; "
-                        "repairing SQLite cookie DB in-place without replacing profile."
-                    )
+            if _profile_is_isolated_slot(slot_profile):
+                if not (slot_profile.is_dir() and (slot_profile / "Default").is_dir()):
+                    print(f"[+] Preparing an isolated browser profile for slot {active_slot}: {slot_profile}")
+                    _seed_profile(base_profile, slot_profile)
+                elif not _has_cookie_db(slot_profile) and profile_has_signed_in_account(slot_profile):
                     repair_slot_cookie_db_only(base_profile, slot_profile)
-                    seeded_ok = True
-                elif _has_cookie_db(base_profile):
-                    print(f"[+] Seeding initial cookie DB for slot {active_slot}: {slot_profile}")
-                    seeded_ok = _seed_profile(base_profile, slot_profile)
-                else:
-                    seeded_ok = True
             else:
-                seeded_ok = True
-
-            if seeded_ok and slot_profile.is_dir() and (slot_profile / "Default").is_dir():
-                profile_dir = slot_profile
-            elif not (base_profile / "Default").is_dir():
-                profile_dir = slot_profile
-            else:
-                profile_dir = slot_profile
+                profile_dir.mkdir(parents=True, exist_ok=True)
         except Exception as exc:
-            print(f"[!] Could not prepare the slot profile: {exc}", file=sys.stderr)
+            print(f"[!] Could not prepare the browser profile: {exc}", file=sys.stderr)
             profile_dir = slot_profile
 
-        # Section 2.3.C: When using a shared multi-account profile, verify the account index
-        # in Default/Preferences (`account_info`) so the tab targets the exact `/u/<index>/` account.
+        # Section 2.3.C & Round 18 Section 1.1: Verify the account index in the Argon browser's
+        # Default/Preferences (`account_info`) so the tab targets the exact `/u/<index>/` account.
         if not _profile_is_isolated_slot(profile_dir):
             expected_acct_idx = pool_cfg.get_account_index(active_slot)
             ok_idx, found_idx, all_pref_emails = verify_account_index_in_preferences(
@@ -10159,7 +10902,7 @@ def dispatch_to_argon(
             if found_idx is not None:
                 pool_cfg.set_account_index(active_slot, found_idx)
             print(
-                f"[+] Shared profile account index for slot {active_slot} ({target_email or 'account'}): "
+                f"[+] Argon browser account index for slot {active_slot} ({target_email or 'account'}): "
                 f"/u/{eff_idx}/ (verified_in_preferences={ok_idx}, registered_accounts={len(all_pref_emails)})"
             )
             target_url = re.sub(
@@ -10195,8 +10938,7 @@ def dispatch_to_argon(
                 "no_viewport": True,
             }
 
-            # Section 2.3.A & 2.3.B: Attach to (or start) the profile's single CDP browser host
-            # and open a dedicated tab for this task so N tasks share 1 browser process.
+            # Attach to (or start) the Argon browser's single CDP host and open a dedicated tab.
             context, page, host_tab_id, attached_to_host = acquire_host_tab(
                 playwright_instance=p,
                 profile_dir=profile_dir,
@@ -10209,21 +10951,17 @@ def dispatch_to_argon(
             )
 
             if context is None or page is None:
-                # Fallback when CDP host is unavailable: if profile is busy with a non-host browser,
-                # clone a concurrent profile directory so this run still does not block.
+                # If a plain Chrome without --remote-debugging-port holds the Argon browser profile,
+                # close it safely (snapshotting & restoring cookies) instead of cloning *-concurrent-* leftovers.
                 if (not lock_acquired or _profile_is_busy(profile_dir)) and not has_live_browser_host(profile_dir):
                     print(
-                        f"[+] Profile ({profile_dir}) is held by a non-host browser; "
-                        f"cloning a concurrent profile directory for {active_slot} as fallback."
+                        f"[i] Profile ({profile_dir}) is held by a Chrome without a CDP endpoint; "
+                        f"closing it safely (preserving cookies) so {active_slot} can launch."
                     )
-                    concurrent_cand = profile_dir.parent / f"{profile_dir.name}-concurrent-{os.getpid()}"
-                    src_for_clone = profile_dir if (profile_dir / "Default").is_dir() else base_profile
-                    cloned_prof = _copy_profile(src_for_clone, concurrent_cand, allow_busy=True)
-                    if cloned_prof is not None:
-                        temp_concurrent_profile = cloned_prof
-                        profile_dir = cloned_prof
-                        launch_kwargs["user_data_dir"] = str(profile_dir)
-                        slot_lock.update_profile_dir(profile_dir)
+                    try:
+                        _close_browser_safely(None, profile_dir)
+                    except Exception:
+                        pass
 
                 if chrome_exe:
                     print(f"[+] Launching installed Google Chrome binary (fallback mode): {chrome_exe}")
@@ -10277,6 +11015,7 @@ def dispatch_to_argon(
                 page.on("download", _on_download)
             except Exception:
                 pass
+            _install_pre_text_content_hide_script(page)
             _install_drive_id_listener(page)
 
             # D4: Register the task as running in TaskRegistry before navigation
@@ -11296,7 +12035,10 @@ def dispatch_to_argon(
 
                     working = _is_argon_working(page)
                     try:
-                        body_now = page.locator("body").inner_text(timeout=6000) or ""
+                        if page.locator("generated-file").count() > 0:
+                            body_now = last_body
+                        else:
+                            body_now = page.locator("body").inner_text(timeout=6000) or ""
                     except Exception:
                         body_now = last_body
                     last_body = body_now
@@ -11532,6 +12274,11 @@ def dispatch_to_argon(
                     return EXIT_FAILURE
                 out_ps1 = (active_downloads_dir / "apply_changes.ps1") if delivery_dir else (proj_root / "apply_changes.ps1")
                 out_ps1.write_text(extracted_patch + "\n", encoding="utf-8")
+                try:
+                    extra_assets_inline = capture_additional_round_artifacts(page, out_ps1.parent)
+                    write_delivery_bundle(out_ps1.parent, patch_path=out_ps1, asset_paths=extra_assets_inline)
+                except Exception:
+                    pass
                 if chat_id and lane:
                     session_store.remember(
                         proj_root, mode, active_slot, chat_id,
@@ -12090,22 +12837,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--shared-profile",
         action="store_true",
-        help="Run this slot as a tab inside the shared Argon Bridge browser profile (~/.gemini/argon_browser_profile; default).",
+        help="Run this slot as a tab inside the Argon browser profile (~/.gemini/argon_browser_profile; default).",
     )
     parser.add_argument(
         "--isolated-profile",
         action="store_true",
-        help="Escape hatch: run this slot in an isolated per-slot browser profile (~/.gemini/argon_profiles/slot-uN).",
+        help="Emergency escape hatch: run this slot in an isolated per-slot browser profile (~/.gemini/argon_profiles/slot-uN).",
     )
     parser.add_argument(
         "--enable-shared-profile",
         action="store_true",
-        help="Persist shared Argon Bridge browser mode in accounts_pool.json and record verified /u/<index>/ account indices.",
+        help="Configure accounts_pool.json to use the Argon browser profile and record verified /u/<index>/ account indices.",
     )
     parser.add_argument(
         "--reclaim-slot-profiles",
+        "--migrate-slot-profiles",
+        dest="reclaim_slot_profiles",
         action="store_true",
-        help="Safely reclaim the ~68 GB of old per-slot profiles (~/.gemini/argon_profiles/slot-u*) after verifying each account is in the shared profile.",
+        help="Migrate every account session from ~/.gemini/argon_profiles/slot-u* into the Argon browser profile, verify each account there, and COMPLETELY DELETE the old ~68 GB slot directories and test leftovers.",
+    )
+    parser.add_argument(
+        "--keep-archive",
+        action="store_true",
+        help="Optional: move migrated slot profiles into ~/.gemini/argon_reclaimed_profiles/<timestamp>/ instead of deleting them completely (default: OFF, deletes completely to free disk space).",
     )
     parser.add_argument(
         "--append-followup",
@@ -12563,9 +13317,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         cfg_en = PoolConfig()
         rep_en = cfg_en.enable_shared_profile_mode()
         print("=" * 78)
-        print("  ARGON BRIDGE SHARED BROWSER PROFILE ENABLED")
+        print("  ARGON BROWSER PROFILE CONFIGURED (ONE BROWSER FOR ALL ACCOUNTS)")
         print("=" * 78)
-        print(f"  Shared profile : {rep_en['profile_dir']}")
+        print(f"  Argon profile  : {rep_en['profile_dir']}")
         print(f"  Verified slots : {len(rep_en['verified'])}")
         for s_k, idx_v in sorted(rep_en["verified"].items()):
             print(f"    - {s_k} -> /u/{idx_v}/")
@@ -12577,7 +13331,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     if getattr(args, "reclaim_slot_profiles", False):
         from safe_browser import reclaim_slot_profiles_cli
 
-        return reclaim_slot_profiles_cli()
+        return reclaim_slot_profiles_cli(
+            keep_archive=bool(getattr(args, "keep_archive", False)),
+        )
 
     if getattr(args, "self_test", False):
         return run_preflight_selftest_cli(

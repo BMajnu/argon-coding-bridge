@@ -327,7 +327,7 @@ class PoolLoginAssistantApp:
 
         self.profile_dir_label = tk.Label(
             header_frame,
-            text=f"Slot Profile: {self.pool_config.profile_dir_for_slot()}",
+            text=f"Argon Browser Profile: {self.pool_config.profile_dir}",
             font=("Consolas", 8),
             fg="#64748b",
             bg="#0f172a",
@@ -718,13 +718,10 @@ class PoolLoginAssistantApp:
         status = raw_status if raw_status.lower() in allowed_badge_statuses else "signed_in"
 
         rec_idx = acc.get("account_index")
-        if self.pool_config.is_shared_profile_slot(slot):
-            eff_idx = self.pool_config.get_account_index(slot)
-            rec_idx = acc.get("account_index")
-            idx_badge = f"/u/{rec_idx}/" if isinstance(rec_idx, int) else f"/u/{eff_idx}/ (unverified)"
-            self.slot_label.configure(text=f"Slot {slot}  •  Index {idx_badge}")
-        else:
-            self.slot_label.configure(text=f"Slot {slot}")
+        eff_idx = self.pool_config.get_account_index(slot)
+        rec_idx = acc.get("account_index")
+        idx_badge = f"/u/{rec_idx}/ (verified)" if isinstance(rec_idx, int) else f"/u/{eff_idx}/ (unverified)"
+        self.slot_label.configure(text=f"Slot {slot}  •  Browser Index {idx_badge}")
         self.tier_label.configure(text=tier)
         self.role_label.configure(text=f"{role}  •  {status}")
         self.counter_label.configure(text=f"Account {self.current_index + 1} of {total}")
@@ -732,12 +729,9 @@ class PoolLoginAssistantApp:
         self.password_var.set(acc.get("password", ""))
         try:
             prof_for_slot = self.pool_config.profile_dir_for_slot(slot)
-            if self.pool_config.is_shared_profile_slot(slot):
-                self.profile_dir_label.configure(
-                    text=f"Shared Argon Bridge Profile: {prof_for_slot} (Index /u/{self.pool_config.get_account_index(slot)}/)"
-                )
-            else:
-                self.profile_dir_label.configure(text=f"Slot Profile: {prof_for_slot}")
+            self.profile_dir_label.configure(
+                text=f"Argon Browser Profile: {prof_for_slot} (Browser Index /u/{eff_idx}/)"
+            )
         except Exception:
             pass
 
@@ -786,8 +780,6 @@ class PoolLoginAssistantApp:
         acc = self._current_account()
         target_slot = slot or (acc.get("slot", "/u/0/") if acc else self.pool_config.active_slot())
         profile_dir = self.pool_config.profile_dir_for_slot(target_slot)
-        if is_isolated_slot_profile(profile_dir) and not (profile_dir.is_dir() and (profile_dir / "Default").is_dir()):
-            seed_slot_profile(self.pool_config.profile_dir, profile_dir)
         profile_dir.mkdir(parents=True, exist_ok=True)
 
         def _bg_open() -> None:
@@ -797,7 +789,7 @@ class PoolLoginAssistantApp:
                 rc = open_browser_cli(slot=target_slot, profile_dir=profile_dir, url=url)
                 if rc == 0:
                     self.set_status_threadsafe(
-                        f"Opened {description} in Argon Bridge browser ({profile_dir.name}).",
+                        f"Opened {description} in the Argon browser ({profile_dir.name}).",
                         "#34d399",
                     )
                     return
@@ -805,7 +797,7 @@ class PoolLoginAssistantApp:
                 pass
             if is_profile_busy(profile_dir):
                 self.set_status_threadsafe(
-                    f"Profile ({profile_dir}) is busy in a non-host browser. Close it with --close-browser first.",
+                    f"Argon browser profile ({profile_dir}) is busy in a non-host browser. Close it with --close-browser first.",
                     "#fbbf24",
                 )
                 return
@@ -824,7 +816,7 @@ class PoolLoginAssistantApp:
                         stderr=subprocess.DEVNULL,
                     )
                     self.set_status_threadsafe(
-                        f"Opened {description} in Google Chrome ({profile_dir.name}).",
+                        f"Opened {description} in the Argon browser ({profile_dir.name}).",
                         "#34d399",
                     )
                     return
@@ -840,10 +832,6 @@ class PoolLoginAssistantApp:
             self.copy_email()
         profile_dir = self.pool_config.profile_dir_for_slot(slot)
         isolated = is_isolated_slot_profile(profile_dir)
-        if isolated and not is_profile_busy(profile_dir):
-            if not (profile_dir.is_dir() and (profile_dir / "Default").is_dir()):
-                seed_slot_profile(self.pool_config.profile_dir, profile_dir)
-            reset_slot_profile_accounts(profile_dir, clear_cookies=True)
         add_url = GOOGLE_ADD_SESSION_URL if isolated else GOOGLE_ADD_MULTI_SESSION_URL
         self._launch_chrome_url(add_url, "Google Add Account Page", slot=slot)
 

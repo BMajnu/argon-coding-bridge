@@ -36,37 +36,37 @@ def compute_missing_actions(send_progress: str, zip_path: Path, prompt_path: Pat
     p = str(send_progress or "none").strip().lower()
     if p == "none":
         return [
-            f"1. Open the conversation link in Google Chrome ({chat_url}).",
+            f"1. Open the conversation link in the Argon browser ({chat_url}).",
             "2. Verify Task mode is active and '4 Argon (Complex tasks)' model is selected (never Flash).",
             f"3. Copy the full prompt from {prompt_path.resolve()} and paste into the composer.",
             f"4. Attach the context archive: {zip_path.resolve()}",
             "5. The moment the upload spinner finishes, click the Send button immediately.",
-            "6. Wait for Argon to generate apply_changes.ps1 and download it via the toolbar Download button.",
+            "6. Wait for Argon to generate apply_changes.ps1 (and any image/SVG/audio artifacts) and download via the chip's Export -> Download menu item.",
         ]
     elif p == "prompt_pasted":
         return [
-            f"1. Open the conversation link in Google Chrome ({chat_url}) where the prompt is already pasted.",
+            f"1. Open the conversation link in the Argon browser ({chat_url}) where the prompt is already pasted.",
             "2. Confirm the model chip still reads '4 Argon' (never Flash).",
             f"3. Attach the context archive: {zip_path.resolve()}",
             "4. The moment the upload finishes, click the Send button immediately.",
-            "5. Wait for Argon to generate apply_changes.ps1 and download it via toolbar.",
+            "5. Wait for Argon to generate apply_changes.ps1 and download via the chip's Export -> Download menu item.",
         ]
     elif p == "zip_attached":
         return [
-            f"1. Focus the composer in Chrome ({chat_url}) where the prompt is pasted and the ZIP upload has finished.",
+            f"1. Focus the composer in the Argon browser ({chat_url}) where the prompt is pasted and the ZIP upload has finished.",
             "2. Confirm the model chip reads '4 Argon' (never Flash) and click the Send button immediately.",
-            "3. Wait for Argon to generate apply_changes.ps1 and download it via toolbar.",
+            "3. Wait for Argon to generate apply_changes.ps1 and download via the chip's Export -> Download menu item.",
         ]
     elif p == "prompt_sent":
         return [
-            f"1. In Chrome ({chat_url}), verify Argon is generating the response.",
-            "2. Wait for the response to finish and look for the apply_changes.ps1 chip.",
-            "3. Click the chip, click Download in the viewer toolbar, and save to downloads folder.",
+            f"1. In the Argon browser ({chat_url}), verify Argon is generating the response.",
+            "2. Wait for the response to finish and look for the apply_changes.ps1 generated-file chip (and any asset chips).",
+            "3. Click the chip's Export button -> leaf 'Download' item, and save to the downloads folder (or run with --resume to build argon_delivery.zip and DELIVERY_MANIFEST.md automatically).",
         ]
     else:  # verified
         return [
             f"1. Prompt was already verified in the conversation ({chat_url}).",
-            "2. Wait for the generated apply_changes.ps1 download or run with --resume.",
+            "2. Wait for the generated apply_changes.ps1 (and argon_delivery.zip bundle) or run with --resume.",
         ]
 
 def compute_manual_commands(

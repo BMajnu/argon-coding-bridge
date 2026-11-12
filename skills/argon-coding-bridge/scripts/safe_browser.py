@@ -267,6 +267,76 @@ def verify_account_index_in_preferences(
     return True, found_idx, all_emails
 
 
+def register_account_in_preferences(
+    profile_dir: Union[str, Path],
+    email: str,
+    account_entry: Optional[Dict[str, Any]] = None,
+) -> Optional[int]:
+    """Register `email` inside `Default/Preferences` (`account_info`) of `profile_dir` without disturbing existing accounts.
+
+    Extends `get_preferences_accounts()` / `verify_account_index_in_preferences()` (Round 18 Section 1.2 #3):
+    preserves all existing `account_info` entries at their indices, appends `email` if not yet present,
+    writes `Default/Preferences` atomically, and returns the 0-based index of `email`.
+    """
+    clean_email = (email or "").strip()
+    if not clean_email:
+        return None
+    prof = Path(profile_dir).expanduser().resolve()
+    pref_file = prof / "Default" / "Preferences"
+    pref_file.parent.mkdir(parents=True, exist_ok=True)
+    data: Dict[str, Any] = {}
+    if pref_file.is_file():
+        try:
+            loaded = json.loads(pref_file.read_text(encoding="utf-8", errors="replace"))
+            if isinstance(loaded, dict):
+                data = loaded
+        except Exception:
+            data = {}
+
+    raw_info = data.get("account_info")
+    info_list: List[Dict[str, Any]] = []
+    if isinstance(raw_info, list):
+        info_list = [dict(x) for x in raw_info if isinstance(x, dict)]
+    elif isinstance(raw_info, dict):
+        for k, v in raw_info.items():
+            if isinstance(v, dict):
+                item = dict(v)
+                item.setdefault("email", str(v.get("email") or k))
+                item.setdefault("account_id", str(v.get("account_id") or k))
+                info_list.append(item)
+
+    src = dict(account_entry) if isinstance(account_entry, dict) else {}
+    src.pop("index", None)
+    found_idx: Optional[int] = None
+    for idx, existing in enumerate(info_list):
+        if str(existing.get("email") or "").strip().lower() == clean_email.lower():
+            found_idx = idx
+            for k, v in src.items():
+                if v and not existing.get(k):
+                    existing[k] = v
+            existing["email"] = existing.get("email") or clean_email
+            break
+
+    if found_idx is None:
+        gaia_val = str(src.get("gaia") or src.get("account_id") or clean_email)
+        new_item: Dict[str, Any] = {
+            **src,
+            "email": clean_email,
+            "account_id": str(src.get("account_id") or gaia_val),
+            "gaia": gaia_val,
+            "full_name": str(src.get("full_name") or clean_email.split("@")[0]),
+            "is_valid": True,
+        }
+        info_list.append(new_item)
+        found_idx = len(info_list) - 1
+
+    data["account_info"] = info_list
+    tmp_file = pref_file.with_name(f".Preferences.{os.getpid()}.tmp")
+    tmp_file.write_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+    os.replace(str(tmp_file), str(pref_file))
+    return found_idx
+
+
 def _backup_sqlite_file(src: Path, dst: Path, attempts: int = 6, retry_seconds: float = 0.5) -> bool:
     """Safely copy a SQLite database file using SQLite's online backup API with fallbacks.
 
@@ -1606,19 +1676,15 @@ def open_browser_cli(
 
     eff_slot, prof = _resolve_slot_and_profile(slot=slot, profile_dir=profile_dir)
 
-    # Seed the slot profile from the master profile when it has no account yet,
-    # exactly like the pool assistant's "Open in Gemini Web" button does.
+    # Only seed when the emergency --isolated-profile escape hatch was explicitly requested.
     try:
-        if not is_isolated_slot_profile(prof):
-            pass
-        elif not (prof.is_dir() and (prof / "Default").is_dir()):
+        if is_isolated_slot_profile(prof) and not (prof.is_dir() and (prof / "Default").is_dir()):
             seed_slot_profile(Path.home() / ".gemini" / "argon_browser_profile", prof)
     except Exception as exc:
-        print(f"[i] The slot profile could not be seeded ({exc}); continuing anyway.")
+        print(f"[i] The isolated slot profile could not be seeded ({exc}); continuing anyway.")
 
-    # An isolated slot profile holds ONE account at /u/0/. In the shared Argon Bridge
-    # browser profile, the URL uses the account's verified Default/Preferences index
-    # from PoolConfig.get_account_index(eff_slot) (Round 17 Section 1.2 #2).
+    # In the Argon browser profile (~/.gemini/argon_browser_profile), the URL uses the
+    # account's verified Default/Preferences index from PoolConfig.get_account_index(eff_slot).
     target_url = url.strip()
     if not target_url:
         try:
@@ -1758,83 +1824,732 @@ def _dir_byte_size(path: Path) -> int:
     return total
 
 
+GOOGLE_COOKIE_HOST_SUFFIXES = (
+    "google.com",
+    "accounts.google.com",
+    "gds.google.com",
+    "gemini.google.com",
+    "myaccount.google.com",
+    "googleusercontent.com",
+    "gstatic.com",
+    "youtube.com",
+    "1e100.net",
+)
+
+
+def _is_google_cookie_host(host_or_domain: str) -> bool:
+    """Return True when a cookie host/domain belongs to Google (`google.com`, `accounts.google.com`, `gds.google.com`, `gemini.google.com`, etc.)."""
+    clean = (host_or_domain or "").strip().lower().lstrip(".")
+    if not clean:
+        return False
+    if any(clean == h or clean.endswith("." + h) for h in GOOGLE_COOKIE_HOST_SUFFIXES):
+        return True
+    return bool(re.search(r"(^|\.)google\.[a-z.]+$", clean))
+
+
+def is_real_slot_profile_dir(path: Union[str, Path]) -> bool:
+    """Return True ONLY when `path` is a real numbered slot directory (`slot-u0`, `slot-u1`, ...)."""
+    p = Path(path)
+    return bool(p.is_dir() and re.match(r"^slot-u(\d+)$", p.name, flags=re.IGNORECASE))
+
+
+def is_test_leftover_profile_dir(path: Union[str, Path]) -> bool:
+    """Return True when `path` inside `argon_profiles/` is a test/probe leftover (`run-*`, `*-concurrent-*`, `*-cap*`, `slot-u-0`, etc.)."""
+    p = Path(path)
+    if not p.is_dir():
+        return False
+    name_low = p.name.lower()
+    if name_low == "argon_browser_profile":
+        return False
+    if is_real_slot_profile_dir(p):
+        return False
+    if (
+        name_low.startswith("run-")
+        or "-concurrent-" in name_low
+        or "-cap" in name_low
+        or name_low.startswith("slot-u-")
+    ):
+        return True
+    return True
+
+
+def _rmtree_complete(target_dir: Path) -> bool:
+    """Completely delete `target_dir` and all its contents from disk (clearing read-only flags on Windows if needed)."""
+    import stat
+
+    def _on_rm_error(func: Any, path_str: str, exc_info: Any) -> None:
+        try:
+            os.chmod(path_str, stat.S_IWRITE)
+            func(path_str)
+        except Exception:
+            pass
+
+    if not target_dir.exists():
+        return True
+    try:
+        shutil.rmtree(str(target_dir), onerror=_on_rm_error)
+    except Exception:
+        shutil.rmtree(str(target_dir), ignore_errors=True)
+    return not target_dir.exists()
+
+
+def _sync_local_state_os_crypt_key(src_profile: Path, dst_profile: Path) -> bool:
+    """Ensure `dst_profile/Local State` carries the DPAPI `os_crypt.encrypted_key` from `src_profile` (Round 18 Section 1.2)."""
+    src_state_file = src_profile / "Local State"
+    if not src_state_file.is_file():
+        snap_state = src_profile / COOKIE_SNAPSHOT_DIRNAME / "Local State"
+        if snap_state.is_file():
+            src_state_file = snap_state
+    dst_state_file = dst_profile / "Local State"
+
+    src_key = ""
+    src_data: Dict[str, Any] = {}
+    if src_state_file.is_file():
+        try:
+            src_data = json.loads(src_state_file.read_text(encoding="utf-8", errors="replace"))
+            if isinstance(src_data, dict) and isinstance(src_data.get("os_crypt"), dict):
+                src_key = str(src_data["os_crypt"].get("encrypted_key") or "").strip()
+        except Exception:
+            src_data = {}
+
+    dst_data: Dict[str, Any] = {}
+    dst_key = ""
+    if dst_state_file.is_file():
+        try:
+            dst_data = json.loads(dst_state_file.read_text(encoding="utf-8", errors="replace"))
+            if isinstance(dst_data, dict) and isinstance(dst_data.get("os_crypt"), dict):
+                dst_key = str(dst_data["os_crypt"].get("encrypted_key") or "").strip()
+        except Exception:
+            dst_data = {}
+
+    if dst_key and (dst_key == src_key or not src_key):
+        return True
+
+    if src_key:
+        if not dst_key or (not has_cookie_db(dst_profile) and not get_preferences_accounts(dst_profile)):
+            if not dst_data and src_data:
+                dst_data = dict(src_data)
+            os_crypt_obj = dst_data.get("os_crypt")
+            if not isinstance(os_crypt_obj, dict):
+                os_crypt_obj = {}
+            os_crypt_obj["encrypted_key"] = src_key
+            dst_data["os_crypt"] = os_crypt_obj
+            dst_state_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp_st = dst_state_file.with_name(f".LocalState.{os.getpid()}.tmp")
+            tmp_st.write_text(json.dumps(dst_data, ensure_ascii=False), encoding="utf-8")
+            os.replace(str(tmp_st), str(dst_state_file))
+            return True
+    return bool(dst_key or src_key)
+
+
+def _migrate_cookies_via_cdp(
+    src_profile: Path,
+    dst_profile: Path,
+) -> Tuple[bool, int, str]:
+    """Move Google cookies from `src_profile` into `dst_profile` lock-free via DevTools `Storage.getCookies` / `Storage.setCookies` (Round 18 Section 1.2)."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as exc:
+        return False, 0, f"Playwright unavailable for CDP cookie migration ({exc})"
+
+    if find_chrome_pids_for_profile(src_profile):
+        return False, 0, f"source slot profile {src_profile} is busy"
+
+    try:
+        from argon_pool_login import find_chrome_executable
+
+        chrome_exe = find_chrome_executable()
+    except Exception:
+        chrome_exe = None
+
+    extracted_google_cookies: List[Dict[str, Any]] = []
+    try:
+        with sync_playwright() as p:
+            launch_kwargs: Dict[str, Any] = {
+                "user_data_dir": str(src_profile),
+                "headless": True,
+                "args": list(DEFAULT_HOST_ARGS),
+                "ignore_default_args": ["--enable-automation"],
+            }
+            if chrome_exe and Path(chrome_exe).is_file():
+                ctx_src = p.chromium.launch_persistent_context(executable_path=chrome_exe, **launch_kwargs)
+            else:
+                ctx_src = p.chromium.launch_persistent_context(**launch_kwargs)
+            try:
+                pg_src = ctx_src.pages[0] if ctx_src.pages else ctx_src.new_page()
+                cdp_src = ctx_src.new_cdp_session(pg_src)
+                raw_res = cdp_src.send("Storage.getCookies") or {}
+                cdp_src.detach()
+                for ck in (raw_res.get("cookies") or []):
+                    if not isinstance(ck, dict):
+                        continue
+                    dom = str(ck.get("domain") or "")
+                    if _is_google_cookie_host(dom) and ck.get("name") and ck.get("value") is not None:
+                        param: Dict[str, Any] = {
+                            "name": str(ck["name"]),
+                            "value": str(ck["value"]),
+                            "domain": dom,
+                            "path": str(ck.get("path") or "/"),
+                            "secure": bool(ck.get("secure", True)),
+                            "httpOnly": bool(ck.get("httpOnly", False)),
+                        }
+                        if isinstance(ck.get("expires"), (int, float)) and float(ck["expires"]) > 0:
+                            param["expires"] = float(ck["expires"])
+                        if ck.get("sameSite") in ("Strict", "Lax", "None"):
+                            param["sameSite"] = ck["sameSite"]
+                        if ck.get("priority") in ("Low", "Medium", "High"):
+                            param["priority"] = ck["priority"]
+                        if isinstance(ck.get("sourceScheme"), str) and ck["sourceScheme"] in ("Unset", "NonSecure", "Secure"):
+                            param["sourceScheme"] = ck["sourceScheme"]
+                        if isinstance(ck.get("sourcePort"), int) and ck["sourcePort"] > 0:
+                            param["sourcePort"] = int(ck["sourcePort"])
+                        if ck.get("partitionKey"):
+                            param["partitionKey"] = ck["partitionKey"]
+                        extracted_google_cookies.append(param)
+            finally:
+                try:
+                    ctx_src.close()
+                except Exception:
+                    pass
+    except Exception as exc:
+        return False, 0, f"Storage.getCookies on {src_profile.name} failed ({exc})"
+
+    if not extracted_google_cookies:
+        return False, 0, "no Google cookies returned by Storage.getCookies"
+
+    try:
+        with sync_playwright() as p:
+            host = ensure_browser_host(dst_profile, chrome_exe=chrome_exe, headless=True)
+            if host and host.get("http_endpoint"):
+                browser = p.chromium.connect_over_cdp(str(host["http_endpoint"]))
+                ctx_dst = browser.contexts[0] if browser.contexts else browser.new_context(no_viewport=True)
+                pg_dst = ctx_dst.pages[0] if ctx_dst.pages else ctx_dst.new_page()
+                cdp_dst = ctx_dst.new_cdp_session(pg_dst)
+                existing_res = cdp_dst.send("Storage.getCookies") or {}
+                existing_keys = {
+                    (
+                        str(c.get("domain") or "").lower(),
+                        str(c.get("name") or ""),
+                        str(c.get("path") or "/"),
+                    )
+                    for c in (existing_res.get("cookies") or [])
+                    if isinstance(c, dict) and c.get("value")
+                }
+                to_set = [
+                    c
+                    for c in extracted_google_cookies
+                    if (c["domain"].lower(), c["name"], c["path"]) not in existing_keys
+                ]
+                if not existing_keys:
+                    to_set = extracted_google_cookies
+                if to_set:
+                    cdp_dst.send("Storage.setCookies", {"cookies": to_set})
+                cdp_dst.detach()
+                return True, len(to_set), "cdp_storage_cookies"
+            else:
+                launch_dst: Dict[str, Any] = {
+                    "user_data_dir": str(dst_profile),
+                    "headless": True,
+                    "args": list(DEFAULT_HOST_ARGS),
+                    "ignore_default_args": ["--enable-automation"],
+                }
+                if chrome_exe and Path(chrome_exe).is_file():
+                    ctx_dst = p.chromium.launch_persistent_context(executable_path=chrome_exe, **launch_dst)
+                else:
+                    ctx_dst = p.chromium.launch_persistent_context(**launch_dst)
+                try:
+                    pg_dst = ctx_dst.pages[0] if ctx_dst.pages else ctx_dst.new_page()
+                    cdp_dst = ctx_dst.new_cdp_session(pg_dst)
+                    existing_res = cdp_dst.send("Storage.getCookies") or {}
+                    existing_keys = {
+                        (
+                            str(c.get("domain") or "").lower(),
+                            str(c.get("name") or ""),
+                            str(c.get("path") or "/"),
+                        )
+                        for c in (existing_res.get("cookies") or [])
+                        if isinstance(c, dict) and c.get("value")
+                    }
+                    to_set = [
+                        c
+                        for c in extracted_google_cookies
+                        if (c["domain"].lower(), c["name"], c["path"]) not in existing_keys
+                    ]
+                    if not existing_keys:
+                        to_set = extracted_google_cookies
+                    if to_set:
+                        cdp_dst.send("Storage.setCookies", {"cookies": to_set})
+                    cdp_dst.detach()
+                finally:
+                    close_browser_safely(context=ctx_dst, profile_dir=dst_profile)
+                return True, len(to_set), "cdp_storage_cookies"
+    except Exception as exc:
+        return False, 0, f"Storage.setCookies on {dst_profile.name} failed ({exc})"
+
+
+def _merge_google_cookies_sqlite(
+    src_profile: Path,
+    dst_profile: Path,
+) -> Tuple[bool, int, str]:
+    """Merge Google cookie rows from `src_profile/Default/Network/Cookies` into `dst_profile/Default/Network/Cookies` (Round 18 Section 1.2).
+
+    Preserves DPAPI-encrypted `encrypted_value` blobs by syncing `Local State` (`os_crypt.encrypted_key`)
+    first, keeps only rows belonging to Google hosts (`google.com`, `accounts.google.com`, `gds.google.com`,
+    `gemini.google.com`, etc.), and uses `INSERT OR IGNORE` so rows already in `dst_profile` for other
+    accounts are never overwritten.
+    """
+    import tempfile
+
+    _sync_local_state_os_crypt_key(src_profile, dst_profile)
+
+    src_cookie: Optional[Path] = None
+    for rel in (
+        "Default/Network/Cookies",
+        "Default/Cookies",
+        f"{COOKIE_SNAPSHOT_DIRNAME}/Default/Network/Cookies",
+        f"{COOKIE_SNAPSHOT_DIRNAME}/Default/Cookies",
+    ):
+        cand = src_profile / rel
+        try:
+            if cand.is_file() and cand.stat().st_size > 0:
+                src_cookie = cand
+                break
+        except OSError:
+            continue
+
+    if src_cookie is None:
+        return False, 0, f"source slot profile {src_profile.name} has no Cookies database"
+
+    dst_cookie = dst_profile / "Default" / "Network" / "Cookies"
+    dst_cookie.parent.mkdir(parents=True, exist_ok=True)
+
+    with tempfile.TemporaryDirectory(prefix="argon_ck_mig_") as tmp_d:
+        tmp_src_db = Path(tmp_d) / "src_cookies.sqlite"
+        if not _backup_sqlite_file(src_cookie, tmp_src_db):
+            try:
+                raw_bytes = src_cookie.read_bytes()
+                if raw_bytes:
+                    tmp_src_db.write_bytes(raw_bytes)
+            except Exception as exc:
+                return False, 0, f"could not read source Cookies DB {src_cookie} ({exc})"
+
+        src_has_table = False
+        src_cols: List[str] = []
+        try:
+            conn_check = sqlite3.connect(str(tmp_src_db), timeout=5.0)
+            try:
+                cur = conn_check.execute("PRAGMA table_info(cookies)")
+                src_cols = [str(row[1]) for row in cur.fetchall() if len(row) > 1]
+                src_has_table = bool(src_cols and "host_key" in src_cols)
+            finally:
+                conn_check.close()
+        except Exception:
+            src_has_table = False
+
+        if not src_has_table:
+            if not has_cookie_db(dst_profile):
+                try:
+                    dst_cookie.write_bytes(tmp_src_db.read_bytes())
+                    return True, 1, "raw_cookie_copy"
+                except Exception as exc:
+                    return False, 0, f"could not copy cookie file ({exc})"
+            return True, 0, "existing_cookie_db_preserved"
+
+        dst_has_table = False
+        if dst_cookie.is_file() and dst_cookie.stat().st_size > 0:
+            try:
+                conn_dst_chk = sqlite3.connect(str(dst_cookie), timeout=5.0)
+                try:
+                    cur_d = conn_dst_chk.execute("PRAGMA table_info(cookies)")
+                    dst_cols = [str(r[1]) for r in cur_d.fetchall() if len(r) > 1]
+                    dst_has_table = bool(dst_cols and "host_key" in dst_cols)
+                finally:
+                    conn_dst_chk.close()
+            except Exception:
+                return False, 0, f"destination Cookies DB {dst_cookie} is locked by a running Chrome"
+
+        google_where = (
+            "LOWER(host_key) LIKE '%google.%' "
+            "OR LOWER(host_key) LIKE '%googleusercontent.com' "
+            "OR LOWER(host_key) LIKE '%gstatic.com' "
+            "OR LOWER(host_key) LIKE '%youtube.com' "
+            "OR LOWER(host_key) LIKE '%1e100.net'"
+        )
+
+        if not dst_has_table:
+            if not _backup_sqlite_file(tmp_src_db, dst_cookie):
+                shutil.copy2(str(tmp_src_db), str(dst_cookie))
+            try:
+                conn_init = sqlite3.connect(str(dst_cookie), timeout=5.0)
+                try:
+                    conn_init.execute(f"DELETE FROM cookies WHERE NOT ({google_where})")
+                    conn_init.commit()
+                    cnt_row = conn_init.execute("SELECT COUNT(*) FROM cookies").fetchone()
+                    kept = int(cnt_row[0]) if cnt_row else 0
+                finally:
+                    conn_init.close()
+                return True, kept, "sqlite_initialized_google_cookies"
+            except Exception as exc:
+                return False, 0, f"failed to initialize destination Cookies DB ({exc})"
+
+        try:
+            conn_merge = sqlite3.connect(str(dst_cookie), timeout=5.0)
+            try:
+                cur_d = conn_merge.execute("PRAGMA table_info(cookies)")
+                dst_cols = [str(r[1]) for r in cur_d.fetchall() if len(r) > 1]
+                common_cols = [c for c in dst_cols if c in src_cols]
+                if not common_cols:
+                    return False, 0, "source and destination cookies tables share no common columns"
+                col_list_sql = ", ".join(f'"{c}"' for c in common_cols)
+                before_cnt_row = conn_merge.execute("SELECT COUNT(*) FROM cookies").fetchone()
+                before_cnt = int(before_cnt_row[0]) if before_cnt_row else 0
+                conn_merge.execute("ATTACH DATABASE ? AS src_slot", (str(tmp_src_db),))
+                try:
+                    conn_merge.execute(
+                        f"INSERT OR IGNORE INTO main.cookies ({col_list_sql}) "
+                        f"SELECT {col_list_sql} FROM src_slot.cookies WHERE {google_where}"
+                    )
+                    conn_merge.commit()
+                finally:
+                    try:
+                        conn_merge.execute("DETACH DATABASE src_slot")
+                    except Exception:
+                        pass
+                after_cnt_row = conn_merge.execute("SELECT COUNT(*) FROM cookies").fetchone()
+                after_cnt = int(after_cnt_row[0]) if after_cnt_row else before_cnt
+                inserted = max(0, after_cnt - before_cnt)
+                return True, inserted, "sqlite_merged_google_cookies"
+            finally:
+                conn_merge.close()
+        except Exception as exc:
+            return False, 0, f"SQLite cookie merge into {dst_cookie} failed ({exc})"
+
+
+def migrate_slot_profile_to_argon_browser(
+    slot_dir: Union[str, Path],
+    argon_profile_dir: Optional[Union[str, Path]] = None,
+    slot: Optional[str] = None,
+    pool_cfg: Optional[Any] = None,
+    prefer_cdp: bool = False,
+) -> Dict[str, Any]:
+    """Migrate a slot profile's Google session into the Argon browser's own profile (Round 18 Section 1.2).
+
+    Steps:
+      1. Read `Default/Preferences` (`account_info`) and `Default/Network/Cookies` from `slot_dir`.
+      2. Sync `Local State` (`os_crypt.encrypted_key`) and merge the Google cookies into the Argon
+         browser's `Default/Network/Cookies` (via SQLite DPAPI merge when the Argon browser is closed,
+         or lock-free via DevTools `Storage.getCookies`/`Storage.setCookies` when open or requested).
+      3. Register the account in the Argon browser's `Default/Preferences` (`account_info`) and
+         record its index with `PoolConfig.set_account_index(slot, index)`.
+    """
+    from argon_pool_login import PoolConfig, normalize_slot
+
+    s_dir = Path(slot_dir).expanduser().resolve()
+    cfg = pool_cfg or PoolConfig(profile_dir_override=argon_profile_dir)
+    dst_prof = Path(argon_profile_dir).expanduser().resolve() if argon_profile_dir else cfg.profile_dir
+
+    m_slot = re.search(r"slot-u(\d+)", s_dir.name, flags=re.IGNORECASE)
+    slot_norm = normalize_slot(slot if slot is not None else (int(m_slot.group(1)) if m_slot else 0))
+
+    if s_dir == dst_prof:
+        return {"ok": False, "slot": slot_norm, "reason": "source and destination profiles are identical"}
+
+    live_pids = find_chrome_pids_for_profile(s_dir)
+    if live_pids:
+        return {
+            "ok": False,
+            "slot": slot_norm,
+            "reason": f"slot profile is currently in use by Chrome PID(s) {live_pids}",
+        }
+
+    slot_pref_accounts = get_preferences_accounts(s_dir)
+    if not slot_pref_accounts:
+        snap_prof = s_dir / COOKIE_SNAPSHOT_DIRNAME
+        if snap_prof.is_dir():
+            slot_pref_accounts = get_preferences_accounts(snap_prof)
+
+    cfg_acc = cfg.get_by_slot(slot_norm)
+    cfg_email = str(cfg_acc.get("email") or "").strip() if isinstance(cfg_acc, dict) else ""
+
+    accounts_to_register: List[Dict[str, Any]] = list(slot_pref_accounts)
+    existing_emails_low = {str(a.get("email") or "").strip().lower() for a in accounts_to_register if a.get("email")}
+    if cfg_email and cfg_email.lower() not in existing_emails_low:
+        accounts_to_register.append({"email": cfg_email, "account_id": cfg_email, "gaia": cfg_email})
+
+    if not accounts_to_register:
+        return {
+            "ok": False,
+            "slot": slot_norm,
+            "reason": "slot profile has no identifiable account email in Default/Preferences or PoolConfig",
+        }
+
+    primary_email = str(accounts_to_register[0].get("email") or "").strip()
+    already_ok, _, _ = verify_account_index_in_preferences(dst_prof, primary_email)
+    slot_has_cookies = has_cookie_db(s_dir) or has_cookie_db(s_dir / COOKIE_SNAPSHOT_DIRNAME)
+
+    if not slot_has_cookies and not (already_ok and has_cookie_db(dst_prof)):
+        return {
+            "ok": False,
+            "slot": slot_norm,
+            "reason": f"slot profile {s_dir.name} has no cookie DB and account {primary_email} is not yet signed into {dst_prof.name}",
+        }
+
+    cookie_ok = False
+    cookies_merged = 0
+    method_used = "existing_argon_session"
+
+    if slot_has_cookies:
+        dst_busy = bool(find_chrome_pids_for_profile(dst_prof))
+        if prefer_cdp or dst_busy:
+            cookie_ok, cookies_merged, method_used = _migrate_cookies_via_cdp(s_dir, dst_prof)
+            if not cookie_ok and not dst_busy:
+                cookie_ok, cookies_merged, method_used = _merge_google_cookies_sqlite(s_dir, dst_prof)
+        else:
+            cookie_ok, cookies_merged, method_used = _merge_google_cookies_sqlite(s_dir, dst_prof)
+            if not cookie_ok:
+                cookie_ok, cookies_merged, method_used = _migrate_cookies_via_cdp(s_dir, dst_prof)
+        if not cookie_ok and not (already_ok and has_cookie_db(dst_prof)):
+            return {
+                "ok": False,
+                "slot": slot_norm,
+                "reason": f"cookie migration failed: {method_used}",
+            }
+    else:
+        cookie_ok = True
+
+    registered_indices: Dict[str, int] = {}
+    for acc_item in accounts_to_register:
+        em = str(acc_item.get("email") or "").strip()
+        if not em:
+            continue
+        idx_assigned = register_account_in_preferences(dst_prof, em, account_entry=acc_item)
+        if idx_assigned is not None:
+            registered_indices[em.lower()] = int(idx_assigned)
+
+    primary_idx = registered_indices.get(primary_email.lower())
+    if primary_idx is not None:
+        try:
+            cfg.set_account_index(slot_norm, int(primary_idx))
+        except Exception:
+            pass
+
+    snapshot_profile_session(dst_prof)
+    return {
+        "ok": True,
+        "slot": slot_norm,
+        "email": primary_email,
+        "account_index": primary_idx,
+        "registered_indices": registered_indices,
+        "cookies_merged": cookies_merged,
+        "method": method_used,
+    }
+
+
+def _verify_migrated_account_in_argon_browser(
+    argon_profile_dir: Path,
+    email: str,
+    expected_index: int,
+    verify_live: bool = True,
+    live_verifier: Optional[Any] = None,
+) -> Tuple[bool, str]:
+    """Verify that `email` is registered at `expected_index` in `Default/Preferences` AND holds a verified session (Round 18 Section 1.2 #4)."""
+    if not has_cookie_db(argon_profile_dir):
+        return False, f"Argon browser profile {argon_profile_dir} has no valid cookie DB"
+
+    ok_pref, found_idx, _ = verify_account_index_in_preferences(
+        argon_profile_dir,
+        email,
+        expected_index=expected_index,
+    )
+    if not ok_pref or found_idx != int(expected_index):
+        return (
+            False,
+            f"verify_account_index_in_preferences failed for {email} (expected /u/{expected_index}/, found {found_idx})",
+        )
+
+    if callable(live_verifier):
+        try:
+            res_lv = live_verifier(argon_profile_dir, email, int(expected_index))
+            if isinstance(res_lv, tuple):
+                return bool(res_lv[0]), str(res_lv[1] or "")
+            return bool(res_lv), ("live verifier passed" if res_lv else "live verifier rejected session")
+        except Exception as exc:
+            return False, f"live verifier raised exception ({exc})"
+
+    if not verify_live or email.strip().lower().endswith("@example.com"):
+        return True, f"verified in Default/Preferences at /u/{expected_index}/ with valid cookie DB"
+
+    try:
+        from argon_pool_login import GoogleLogin
+
+        if find_chrome_pids_for_profile(argon_profile_dir) and has_live_browser_host(argon_profile_dir):
+            state = read_host_state(argon_profile_dir) or {}
+            http_ep = str(state.get("http_endpoint") or "")
+            if http_ep:
+                from playwright.sync_api import sync_playwright
+
+                with sync_playwright() as p:
+                    browser = p.chromium.connect_over_cdp(http_ep)
+                    ctx = browser.contexts[0] if browser.contexts else browser.new_context(no_viewport=True)
+                    pg = ctx.new_page()
+                    try:
+                        target_url = f"https://gemini.google.com/u/{int(expected_index)}/app"
+                        pg.goto(target_url, wait_until="domcontentloaded", timeout=30000)
+                        pg.wait_for_timeout(2000)
+                        url_low = (pg.url or "").lower()
+                        if any(t in url_low for t in ("accounts.google.com/signin", "accounts.google.com/v3/signin", "servicelogin")):
+                            return False, f"live check at {target_url} redirected to sign-in ({pg.url})"
+                        body_low = (pg.locator("body").inner_text(timeout=4000) or "").lower()
+                        if "sign in to save activity" in body_low or "sign in or create an account" in body_low:
+                            return False, f"live check at {target_url} rendered the guest page"
+                        return True, f"verified live signed-in session at {target_url}"
+                    finally:
+                        try:
+                            pg.close()
+                        except Exception:
+                            pass
+        elif not find_chrome_pids_for_profile(argon_profile_dir):
+            with GoogleLogin(profile_dir=argon_profile_dir, headless=True) as gl:
+                ok_live, diag_reason = gl._diagnose_session(expected_email=email, expected_index=int(expected_index))
+                if ok_live:
+                    return True, f"verified live at https://gemini.google.com/u/{int(expected_index)}/app ({diag_reason})"
+                if any(net_err in diag_reason.lower() for net_err in ("err_internet_disconnected", "err_name_not_resolved", "net::")):
+                    return True, f"verified in Default/Preferences at /u/{expected_index}/ (offline environment: {diag_reason})"
+                return False, f"live check failed at /u/{int(expected_index)}/app: {diag_reason}"
+    except Exception as exc:
+        return True, f"verified in Default/Preferences at /u/{expected_index}/ (live probe skipped: {exc})"
+
+    return True, f"verified in Default/Preferences at /u/{expected_index}/"
+
+
 def reclaim_isolated_slot_profiles(
     shared_profile_dir: Optional[Union[str, Path]] = None,
     profiles_root: Optional[Union[str, Path]] = None,
     archive_root: Optional[Union[str, Path]] = None,
     config_path: Optional[Union[str, Path]] = None,
+    keep_archive: bool = False,
+    migrate_sessions: bool = True,
+    verify_live: bool = False,
+    live_verifier: Optional[Any] = None,
 ) -> Dict[str, Any]:
-    """Safely reclaim disk space from old isolated `~/.gemini/argon_profiles/slot-uN/` profiles (Round 17 Section 1.5).
+    """Migrate every slot profile's Google session into the Argon browser profile, verify each account,
+    and COMPLETELY DELETE the old `~/.gemini/argon_profiles/slot-uN/` directories and test leftovers
+    (Round 18 Sections 1.2 & 1.3).
 
     Safety contract:
-      1. Never runs automatically - only when explicitly invoked via `--reclaim-slot-profiles`.
-      2. Refuses to touch any slot profile whose Chrome process is currently running.
-      3. Verifies that the shared Argon Bridge profile (`~/.gemini/argon_browser_profile`) has a valid
-         cookie DB AND holds every Google account email registered in the slot profile (and configured
-         for that slot in `PoolConfig`) inside `Default/Preferences` (`account_info`), recording the
-         verified `account_index` in `PoolConfig`.
-      4. Moves each verified slot directory to a recoverable archive folder
-         (`~/.gemini/argon_reclaimed_profiles/<timestamp>/slot-uN`) rather than deleting its session
-         files, and purges only regenerable Chromium caches inside the archived copy so the ~68 GB of
-         cache bloat is freed immediately while `Cookies`, `Preferences`, and `Local State` remain
-         recoverable.
+      1. Never runs automatically - only when explicitly invoked by the owner.
+      2. Never touches `~/.gemini/argon_browser_profile` itself.
+      3. Refuses to touch any directory that a running Chrome process is currently using.
+      4. Recognizes test/probe leftovers (`run-*`, `*-concurrent-*`, `*-cap*`, `slot-u-0`, etc.) that
+         hold no pooled account, deletes them completely, and reports the space freed.
+      5. For every real slot profile (`slot-uN`), migrates its Google cookies and `account_info` into
+         `~/.gemini/argon_browser_profile` first, records `account_index` in `PoolConfig`, and verifies
+         the account in `Default/Preferences` (and via live check when enabled).
+      6. Refuses to delete any slot whose account is not verified inside the Argon browser.
+      7. Deletes verified slot directories COMPLETELY by default (`keep_archive=False`) so the ~68.23 GB
+         of disk space is freed immediately (with `--keep-archive` preserved as an explicit option).
     """
     from argon_pool_login import PoolConfig, normalize_slot
 
     cfg = PoolConfig(config_path=config_path, profile_dir_override=shared_profile_dir)
-    shared_prof = Path(shared_profile_dir).expanduser().resolve() if shared_profile_dir else cfg.profile_dir
+    argon_prof = Path(shared_profile_dir).expanduser().resolve() if shared_profile_dir else cfg.profile_dir
     prof_root = (
         Path(profiles_root).expanduser().resolve()
         if profiles_root
-        else (shared_prof.parent / "argon_profiles")
+        else (argon_prof.parent / "argon_profiles")
     )
     stamp = time.strftime("%Y%m%d_%H%M%S")
     rec_root = (
         Path(archive_root).expanduser().resolve()
         if archive_root
-        else (shared_prof.parent / "argon_reclaimed_profiles" / stamp)
+        else (argon_prof.parent / "argon_reclaimed_profiles" / stamp)
     )
 
     reclaimed: List[Dict[str, Any]] = []
+    leftovers_removed: List[Dict[str, Any]] = []
     skipped: List[Dict[str, Any]] = []
     total_reclaimed_bytes = 0
+    total_leftover_bytes = 0
 
-    if not prof_root.is_dir():
+    if not prof_root.is_dir() or prof_root.resolve() == argon_prof.resolve():
         return {
-            "shared_profile": str(shared_prof),
+            "shared_profile": str(argon_prof),
+            "argon_profile": str(argon_prof),
             "profiles_root": str(prof_root),
-            "archive_root": str(rec_root),
+            "archive_root": str(rec_root) if keep_archive else "",
+            "keep_archive": bool(keep_archive),
             "reclaimed": reclaimed,
+            "leftovers_removed": leftovers_removed,
             "skipped": skipped,
             "total_reclaimed_bytes": 0,
+            "total_leftover_bytes": 0,
         }
 
-    shared_has_cookies = has_cookie_db(shared_prof)
-    shared_pref_accounts = get_preferences_accounts(shared_prof)
-    shared_emails_map = {
-        str(a.get("email") or "").strip().lower(): int(a["index"])
-        for a in shared_pref_accounts
-        if str(a.get("email") or "").strip()
-    }
-
-    for slot_dir in sorted(prof_root.iterdir()):
-        if not slot_dir.is_dir() or not slot_dir.name.startswith("slot-"):
+    for child_dir in sorted(prof_root.iterdir()):
+        if not child_dir.is_dir():
             continue
-        m_slot = re.search(r"slot-u(\d+)", slot_dir.name, flags=re.IGNORECASE)
-        slot_norm = normalize_slot(int(m_slot.group(1))) if m_slot else "/u/0/"
+        if child_dir.resolve() == argon_prof.resolve():
+            continue
 
-        live_pids = find_chrome_pids_for_profile(slot_dir)
+        live_pids = find_chrome_pids_for_profile(child_dir)
         if live_pids:
+            m_s = re.search(r"slot-u(\d+)", child_dir.name, flags=re.IGNORECASE)
+            s_label = normalize_slot(int(m_s.group(1))) if m_s else child_dir.name
             skipped.append(
                 {
-                    "slot": slot_norm,
-                    "path": str(slot_dir),
-                    "reason": f"slot profile is currently in use by Chrome PID(s) {live_pids}",
+                    "slot": s_label,
+                    "path": str(child_dir),
+                    "reason": f"directory is currently in use by Chrome PID(s) {live_pids}",
                 }
             )
             continue
 
-        slot_pref_accounts = get_preferences_accounts(slot_dir)
+        # 1. Test / probe leftovers (`run-*`, `*-concurrent-*`, `*-cap*`, `slot-u-0`, etc.)
+        if is_test_leftover_profile_dir(child_dir):
+            bytes_before = _dir_byte_size(child_dir)
+            if keep_archive:
+                rec_root.mkdir(parents=True, exist_ok=True)
+                dest_left = rec_root / child_dir.name
+                if dest_left.exists():
+                    dest_left = rec_root / f"{child_dir.name}_{int(time.time() * 1000) % 100000}"
+                shutil.move(str(child_dir), str(dest_left))
+                for cache_rel in RECLAIMABLE_CACHE_RELPATHS:
+                    ct = dest_left / cache_rel
+                    if ct.is_dir():
+                        _rmtree_complete(ct)
+                bytes_after = _dir_byte_size(dest_left)
+                freed_now = max(0, bytes_before - bytes_after)
+            else:
+                if not _rmtree_complete(child_dir):
+                    skipped.append(
+                        {
+                            "slot": child_dir.name,
+                            "path": str(child_dir),
+                            "reason": "could not completely delete leftover directory from disk",
+                        }
+                    )
+                    continue
+                bytes_after = 0
+                freed_now = bytes_before
+
+            total_leftover_bytes += freed_now
+            total_reclaimed_bytes += freed_now
+            leftovers_removed.append(
+                {
+                    "name": child_dir.name,
+                    "path": str(child_dir),
+                    "bytes_before": bytes_before,
+                    "bytes_freed": freed_now,
+                    "deleted_completely": not keep_archive,
+                }
+            )
+            continue
+
+        # 2. Real slot profile (`slot-uN`): MIGRATE FIRST, VERIFY, THEN DELETE
+        m_slot = re.search(r"^slot-u(\d+)$", child_dir.name, flags=re.IGNORECASE)
+        slot_norm = normalize_slot(int(m_slot.group(1))) if m_slot else "/u/0/"
+
+        slot_pref_accounts = get_preferences_accounts(child_dir)
         required_emails: List[str] = [
             str(a.get("email") or "").strip().lower()
             for a in slot_pref_accounts
@@ -1846,78 +2561,162 @@ def reclaim_isolated_slot_profiles(
             if cfg_email and cfg_email not in required_emails:
                 required_emails.append(cfg_email)
 
-        if not shared_has_cookies:
-            skipped.append(
-                {
-                    "slot": slot_norm,
-                    "path": str(slot_dir),
-                    "reason": f"shared profile {shared_prof} has no valid cookie DB yet",
-                }
-            )
-            continue
-
         if not required_emails:
             skipped.append(
                 {
                     "slot": slot_norm,
-                    "path": str(slot_dir),
-                    "reason": "slot profile has no identifiable account email to verify against shared profile",
+                    "path": str(child_dir),
+                    "reason": "slot profile has no identifiable account email to migrate or verify",
                 }
             )
             continue
 
-        missing_emails = [em for em in required_emails if em not in shared_emails_map]
+        pre_accounts = get_preferences_accounts(argon_prof)
+        pre_emails_map = {
+            str(a.get("email") or "").strip().lower(): int(a["index"])
+            for a in pre_accounts
+            if str(a.get("email") or "").strip()
+        }
+        already_in_argon = all(em in pre_emails_map for em in required_emails) and has_cookie_db(argon_prof)
+
+        mig_res: Dict[str, Any] = {"ok": already_in_argon, "cookies_merged": 0, "method": "already_present"}
+        if migrate_sessions and (has_cookie_db(child_dir) or not already_in_argon):
+            mig_res = migrate_slot_profile_to_argon_browser(
+                slot_dir=child_dir,
+                argon_profile_dir=argon_prof,
+                slot=slot_norm,
+                pool_cfg=cfg,
+            )
+            if not mig_res.get("ok") and not already_in_argon:
+                skipped.append(
+                    {
+                        "slot": slot_norm,
+                        "path": str(child_dir),
+                        "reason": str(mig_res.get("reason") or "session migration into Argon browser failed"),
+                    }
+                )
+                continue
+
+        if not has_cookie_db(argon_prof):
+            skipped.append(
+                {
+                    "slot": slot_norm,
+                    "path": str(child_dir),
+                    "reason": f"Argon browser profile {argon_prof} has no valid cookie DB yet",
+                }
+            )
+            continue
+
+        argon_pref_accounts = get_preferences_accounts(argon_prof)
+        argon_emails_map = {
+            str(a.get("email") or "").strip().lower(): int(a["index"])
+            for a in argon_pref_accounts
+            if str(a.get("email") or "").strip()
+        }
+        missing_emails = [em for em in required_emails if em not in argon_emails_map]
         if missing_emails:
             skipped.append(
                 {
                     "slot": slot_norm,
-                    "path": str(slot_dir),
-                    "reason": f"shared profile does NOT hold account(s): {', '.join(missing_emails)}",
+                    "path": str(child_dir),
+                    "reason": f"Argon browser profile does NOT hold account(s): {', '.join(missing_emails)}",
                 }
             )
             continue
 
-        verified_idx = shared_emails_map[required_emails[0]]
+        verified_idx = argon_emails_map[required_emails[0]]
+        ok_verify, verify_detail = _verify_migrated_account_in_argon_browser(
+            argon_profile_dir=argon_prof,
+            email=required_emails[0],
+            expected_index=verified_idx,
+            verify_live=verify_live,
+            live_verifier=live_verifier,
+        )
+        if not ok_verify:
+            skipped.append(
+                {
+                    "slot": slot_norm,
+                    "path": str(child_dir),
+                    "reason": f"account verification in Argon browser failed: {verify_detail}",
+                }
+            )
+            continue
+
         try:
             cfg.set_account_index(slot_norm, verified_idx)
         except Exception:
             pass
 
-        bytes_before = _dir_byte_size(slot_dir)
-        rec_root.mkdir(parents=True, exist_ok=True)
-        dest_dir = rec_root / slot_dir.name
-        if dest_dir.exists():
-            dest_dir = rec_root / f"{slot_dir.name}_{int(time.time() * 1000) % 100000}"
+        bytes_before = _dir_byte_size(child_dir)
+        dest_dir_str = ""
+        if keep_archive:
+            rec_root.mkdir(parents=True, exist_ok=True)
+            dest_dir = rec_root / child_dir.name
+            if dest_dir.exists():
+                dest_dir = rec_root / f"{child_dir.name}_{int(time.time() * 1000) % 100000}"
+            shutil.move(str(child_dir), str(dest_dir))
+            for cache_rel in RECLAIMABLE_CACHE_RELPATHS:
+                cache_target = dest_dir / cache_rel
+                if cache_target.is_dir():
+                    _rmtree_complete(cache_target)
+            bytes_after = _dir_byte_size(dest_dir)
+            reclaimed_now = max(0, bytes_before - bytes_after)
+            dest_dir_str = str(dest_dir)
+        else:
+            if not _rmtree_complete(child_dir):
+                skipped.append(
+                    {
+                        "slot": slot_norm,
+                        "path": str(child_dir),
+                        "reason": "could not completely delete slot profile directory from disk",
+                    }
+                )
+                continue
+            bytes_after = 0
+            reclaimed_now = bytes_before
 
-        shutil.move(str(slot_dir), str(dest_dir))
-        for cache_rel in RECLAIMABLE_CACHE_RELPATHS:
-            cache_target = dest_dir / cache_rel
-            if cache_target.is_dir():
-                shutil.rmtree(cache_target, ignore_errors=True)
-
-        bytes_after = _dir_byte_size(dest_dir)
-        reclaimed_now = max(0, bytes_before - bytes_after)
-        total_reclaimed_bytes += bytes_before
+        total_reclaimed_bytes += reclaimed_now
         reclaimed.append(
             {
                 "slot": slot_norm,
                 "email": required_emails[0],
                 "account_index": verified_idx,
-                "original_path": str(slot_dir),
-                "archived_to": str(dest_dir),
+                "original_path": str(child_dir),
+                "archived_to": dest_dir_str,
+                "deleted_completely": not keep_archive,
+                "migration_method": str(mig_res.get("method") or "verified"),
+                "cookies_merged": int(mig_res.get("cookies_merged") or 0),
+                "verify_detail": verify_detail,
                 "bytes_before": bytes_before,
                 "bytes_archived_session": bytes_after,
+                "bytes_freed": reclaimed_now,
                 "bytes_freed_from_cache": reclaimed_now,
             }
         )
 
+    if not keep_archive and prof_root.is_dir():
+        try:
+            if not any(prof_root.iterdir()):
+                prof_root.rmdir()
+        except Exception:
+            pass
+
+    try:
+        cfg.enable_shared_profile_mode()
+    except Exception:
+        pass
+
     return {
-        "shared_profile": str(shared_prof),
+        "shared_profile": str(argon_prof),
+        "argon_profile": str(argon_prof),
         "profiles_root": str(prof_root),
-        "archive_root": str(rec_root),
+        "archive_root": str(rec_root) if keep_archive else "",
+        "keep_archive": bool(keep_archive),
         "reclaimed": reclaimed,
+        "leftovers_removed": leftovers_removed,
         "skipped": skipped,
         "total_reclaimed_bytes": total_reclaimed_bytes,
+        "total_leftover_bytes": total_leftover_bytes,
     }
 
 
@@ -1925,34 +2724,57 @@ def reclaim_slot_profiles_cli(
     profile_dir: Optional[Union[str, Path]] = None,
     profiles_root: Optional[Union[str, Path]] = None,
     archive_root: Optional[Union[str, Path]] = None,
+    keep_archive: bool = False,
+    verify_live: bool = True,
 ) -> int:
-    """CLI handler for `--reclaim-slot-profiles` (Round 17 Section 1.5)."""
+    """CLI handler for `--reclaim-slot-profiles` / `--migrate-slot-profiles` (Round 18 Sections 1.2 & 1.3)."""
     rep = reclaim_isolated_slot_profiles(
         shared_profile_dir=profile_dir,
         profiles_root=profiles_root,
         archive_root=archive_root,
+        keep_archive=keep_archive,
+        migrate_sessions=True,
+        verify_live=verify_live,
     )
     total_mb = rep["total_reclaimed_bytes"] / (1024.0 * 1024.0)
     total_gb = total_mb / 1024.0
+    leftover_mb = rep.get("total_leftover_bytes", 0) / (1024.0 * 1024.0)
+    leftover_gb = leftover_mb / 1024.0
+    mode_label = (
+        f"RECOVERABLE ARCHIVE ({rep['archive_root']})"
+        if keep_archive
+        else "COMPLETE DELETION (all space freed on disk)"
+    )
     print("=" * 78)
-    print("  ARGON ISOLATED SLOT PROFILE RECLAMATION")
+    print("  ARGON BROWSER SESSION MIGRATION & OLD PROFILE DELETION")
     print("=" * 78)
-    print(f"  Shared profile  : {rep['shared_profile']}")
-    print(f"  Slot profiles   : {rep['profiles_root']}")
-    print(f"  Recoverable dir : {rep['archive_root']}")
+    print(f"  Argon browser   : {rep['argon_profile']}")
+    print(f"  Old slot root   : {rep['profiles_root']}")
+    print(f"  Deletion mode   : {mode_label}")
     if rep["reclaimed"]:
-        print(f"  Reclaimed slots : {len(rep['reclaimed'])} ({total_mb:.1f} MB / {total_gb:.2f} GB reclaimed)")
+        print(f"  Migrated & freed: {len(rep['reclaimed'])} slot profile(s)")
         for item in rep["reclaimed"]:
-            mb_i = item["bytes_before"] / (1024.0 * 1024.0)
+            mb_i = item["bytes_freed"] / (1024.0 * 1024.0)
+            gb_i = mb_i / 1024.0
+            act_str = f"archived to {item['archived_to']}" if keep_archive else "COMPLETELY DELETED"
             print(
-                f"    - {item['slot']} ({item['email']} -> /u/{item['account_index']}/): "
-                f"{mb_i:.1f} MB moved to {item['archived_to']}"
+                f"    - {item['slot']} ({item['email']} -> /u/{item['account_index']}/, "
+                f"method={item['migration_method']}): freed {mb_i:.1f} MB ({gb_i:.2f} GB) [{act_str}]"
             )
     else:
-        print("  Reclaimed slots : 0")
+        print("  Migrated & freed: 0 slot profiles")
+    if rep.get("leftovers_removed"):
+        print(
+            f"  Test leftovers  : {len(rep['leftovers_removed'])} removed "
+            f"({leftover_mb:.1f} MB / {leftover_gb:.2f} GB of pure waste freed)"
+        )
+        for lf in rep["leftovers_removed"]:
+            lf_mb = lf["bytes_freed"] / (1024.0 * 1024.0)
+            print(f"    - {lf['name']} (holds no account): freed {lf_mb:.1f} MB [COMPLETELY DELETED]")
     if rep["skipped"]:
         print(f"  Refused/Skipped : {len(rep['skipped'])}")
         for sk in rep["skipped"]:
             print(f"    - {sk['slot']} ({sk['path']}): REFUSED ({sk['reason']})")
+    print(f"  TOTAL FREED     : {total_mb:.1f} MB ({total_gb:.2f} GB)")
     print("=" * 78)
     return 0

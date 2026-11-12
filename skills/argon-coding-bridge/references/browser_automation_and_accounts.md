@@ -9,9 +9,9 @@ Two rules matter more than everything else in this file:
 
 ---
 
-## 🔑 1. One Argon Bridge Browser, Every Account Inside It, and Verified `/u/<index>/` Switching
+## 🔑 1. The Argon Browser Is the ONLY Place, Every Account Lives Inside It, and `/u/<index>/` Switching
 
-The bridge uses **ONE dedicated Chrome browser** — the **Argon Bridge browser** (`~/.gemini/argon_browser_profile`) — and **every pooled Google account lives inside it**. The owner's own daily browser is **never** touched by the bridge.
+There is **ONE** Chrome browser for the bridge — **the Argon browser** (`~/.gemini/argon_browser_profile`) — and everything lives inside it and is controlled from it. There is **no** separate "shared profile" anywhere and no per-slot profile directory in the normal flow. The owner's own daily browser is **never** touched by the bridge.
 
 - **Gemini Web**: `/u/<index>/app`
 
@@ -24,9 +24,9 @@ https://gemini.google.com/u/0/app
 > project: no `--mode aistudio`, no AI Studio URL, no AI Studio button. Gemini Web
 > is the only workspace. Do not re-add it.
 
-- **`/u/<index>/` is the verified browser account index, NOT the pool slot number.** Inside the shared Argon Bridge browser, `<index>` is the 0-based position of that Google account inside `~/.gemini/argon_browser_profile/Default/Preferences` (`account_info`). After each account is signed in, `verify_account_index_in_preferences()` reads its real index and `PoolConfig.set_account_index(slot, index)` records it (`account_index`).
-- **One browser means flat RAM and flat disk.** Because all accounts and task tabs share one Argon Bridge browser process (~1.4 GB RAM and ~2–3 GB disk instead of 62 processes, 7 GB RAM, and 68 GB disk across per-slot profiles), memory and disk usage stay flat no matter how many accounts or concurrent tasks are running.
-- **Never strip `/u/<index>/`.** Each signed-in account has its own Gemini session under its verified `/u/<index>/` path inside the Argon Bridge browser.
+- **`/u/<index>/` is the verified browser account index, NOT the pool slot number.** Inside the Argon browser, `<index>` is the 0-based position of that Google account inside `~/.gemini/argon_browser_profile/Default/Preferences` (`account_info`). After each account is signed in or migrated, `verify_account_index_in_preferences()` reads its real index and `PoolConfig.set_account_index(slot, index)` records it (`account_index`).
+- **One browser means flat RAM and flat disk.** Because all accounts and task tabs live inside the one Argon browser process (~1.4 GB RAM and ~2–3 GB disk instead of 62 processes, 7 GB RAM, and 68.23 GB disk across per-slot profiles), memory and disk usage stay flat no matter how many accounts or concurrent tasks are running.
+- **Never strip `/u/<index>/`.** Each signed-in account has its own Gemini session under its verified `/u/<index>/` path inside the Argon browser.
 
 ---
 
@@ -229,37 +229,39 @@ still THINKING is not a failed run:
 
 Only when none of these hold is the run treated as "finished without a delivery"
 and carried over into a new session. `--no-carry-over` turns the rule off.
-### The delivery rule - the whole file, never a truncated preview
+### The delivery rule - In-Gemini Export -> Download, whole files, and `argon_delivery.zip` bundle
 
-A delivered patch is **always** taken in full. Two ways are used, and both must yield
-the WHOLE file:
+A round can deliver **more than the page file**: in addition to `apply_changes.ps1`, Argon may
+generate images (`.png`, `.jpg`, `.webp`), `.svg` graphics, audio (`.wav`, `.mp3`), or other assets.
+The bridge captures **every generated artifact** of the round and writes:
 
-1. the viewer's **Download** button (the real bytes), and
-2. Drive's `viewer/text` endpoint, **page by page**, when the button is not reachable.
+```text
+<delivery-dir>/
+    apply_changes.ps1          <- the patch (unchanged contract)
+    argon_delivery.zip         <- the bundle (apply_changes.ps1 + assets/* + DELIVERY_MANIFEST.md)
+    DELIVERY_MANIFEST.md       <- every file: name, byte size, sha256, one-line description
+```
 
-The Drive viewer renders only what fits on screen, so a long patch read out of the
-preview can stop half-way. A half-written patch then fails the apply step with *"Target
-block not found"* - even though Argon's delivery was fine.
-
-The second way matters even more, because the endpoint is **paged**:
-`drive.google.com/viewer/text?id=<FILE_ID>&page=N` serves the file in PAGES, and
-**page 0 simply stops mid-statement with no error at all**. A downloader that reads one
-page accepts a HALF patch that still parses. So the bridge walks `page=0, 1, 2 ...`
-until a page comes back empty and stitches the chunks. Measured on a 544 KB delivery:
-page 0 = 262 114 characters, page 1 = 261 605, page 2 = 20 639 - the whole file is
-544 927 bytes, and its SHA-256 matches the file the owner downloaded by hand.
-
-The file id is not read from the preview: the Drive viewer **crashes in headless
-Chromium**, so the id only ever appears in the request the Gemini page fires when the
-chip is clicked (`viewer/meta?id=...`). The bridge records it from the network.
-
-When neither way produces a complete file the run **fails loudly and writes nothing**;
-a truncated file is never accepted as a patch. The same applies to a script that Argon
-inlines in the chat bubble: it must be complete before it is accepted.
-
-A downloaded file is checked for completeness: it has to carry the `[SUCCESS]` marker, a
-`NOTES` block that was opened must be closed, and no here-string may be left unterminated. A
-file that fails those checks is reported as truncated and is **not** written.
+1. **In-Gemini Chip DOM & `pre.text-content` Crash Prevention**:
+   Each `generated-file` chip renders `generated-file-senna-preview` > `div.title-container` (file
+   icon, `title="apply_changes.ps1"`, `gem-button` `"Export"`, `button aria="Fullscreen"`,
+   `button aria="Close"`) and `gem-popover` > `div.content` > `pre.text-content`. Because a 216 KB
+   patch produces a 116,892 px tall `pre.text-content` that crashes headless Chrome, the bridge
+   injects `pre.text-content{display:none!important}` via `page.add_init_script` BEFORE navigation
+   and waits for `page.locator("generated-file").count() > 0` instead of reading `inner_text("body")`.
+2. **Export `gem-button` -> Leaf `"Download"`**:
+   Clicking the chip opens an in-Gemini preview, not a Drive page. The bridge clicks the chip's
+   **Export** `gem-button` and then clicks the **leaf** element whose text is `"Download"` (never a
+   container element whose aggregated text merely includes `"Download"`), cross-checking the
+   downloaded file's SHA-256 against `pre.text-content`.
+3. **Drive Paged Text & Binary Fallback**:
+   When a file is Drive-hosted, text patches walk `drive.google.com/viewer/text?id=<FILE_ID>&page=N`
+   page by page (`page=0, 1, 2 ...` until empty) and binary assets are fetched as raw bytes from
+   Drive's download endpoint.
+4. **Completeness & Manifest Verification**:
+   `apply_changes.ps1` must carry `[SUCCESS]`, a closed `NOTES` block, and balanced here-strings,
+   and every file inside `argon_delivery.zip` is verified against the byte size and SHA-256 recorded
+   in `DELIVERY_MANIFEST.md`.
 ### The model double check
 
 The model is verified twice and only against the **model chip** (the control next to the
@@ -312,12 +314,16 @@ If you drive the browser with a script or a browser extension:
 
 When running multiple coding tasks in parallel across large codebases, the pool distributes new tasks across accounts while keeping follow-ups in their existing conversations.
 
-### Shared Argon Bridge Browser & Profile Reclaiming (Round 17):
-1. **One Shared Argon Bridge Browser (`~/.gemini/argon_browser_profile`)**:
-   - `PoolConfig.is_shared_profile_slot()` is `True` by default for every slot.
-   - Every pooled Google account is signed into the single shared profile `~/.gemini/argon_browser_profile`, and its verified index in `Default/Preferences` (`account_info`) is stored as `account_index` via `PoolConfig.set_account_index(slot, index)`.
-   - `--close-browser --slot /u/N/` closes **only that account's tabs** (reusing `--close-tab`) and leaves the Argon Bridge browser running for the other accounts; the browser itself closes politely (flushing cookies) only when no task tab is left.
-   - Old per-slot profiles (`~/.gemini/argon_profiles/slot-u0/` through `slot-u11/`) are reclaimed on demand with `python skills/argon-coding-bridge/scripts/dispatch_argon.py --reclaim-slot-profiles`, which verifies each account is present in the shared profile before moving the directory to `~/.gemini/argon_reclaimed_profiles/<timestamp>/` and printing the reclaimed space.
+### The Argon Browser, Session Migration & Complete Deletion of Old Slot Profiles (Round 18):
+1. **The Argon Browser Is the Only Place (`~/.gemini/argon_browser_profile`)**:
+   - `PoolConfig.profile_dir_for_slot(slot)` always resolves to `~/.gemini/argon_browser_profile`. There is no separate "shared profile" and no per-slot profile directory in the normal flow.
+   - Every pooled Google account lives inside the Argon browser, and its verified index in `Default/Preferences` (`account_info`) is stored as `account_index` via `PoolConfig.set_account_index(slot, index)`.
+   - `--close-browser --slot /u/N/` closes **only that account's tabs** (reusing `--close-tab`) and leaves the Argon browser running for the other accounts; the browser itself closes politely (flushing cookies) only when no task tab is left.
+2. **Migrating Sessions First, Then Completely Deleting the Old 68.23 GB (`--reclaim-slot-profiles`)**:
+   - Run `python skills/argon-coding-bridge/scripts/dispatch_argon.py --reclaim-slot-profiles` (or `argon_pool_login.py --reclaim-slot-profiles`).
+   - For each old `~/.gemini/argon_profiles/slot-uN/` directory, `migrate_slot_profile_to_argon_browser()` reads `Default/Network/Cookies` and `Default/Preferences` (`account_info`), carries over or verifies the Windows DPAPI `Local State` `os_crypt.encrypted_key`, merges Google cookies (`google.com`, `accounts.google.com`, `gds.google.com`, `gemini.google.com`, etc.) via DevTools `Storage.getCookies`/`Storage.setCookies` or SQLite `INSERT OR IGNORE` without touching rows for other accounts, and registers the account in `Default/Preferences` (`account_info`).
+   - Each migrated account is verified with `verify_account_index_in_preferences()` and at `https://gemini.google.com/u/<index>/app`. Only verified slot profiles are deleted (unverified or busy profiles are refused), and deletion is **complete** by default (`shutil.rmtree`, freeing the full ~68.23 GB on disk; `--keep-archive` is an optional flag, default OFF).
+   - Test/probe leftovers (`run-*`, `*-concurrent-*`, `*-cap*`, `slot-u-0`) that hold no account (~8.4 GB of pure waste) are recognized, completely deleted, and reported alongside the per-slot and total freed space. `~/.gemini/argon_browser_profile` itself is never touched.
 
 ### Slot Selection Policy (Rule 2):
 - **New Tasks**:
@@ -334,7 +340,7 @@ python "./skills/argon-coding-bridge/scripts/dispatch_argon.py" --task "Describe
 python "./skills/argon-coding-bridge/scripts/dispatch_argon.py" --task "..." --project-path . --max-accounts 3
 ```
 
-### Parallel Isolation: Per-Slot Profiles, Lock Files, Busy Slot Detection & Next-Account Selection
+### Parallel Isolation: Lock Files, Busy Slot Detection, Next-Account Selection & Argon Browser Host
 
 1. **Where the Lock Files Live & How a Busy Slot Is Detected and Announced**:
    - Each slot `/u/N/` has a lock file at `~/.gemini/argon_locks/slot-uN.lock` storing `pid`,
@@ -342,8 +348,7 @@ python "./skills/argon-coding-bridge/scripts/dispatch_argon.py" --task "..." --p
    - When `SlotLock.acquire()` sees an existing lock file, it checks whether `pid` is still alive
      (`_pid_alive`). A dead PID is treated as stale and reclaimed immediately so a crashed run never
      blocks the slot.
-   - If the PID is alive—or if `_profile_is_busy()` detects a live `SingletonLock`, Windows
-     `lockfile`, or locked `Default/Network/Cookies`—the dispatcher announces that the slot is busy
+   - If the PID is alive, the dispatcher announces that the slot is busy
      (`[!] Slot /u/N/ is already in use by pid <PID> ...`) and never touches or kills the other
      browser. Every lock is released in a `finally` block when the run ends.
 2. **How the Next Account Is Chosen**:
@@ -354,16 +359,16 @@ python "./skills/argon-coding-bridge/scripts/dispatch_argon.py" --task "..." --p
      at `MAX_TASKS_PER_SLOT`.
    - When a slot returns exit code `7` (`slot busy`) or fails pre-flight on a new task,
      `main()` automatically advances to the next slot in the list (up to `--max-accounts`).
-3. **How the Shared Argon Bridge Browser Host Works**:
-   - Every slot `/u/N/` maps to the single shared Argon Bridge browser profile at `~/.gemini/argon_browser_profile` (`PoolConfig.is_shared_profile_slot()` is `True` by default; `--isolated-profile` / `ARGON_SHARED_PROFILE=0` remains available as an escape hatch).
-   - `ensure_browser_host()` attaches to the running Argon Bridge browser via the CDP endpoint in `.argon_browser_endpoint` (or `DevToolsActivePort` / `--remote-debugging-port`), refusing only when a running Chrome publishes no endpoint.
+3. **How the Argon Browser Host Works**:
+   - Every slot `/u/N/` maps to the Argon browser's own profile at `~/.gemini/argon_browser_profile` (`--isolated-profile` / `ARGON_SHARED_PROFILE=0` remains available only as an emergency escape hatch).
+   - `ensure_browser_host()` attaches to the running Argon browser via the CDP endpoint in `.argon_browser_endpoint` (or `DevToolsActivePort` / `--remote-debugging-port`), refusing only when a running Chrome publishes no endpoint.
    - Task and tab bookkeeping (`TaskRegistry`, `MAX_TASKS_PER_SLOT = 2`, and `host_state["tabs"]` with per-tab `target_id` and `window.name`) stays strictly per **account** (`slot`), so two tasks on the same or different accounts never steal each other's tab.
 
 ---
 
 ## 🔐 8. Automatic Pool Sign-In, Verification Pause-and-Notify & Adding Accounts
 
-Every account slot `/u/N/` in `skills/argon-coding-bridge/config/accounts_pool.json` is signed into the single shared Argon Bridge browser profile at `~/.gemini/argon_browser_profile`, and its verified 0-based index in `Default/Preferences` (`account_info`) is recorded with `PoolConfig.set_account_index(slot, index)` and displayed next to the slot in `login_pool_accounts.py`.
+Every account slot `/u/N/` in `skills/argon-coding-bridge/config/accounts_pool.json` is signed into the Argon browser's own profile at `~/.gemini/argon_browser_profile`, and its verified 0-based index in `Default/Preferences` (`account_info`) is recorded with `PoolConfig.set_account_index(slot, index)` and displayed next to the slot in `login_pool_accounts.py`.
 
 ### Automatic Sign-In Flow (`argon_pool_login.py` & `login_pool_accounts.py`)
 
