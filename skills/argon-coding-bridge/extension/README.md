@@ -31,3 +31,5 @@ and `--remote-debugging-pipe` transport in place of a local TCP debugging port.
 The extension is an accelerator, never a single point of failure. When the extension is absent
 or disabled (`ARGON_DISABLE_COMPANION_EXTENSION=1`), `dispatch_argon.py` logs that the fallback
 path is active and executes the pure-Python path automatically.
+
+Note: This companion extension stays strictly Gemini-only (`gemini.google.com` and `drive.google.com`); general-purpose `<all_urls>` live browser control lives in its own separate extension under `skills/argon-coding-bridge/live_loop/extension/`.

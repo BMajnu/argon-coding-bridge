@@ -12878,6 +12878,37 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Disable the MV3 companion extension for this run and use the pure-Python fallback path.",
     )
     parser.add_argument(
+        "--browser-loop-start",
+        action="store_true",
+        help="Start the general-purpose live browser control loop daemon, print the endpoint + token prefix, and run until Ctrl-C.",
+    )
+    parser.add_argument(
+        "--browser-loop-stop",
+        action="store_true",
+        help="Stop a running live browser control loop daemon and remove ~/.gemini/argon_browser_loop.json.",
+    )
+    parser.add_argument(
+        "--browser-loop-status",
+        action="store_true",
+        help="Print the live browser control loop daemon state (running or not, port, open tabs, and current map per tab).",
+    )
+    parser.add_argument(
+        "--browser-act",
+        default=None,
+        metavar="JSON",
+        help="Run ONE live browser action (JSON string or @file.json) via the running daemon or a one-shot CDP attach.",
+    )
+    parser.add_argument(
+        "--browser-loop-selftest",
+        action="store_true",
+        help="Run the end-to-end live browser control loop self-test on a disposable Chrome and print real measured numbers.",
+    )
+    parser.add_argument(
+        "--browser-allow-eval",
+        action="store_true",
+        help="Allow the live browser loop 'eval' operation (disabled by default for safety; prints a warning).",
+    )
+    parser.add_argument(
         "--max-verify-rounds",
         type=int,
         default=1,
@@ -13339,6 +13370,25 @@ def main(argv: Optional[List[str]] = None) -> int:
         return run_preflight_selftest_cli(
             headless=bool(getattr(args, "headless", False) or True),
             require_extension=False,
+        )
+
+    if (
+        getattr(args, "browser_loop_start", False)
+        or getattr(args, "browser_loop_stop", False)
+        or getattr(args, "browser_loop_status", False)
+        or getattr(args, "browser_act", None) is not None
+        or getattr(args, "browser_loop_selftest", False)
+    ):
+        from browser_loop import browser_loop_cli
+
+        return browser_loop_cli(
+            start=bool(getattr(args, "browser_loop_start", False)),
+            stop=bool(getattr(args, "browser_loop_stop", False)),
+            status=bool(getattr(args, "browser_loop_status", False)),
+            act=getattr(args, "browser_act", None),
+            selftest=bool(getattr(args, "browser_loop_selftest", False)),
+            allow_eval=bool(getattr(args, "browser_allow_eval", False)),
+            slot=args.slot,
         )
 
     if getattr(args, "close_browser", False):

@@ -865,6 +865,16 @@ python "./skills/argon-coding-bridge/scripts/dispatch_argon.py" --task "..." --p
   at the end of `apply_changes.ps1`. The dispatcher extracts those lines via `_extract_notes` /
   `_save_notes`, writes them to `.argon_backup/argon_notes_<timestamp>.md` inside the project, and
   prints each note to the terminal.
+- **General-purpose live agent-to-browser control loop (Round 19)**: `browser_loop.py` and
+  `live_loop/live_map.js` turn the Argon browser into a general-purpose browser on any website
+  (protocol `argon.live.v1`). Lane A attaches to the Argon browser's CDP endpoint via
+  `chromium.connect_over_cdp`, installs `page.expose_binding("__argonPush", cb)` (`Runtime.addBinding`)
+  and `page.add_init_script(live_map.js)` on every tab, and receives spontaneous DOM mutation maps in
+  ~12 ms without polling. Lane B (`live_loop/extension/`) provides a separate unpacked `<all_urls>`
+  MV3 extension for everyday Chrome (keeping `extension/` strictly Gemini-only) with a service-worker
+  WebSocket and an open `chrome.runtime.connect()` port so the MV3 worker never idles out. Use
+  `--browser-loop-start`, `--browser-loop-stop`, `--browser-loop-status`, `--browser-act <JSON|@file>`,
+  and `--browser-loop-selftest` (plus `--browser-allow-eval` when `eval` is explicitly needed).
 
 ---
 

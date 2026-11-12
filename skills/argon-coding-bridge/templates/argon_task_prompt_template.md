@@ -157,6 +157,27 @@ The delivered `apply_changes.ps1` is a single, self-contained PowerShell script 
    Write-Host "[SUCCESS] $patchedCount file(s) patched." -ForegroundColor Green
    ```
 
+9. **CREATING A FILE THAT DOES NOT EXIST YET (NEW FILES):**
+   A file that is brand new is delivered as a file entry that has a `New` block and **NO `Old`
+   block at all** - that is how the bridge recognises "create this file" (an `Old` block means
+   "replace this exact existing text"). In the data-driven format that looks like this:
+
+   ```powershell
+   $PatchFiles = @(
+       @{ RelPath = 'src/new_module.py'
+          Blocks  = @( @{ New = @'
+   ...the complete content of the new file...
+   '@ } ) }
+   )
+   ```
+
+   - The apply script MUST create the parent directory when it is missing, write the file as
+     UTF-8 without BOM, then re-read it from disk and verify the content is really there.
+   - There is nothing to back up for a new file, and the Phase-1 pre-flight must NOT try to find
+     an `Old` block for it - a new file simply has no `Old` block to check.
+   - A file entry that has BOTH `Old` and `New` replaces existing text; a file entry that has ONLY
+     `New` creates the file. Never mix the two meanings inside one file entry.
+
 ### ✅ VERIFY YOUR WORK (REQUIRED)
 The patch is applied by RUNNING your script, so the script must prove that it worked:
 1. After writing each file, re-read it from disk (`$verify = [System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8)`) and assert with `$verify.IndexOf($newReplacement, [System.StringComparison]::Ordinal) -ge 0` that the new content is really there.
@@ -164,6 +185,14 @@ The patch is applied by RUNNING your script, so the script must prove that it wo
    `[FAILED VERIFY] <relative path>` for every file that does not.
 3. If any verification fails, exit with a non-zero code so the run is reported as failed.
 4. Never report success for a file you have not re-read from disk.
+5. **WHEN THE CHANGE ADDS A RUNNABLE BEHAVIOUR, THE PATCH MUST ALSO ADD A SELF-TEST THAT
+   EXERCISES IT.** A new command, a new service, a new loop or a new endpoint is not delivered
+   until one command runs it end to end and prints the real result. The self-test must run
+   against a THROWAWAY fixture (its own temporary profile, its own port, its own directory) so it
+   never touches real user data, real accounts or a running instance.
+6. **Never report a number you did not measure.** If the self-test prints a latency, a count or a
+   duration, that number must come from the run that just happened. A hard-coded or copied
+   measurement is a false report, and a false report is worse than no report.
 
 ### 🗒️ RECORD WHAT YOU FOUND (REQUIRED)
 While reading the project you will often notice something inconsistent, stale, risky or simply

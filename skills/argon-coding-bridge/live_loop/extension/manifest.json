@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "Argon Live Browser Control Loop",
+  "version": "1.19.0",
+  "description": "General-purpose MV3 extension for the Argon Live Browser Control Loop (argon.live.v1): pushes live interactive DOM maps and executes agent actions over a local 127.0.0.1 WebSocket while keeping the Gemini companion extension isolated.",
+  "permissions": [
+    "scripting",
+    "storage",
+    "tabs"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "live_service_worker.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "live_content_script.js"
+      ],
+      "run_at": "document_start"
+    }
+  ]
+}

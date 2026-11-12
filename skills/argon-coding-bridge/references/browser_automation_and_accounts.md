@@ -480,3 +480,27 @@ claiming it.
 - When `apply_changes.ps1` is captured, `_extract_notes()` and `_save_notes()` extract that block,
   save it to `.argon_backup/argon_notes_<timestamp>.md` inside the target project, and print each
   note line to the console.
+
+---
+
+## 🌐 11. General-Purpose Live Browser Control Loop (Round 19)
+
+- **One Map Builder, Two Lanes (`argon.live.v1`)**: `skills/argon-coding-bridge/live_loop/live_map.js`
+  extracts only interactive elements (`a[href]`, `button`, `input`, `select`, `textarea`, interactive
+  ARIA roles, `[contenteditable]`, `[onclick]`, `[tabindex]`), watches the DOM with a debounced
+  `MutationObserver`, and pushes compact element maps to the agent.
+- **Lane A (Primary, CDP)**: `skills/argon-coding-bridge/scripts/browser_loop.py` attaches to the
+  Argon browser's `.argon_browser_endpoint` over CDP, installs `page.expose_binding("__argonPush", cb)`
+  and `page.add_init_script(live_map.js)` across existing and newly opened tabs (`context.on("page", ...)`),
+  and executes actions with `page.evaluate`, returning the fresh map in the same response.
+- **Lane B (Secondary, Separate MV3 Extension)**: `skills/argon-coding-bridge/live_loop/extension/`
+  provides a separate `<all_urls>` unpacked extension for everyday Chrome so the companion extension in
+  `skills/argon-coding-bridge/extension/` stays Gemini-only. `live_content_script.js` keeps a persistent
+  `chrome.runtime.connect()` port open alongside `live_service_worker.js`'s WebSocket (`ws://127.0.0.1:<port>/live`)
+  so the MV3 service worker stays alive.
+- **Stale-Element Guard & Security**: Every element action rebuilds the map at action time and verifies
+  `expect.tag` and `expect.name`; mismatches are refused with `error: "stale_element"` and the fresh map.
+  The daemon binds strictly to `127.0.0.1`, requires the per-run 64-hex token (`X-Argon-Token` or `?token=`),
+  restricts `navigate` to `http://` and `https://`, and keeps `eval` disabled unless `--browser-allow-eval` is passed.
+- **CLI Commands**: `--browser-loop-start`, `--browser-loop-stop`, `--browser-loop-status`,
+  `--browser-act <JSON|@file>`, and `--browser-loop-selftest`.
