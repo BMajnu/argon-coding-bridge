@@ -9,11 +9,11 @@ Two rules matter more than everything else in this file:
 
 ---
 
-## 🔑 1. The Account Slot IS Part of the URL
+## 🔑 1. One Argon Bridge Browser, Every Account Inside It, and Verified `/u/<index>/` Switching
 
-Every account in the pool owns a session path under Google: `/u/<n>/`, where `<n>` is the pool slot number (`/u/0/` = the first account, `/u/1/` = the second, and so on).
+The bridge uses **ONE dedicated Chrome browser** — the **Argon Bridge browser** (`~/.gemini/argon_browser_profile`) — and **every pooled Google account lives inside it**. The owner's own daily browser is **never** touched by the bridge.
 
-- **Gemini Web**: `https://gemini.google.com/u/<n>/app`
+- **Gemini Web**: `/u/<index>/app`
 
 ```text
 https://gemini.google.com/u/0/app
@@ -24,8 +24,9 @@ https://gemini.google.com/u/0/app
 > project: no `--mode aistudio`, no AI Studio URL, no AI Studio button. Gemini Web
 > is the only workspace. Do not re-add it.
 
-- **Never strip the slot.** Each account has its own Gemini session under that path, so a bare `https://gemini.google.com/app` is *not* the same session as `https://gemini.google.com/u/0/app`.
-- The dispatcher builds the URL from the pool configuration: the `active_slot` entry in `skills/argon-coding-bridge/config/accounts_pool.json`, or the `--slot` argument on the command line (`--slot /u/2/`).
+- **`/u/<index>/` is the verified browser account index, NOT the pool slot number.** Inside the shared Argon Bridge browser, `<index>` is the 0-based position of that Google account inside `~/.gemini/argon_browser_profile/Default/Preferences` (`account_info`). After each account is signed in, `verify_account_index_in_preferences()` reads its real index and `PoolConfig.set_account_index(slot, index)` records it (`account_index`).
+- **One browser means flat RAM and flat disk.** Because all accounts and task tabs share one Argon Bridge browser process (~1.4 GB RAM and ~2–3 GB disk instead of 62 processes, 7 GB RAM, and 68 GB disk across per-slot profiles), memory and disk usage stay flat no matter how many accounts or concurrent tasks are running.
+- **Never strip `/u/<index>/`.** Each signed-in account has its own Gemini session under its verified `/u/<index>/` path inside the Argon Bridge browser.
 
 ---
 
@@ -311,11 +312,12 @@ If you drive the browser with a script or a browser extension:
 
 When running multiple coding tasks in parallel across large codebases, the pool distributes new tasks across accounts while keeping follow-ups in their existing conversations.
 
-### Profile Isolation:
-1. **Multi-Profile Setup**:
-   - Maintain dedicated slot profiles: `~/.gemini/argon_profiles/slot-u0/` through `slot-u11/`.
-   - Each profile stays permanently logged into one Google Pro account at browser index `/u/0/`.
-   - Keep cookies/session persistent so no 2FA re-prompt occurs.
+### Shared Argon Bridge Browser & Profile Reclaiming (Round 17):
+1. **One Shared Argon Bridge Browser (`~/.gemini/argon_browser_profile`)**:
+   - `PoolConfig.is_shared_profile_slot()` is `True` by default for every slot.
+   - Every pooled Google account is signed into the single shared profile `~/.gemini/argon_browser_profile`, and its verified index in `Default/Preferences` (`account_info`) is stored as `account_index` via `PoolConfig.set_account_index(slot, index)`.
+   - `--close-browser --slot /u/N/` closes **only that account's tabs** (reusing `--close-tab`) and leaves the Argon Bridge browser running for the other accounts; the browser itself closes politely (flushing cookies) only when no task tab is left.
+   - Old per-slot profiles (`~/.gemini/argon_profiles/slot-u0/` through `slot-u11/`) are reclaimed on demand with `python skills/argon-coding-bridge/scripts/dispatch_argon.py --reclaim-slot-profiles`, which verifies each account is present in the shared profile before moving the directory to `~/.gemini/argon_reclaimed_profiles/<timestamp>/` and printing the reclaimed space.
 
 ### Slot Selection Policy (Rule 2):
 - **New Tasks**:
@@ -352,20 +354,16 @@ python "./skills/argon-coding-bridge/scripts/dispatch_argon.py" --task "..." --p
      at `MAX_TASKS_PER_SLOT`.
    - When a slot returns exit code `7` (`slot busy`) or fails pre-flight on a new task,
      `main()` automatically advances to the next slot in the list (up to `--max-accounts`).
-3. **How the Per-Slot Profiles Work & SQLite Cookie Seeding**:
-   - Every slot `/u/N/` uses its own Chrome profile directory at `~/.gemini/argon_profiles/slot-uN/`.
-   - When a slot profile does not exist yet, `_seed_profile()` seeds it from the master profile
-     (`~/.gemini/argon_browser_profile`) **only** when the master profile is not busy, using
-     SQLite's online backup API (`sqlite3.connect(...).backup(...)`) on `Default/Network/Cookies` so
-     the signed-in session survives. If the master profile is busy, it prints a clear warning
-     instead of creating a signed-out copy, and falls back to the shared master profile only when it
-     is free.
+3. **How the Shared Argon Bridge Browser Host Works**:
+   - Every slot `/u/N/` maps to the single shared Argon Bridge browser profile at `~/.gemini/argon_browser_profile` (`PoolConfig.is_shared_profile_slot()` is `True` by default; `--isolated-profile` / `ARGON_SHARED_PROFILE=0` remains available as an escape hatch).
+   - `ensure_browser_host()` attaches to the running Argon Bridge browser via the CDP endpoint in `.argon_browser_endpoint` (or `DevToolsActivePort` / `--remote-debugging-port`), refusing only when a running Chrome publishes no endpoint.
+   - Task and tab bookkeeping (`TaskRegistry`, `MAX_TASKS_PER_SLOT = 2`, and `host_state["tabs"]` with per-tab `target_id` and `window.name`) stays strictly per **account** (`slot`), so two tasks on the same or different accounts never steal each other's tab.
 
 ---
 
 ## 🔐 8. Automatic Pool Sign-In, Verification Pause-and-Notify & Adding Accounts
 
-Each account slot `/u/N/` in `skills/argon-coding-bridge/config/accounts_pool.json` is signed into its own per-slot Chrome profile directory at `~/.gemini/argon_profiles/slot-uN/` (seeded from the master `profile_dir` at `~/.gemini/argon_browser_profile` when available).
+Every account slot `/u/N/` in `skills/argon-coding-bridge/config/accounts_pool.json` is signed into the single shared Argon Bridge browser profile at `~/.gemini/argon_browser_profile`, and its verified 0-based index in `Default/Preferences` (`account_info`) is recorded with `PoolConfig.set_account_index(slot, index)` and displayed next to the slot in `login_pool_accounts.py`.
 
 ### Automatic Sign-In Flow (`argon_pool_login.py` & `login_pool_accounts.py`)
 

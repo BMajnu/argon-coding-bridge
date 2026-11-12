@@ -81,15 +81,16 @@ Both the **send phase** and the **delivery phase** retry at most two or three ti
 3. Root-cause fix attempt (`attempt 3 of 3`) — updates the manual hand-off pack, fixes the underlying cause, records the fix, and runs the final automatic retry.
 4. **Self-executed manual send fallback**: If the automatic attempts still fail, the bridge performs the manual send **itself** in the browser using the exact same composer, scaled upload wait, and hard Flash model guard, and then waits for the delivery as usual.
 
-### 7. Never kill a slot browser with `taskkill /F`
+### 7. One Dedicated Argon Bridge Browser, `/u/<index>/` Account Switching, and Safe Tab Close (Round 17)
 
-**Never kill the browser of a slot profile with `taskkill /F`.** A hard kill destroys the
-Chrome cookie database and logs the account out. Close it with
-`python dispatch_argon.py --project-path . --close-browser --slot /u/N/` - it closes
-gracefully and, if a kill is unavoidable, snapshots and restores the cookies.
-To close only one tab while leaving the browser and other tabs running, use
-`python dispatch_argon.py --project-path . --close-tab --slot /u/N/ --tab <tab-id>`, and
-inspect running browser hosts with `python dispatch_argon.py --project-path . --list-browsers`.
+- **One Browser for the Whole Bridge**: The bridge uses **ONE dedicated Chrome browser** ("the Argon Bridge browser") backed by the shared profile `~/.gemini/argon_browser_profile`, and **every pooled Google account lives inside it**. The owner's own daily browser is **never** touched by the bridge.
+- **Verified `/u/<index>/` Account Switching**: Accounts are switched with Google's own `/u/<index>/app` path, where `<index>` is the account's verified 0-based position inside that browser's `Default/Preferences` (`account_info`) list (`PoolConfig.get_account_index(slot)` / `PoolConfig.set_account_index(slot, index)`). It is verified against `Default/Preferences` and recorded — it is **not** guessed from the pool slot number.
+- **Flat RAM and Disk Usage**: Running one Argon Bridge browser instead of one browser per account keeps resource usage flat (~12–13 Chrome processes, ~1.4 GB RAM instead of 7 GB, and ~2–3 GB disk instead of 68 GB) no matter how many accounts or tasks are active.
+- **Closing a Slot Closes Only That Account's Tabs (`--close-browser --slot /u/N/`)**:
+  **Never kill the browser with `taskkill /F`.** In shared mode, `python dispatch_argon.py --project-path . --close-browser --slot /u/N/` closes **only the tabs of that account** (reusing `--close-tab`) and leaves the Argon Bridge browser running for the other accounts. The browser itself is closed politely (flushing cookies) only when no task tab is left.
+  To close a single tab by ID, use `python dispatch_argon.py --project-path . --close-tab --slot /u/N/ --tab <tab-id>`, and inspect running tabs with `python dispatch_argon.py --project-path . --list-browsers`.
+- **Reclaiming the 68 GB of Old Per-Slot Profiles (`--reclaim-slot-profiles`)**:
+  Run `python ./skills/argon-coding-bridge/scripts/dispatch_argon.py --reclaim-slot-profiles` (or `argon_pool_login.py --reclaim-slot-profiles`) to safely reclaim the old `~/.gemini/argon_profiles/slot-uN/` directories. It verifies that each slot's Google account is signed into `~/.gemini/argon_browser_profile` first, refuses to touch any slot whose account is missing from the shared profile, moves verified slot profiles to `~/.gemini/argon_reclaimed_profiles/<timestamp>/`, and prints the exact MB/GB reclaimed.
 
 ### 8. Extending a running task (`--append-followup`)
 
@@ -349,10 +350,11 @@ Why:  releases the task in `~/.gemini/argon_tasks.json` so the next round sees
 ## Step 0: Ensure the Account Pool Is Logged In (optional)
 
 The dispatcher rotates across a pool of Google accounts configured in
-`skills/argon-coding-bridge/config/accounts_pool.json`. Each slot `/u/N/` gets its own isolated
-Chrome profile directory at `~/.gemini/argon_profiles/slot-uN/` (seeded from the master profile
-`~/.gemini/argon_browser_profile`), and both `argon_pool_login.py` and `login_pool_accounts.py`
-sign each account directly into that account's `slot-uN` profile so parallel runs never collide.
+`skills/argon-coding-bridge/config/accounts_pool.json`. By default, every account is signed into
+**ONE dedicated Argon Bridge browser profile** (`~/.gemini/argon_browser_profile`, leaving your
+personal daily browser completely untouched), and each account's verified browser index in
+`Default/Preferences` (`account_info`) is recorded via `PoolConfig.set_account_index(slot, index)`
+so tasks switch accounts with `/u/<index>/app` inside that single browser.
 
 **Log in every account, fully automatic:**
 ```bash
@@ -827,14 +829,16 @@ python "./skills/argon-coding-bridge/scripts/dispatch_argon.py" --task "..." --p
   dispatcher announces `[!] Slot /u/N/ is already in use by pid <PID> ...`, refuses to touch the
   other run's browser, and either rotates to the next pool slot or exits with code `7` (`EXIT_SLOT_BUSY`)
   when no slot is free. Locks are always released in a `finally` block.
-- **How per-slot profiles work**: Each slot runs in `~/.gemini/argon_profiles/slot-uN/`. When a new
-  slot profile is created, `_seed_profile` copies the master profile (`~/.gemini/argon_browser_profile`)
-  only if the master profile is not currently busy (announcing clearly if the master is in use
-  rather than creating a signed-out copy) and snapshots `Default/Network/Cookies` via SQLite's
-  online backup API (`sqlite3.connect(...).backup(...)`). `argon_pool_login.py` and
-  `login_pool_accounts.py` also sign each account directly into its own `slot-uN` profile. If a slot
-  profile cannot be prepared, the dispatcher falls back to the shared master profile only when it is
-  free.
+- **How the shared Argon Bridge browser and `/u/<index>/` switching work**: Every slot runs in the
+  single shared Argon Bridge browser profile (`~/.gemini/argon_browser_profile`) by default
+  (`PoolConfig.is_shared_profile_slot()` is `True`). `argon_pool_login.py` and `login_pool_accounts.py`
+  sign every pooled account into that one profile using Google's `AddSession` flow, verify each
+  account's position in `Default/Preferences` (`account_info`) via `verify_account_index_in_preferences`,
+  and record it with `PoolConfig.set_account_index(slot, index)`. Because all accounts share one
+  browser, RAM and disk stay flat regardless of how many accounts or concurrent tasks are running, and
+  the owner's daily browser is never touched. Old isolated `~/.gemini/argon_profiles/slot-uN/`
+  directories can be reclaimed on demand with `--reclaim-slot-profiles` once their accounts are
+  verified in the shared profile.
 
 ---
 

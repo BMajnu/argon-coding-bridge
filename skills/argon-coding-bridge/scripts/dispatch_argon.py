@@ -1246,7 +1246,6 @@ def _generated_file_chip(page):
                 return matched_in_turn[-1]
         except Exception:
             pass
-        return None
 
     try:
         chips = page.locator("generated-file")
@@ -1371,7 +1370,6 @@ def _new_delivery_chip(page, chips_before: int, responses_before: int):
                 return matched[-1]
         except Exception:
             pass
-        return None
 
     try:
         all_chips = page.locator("generated-file")
@@ -1957,11 +1955,19 @@ def _download_from_drive_text(page, dest_dir: Path, max_pages: int = 12) -> tupl
     if not file_id:
         return None, "the Drive preview did not expose a file id"
 
+    auth_user = "0"
+    try:
+        m_au = re.search(r"/u/(\d+)/", str(getattr(page, "url", "") or ""))
+        if m_au:
+            auth_user = str(int(m_au.group(1)))
+    except Exception:
+        auth_user = "0"
+
     # Try the MV3 companion extension's paged viewer/text walker first when loaded.
     ext_resp = _invoke_companion_extension(
         page,
         "capture_delivery",
-        {"fileId": file_id, "maxPages": max_pages, "authUser": "0"},
+        {"fileId": file_id, "maxPages": max_pages, "authUser": auth_user},
         timeout_ms=30000,
     )
     if isinstance(ext_resp, dict) and ext_resp.get("ok") and ext_resp.get("text"):
@@ -1991,13 +1997,24 @@ def _download_from_drive_text(page, dest_dir: Path, max_pages: int = 12) -> tupl
 
     chunks: List[str] = []
     for pg_no in range(max_pages):
-        url = f"https://drive.google.com/viewer/text?id={file_id}&authuser=0&page={pg_no}"
+        url = f"https://drive.google.com/viewer/text?id={file_id}&authuser={auth_user}&page={pg_no}"
         try:
             resp = api.get(url, timeout=120000)
             raw = resp.text()
         except Exception as exc:
             return None, f"the Drive text endpoint failed on page {pg_no} ({exc})"
         data = _decode_drive_text_envelope(raw)
+        if data is None and pg_no == 0 and auth_user != "0":
+            try:
+                resp0 = api.get(
+                    f"https://drive.google.com/viewer/text?id={file_id}&authuser=0&page=0",
+                    timeout=120000,
+                )
+                data = _decode_drive_text_envelope(resp0.text())
+                if data is not None:
+                    auth_user = "0"
+            except Exception:
+                data = None
         if data is None:
             if pg_no == 0:
                 return None, "the Drive text endpoint did not return a file body"
@@ -3151,17 +3168,28 @@ def get_target_url(
             "supported - it consistently fails on agentic work. Use "
             "--mode gemini (Gemini Web)."
         )
-    if isolated_profile:
-        slot_part = "/u/0/"
-    else:
-        slot_part = normalize_slot(slot) if slot else "/u/0/"
+    slot_part = _url_slot_for_account(slot, isolated_profile=isolated_profile)
     return GEMINI_WEB_URL.format(slot=slot_part)
 
 
+_build_app_url = get_target_url
+
+
+def _url_slot_for_account(slot: Optional[str], isolated_profile: bool = False) -> str:
+    """Return `/u/0/` for an isolated slot profile, or `/u/<account_index>/` from `PoolConfig.get_account_index(slot)` in shared mode."""
+    if isolated_profile:
+        return "/u/0/"
+    try:
+        acct_idx = PoolConfig().get_account_index(slot)
+        return f"/u/{acct_idx}/"
+    except Exception:
+        return normalize_slot(slot) if slot else "/u/0/"
+
+
 def _profile_is_isolated_slot(profile_dir: Any) -> bool:
-    """True when the profile is a per-slot profile (one account, index 0)."""
-    if not profile_dir:
-        return True
+    """True ONLY when `profile_dir` is an isolated per-slot profile (`argon_profiles/slot-uN`)."""
+    if not profile_dir or not str(profile_dir).strip():
+        return False
     try:
         resolved = Path(str(profile_dir)).expanduser().resolve()
         return resolved.parent.name == "argon_profiles" or resolved.name.startswith("slot-")
@@ -3169,13 +3197,22 @@ def _profile_is_isolated_slot(profile_dir: Any) -> bool:
         return False
 
 
-def _normalize_gemini_chat_url(url: str, isolated_profile: bool = True) -> str:
-    """Ensure a Gemini Web URL uses `/u/0/` when opened in a 1-account isolated slot profile."""
+def _normalize_gemini_chat_url(
+    url: str,
+    isolated_profile: bool = False,
+    slot: Optional[str] = None,
+) -> str:
+    """Ensure a Gemini Web URL uses `/u/0/` in an isolated profile or `/u/<account_index>/` in the shared Argon Bridge browser."""
     raw = (url or "").strip()
-    if not raw:
+    if not raw or "gemini.google.com" not in raw.lower():
         return raw
-    if isolated_profile and "gemini.google.com" in raw.lower():
-        raw = re.sub(r"(gemini\.google\.com)/u/\d+/", r"\1/u/0/", raw, flags=re.IGNORECASE)
+    if isolated_profile:
+        return re.sub(r"(gemini\.google\.com)/u/\d+/", r"\1/u/0/", raw, flags=re.IGNORECASE)
+    if slot is not None:
+        url_slot = _url_slot_for_account(slot, isolated_profile=False)
+        if re.search(r"gemini\.google\.com/u/\d+/", raw, flags=re.IGNORECASE):
+            return re.sub(r"(gemini\.google\.com)/u/\d+/", f"\\1{url_slot}", raw, flags=re.IGNORECASE)
+        return re.sub(r"(gemini\.google\.com)/(?=app\b)", f"\\1{url_slot}", raw, flags=re.IGNORECASE)
     return raw
 
 
@@ -3536,12 +3573,7 @@ class SlotLock:
 
 
 def _profile_dir_for_slot(base_profile: Path, slot: Optional[str]) -> Path:
-    """Return the browser profile directory for `slot`.
-
-    Defaults to the isolated per-slot profile (`~/.gemini/argon_profiles/slot-uN`),
-    or returns the shared multi-account profile when opted in via `accounts_pool.json`
-    (`"shared_profile": true`) or `--shared-profile` / `ARGON_SHARED_PROFILE=1` (Section 2.3.C).
-    """
+    """Return the browser profile directory for `slot` (the shared Argon Bridge browser profile by default)."""
     base_profile = Path(base_profile).expanduser().resolve()
     try:
         cfg = PoolConfig(profile_dir_override=base_profile)
@@ -3549,13 +3581,15 @@ def _profile_dir_for_slot(base_profile: Path, slot: Optional[str]) -> Path:
             return cfg.profile_dir_for_slot(slot)
     except Exception:
         pass
-    if os.environ.get("ARGON_SHARED_PROFILE") == "1":
-        return base_profile
-    if base_profile.parent.name == "argon_profiles" and base_profile.name.startswith("slot-"):
-        root = base_profile.parent
-    else:
-        root = base_profile.parent / "argon_profiles"
-    return root / f"slot-{_slot_key(slot)}"
+    env_shared = (os.environ.get("ARGON_SHARED_PROFILE") or "").strip().lower()
+    env_mode = (os.environ.get("ARGON_PROFILE_MODE") or "").strip().lower()
+    if env_shared in ("0", "false", "no") or env_mode == "isolated":
+        if base_profile.parent.name == "argon_profiles" and base_profile.name.startswith("slot-"):
+            root = base_profile.parent
+        else:
+            root = base_profile.parent / "argon_profiles"
+        return root / f"slot-{_slot_key(slot)}"
+    return base_profile
 
 
 def _has_cookie_db(profile_dir: Path) -> bool:
@@ -4540,7 +4574,7 @@ class SessionStore:
         if clean_ws_mode not in ("task", "chat"):
             clean_ws_mode = ""
         slot_part = normalize_slot(slot) if slot else "/u/0/"
-        url_slot = "/u/0/" if _profile_is_isolated_slot(profile_dir) else slot_part
+        url_slot = _url_slot_for_account(slot_part, isolated_profile=_profile_is_isolated_slot(profile_dir))
         chat_url = f"https://gemini.google.com{url_slot}app/{chat_id}"
         now_str = time.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -4742,8 +4776,12 @@ class SessionStore:
         win_slot = normalize_slot(winning_lane.get("slot") or entry.get("slot") or "/u/0/")
         win_cid = str(winning_lane["chat_id"])
         win_prof = str(winning_lane.get("profile_dir") or entry.get("profile_dir") or "")
-        url_slot = "/u/0/" if _profile_is_isolated_slot(win_prof) else win_slot
-        win_url = str(winning_lane.get("chat_url") or f"https://gemini.google.com{url_slot}app/{win_cid}")
+        url_slot = _url_slot_for_account(win_slot, isolated_profile=_profile_is_isolated_slot(win_prof))
+        win_url = _normalize_gemini_chat_url(
+            str(winning_lane.get("chat_url") or f"https://gemini.google.com{url_slot}app/{win_cid}"),
+            isolated_profile=_profile_is_isolated_slot(win_prof),
+            slot=win_slot,
+        )
         win_title = str(winning_lane.get("chat_title") or entry.get("chat_title") or "")
         win_ws_mode = str(winning_lane.get("workspace_mode") or entry.get("workspace_mode") or "").strip().lower()
 
@@ -4798,8 +4836,12 @@ class SessionStore:
             return None
         slot_val = normalize_slot(lane_data.get("slot") or entry.get("slot") or "/u/0/")
         prof_val = str(lane_data.get("profile_dir") or entry.get("profile_dir") or "")
-        url_slot = "/u/0/" if _profile_is_isolated_slot(prof_val) else slot_val
-        chat_url = str(lane_data.get("chat_url") or entry.get("chat_url") or f"https://gemini.google.com{url_slot}app/{chat_id}")
+        url_slot = _url_slot_for_account(slot_val, isolated_profile=_profile_is_isolated_slot(prof_val))
+        chat_url = _normalize_gemini_chat_url(
+            str(lane_data.get("chat_url") or entry.get("chat_url") or f"https://gemini.google.com{url_slot}app/{chat_id}"),
+            isolated_profile=_profile_is_isolated_slot(prof_val),
+            slot=slot_val,
+        )
         ws_mode = str(lane_data.get("workspace_mode") or entry.get("workspace_mode") or "unknown").strip().lower()
         if ws_mode not in ("task", "chat"):
             ws_mode = "unknown"
@@ -7400,6 +7442,41 @@ def run_preflight_selftest_cli(headless: bool = True, require_extension: bool = 
             f"  Drive viewer/text   : OK ({len(stitched_text)} bytes stitched across {len(stitched_chunks)} pages)"
         )
 
+    # Verify Round 17 shared Argon Bridge browser profile & /u/<account_index>/ URL resolution
+    with _tempfile.TemporaryDirectory(prefix="argon_r17_st_") as r17_tmp:
+        r17_root = Path(r17_tmp)
+        r17_shared = r17_root / "argon_browser_profile"
+        (r17_shared / "Default" / "Network").mkdir(parents=True, exist_ok=True)
+        (r17_shared / "Default" / "Network" / "Cookies").write_bytes(b"SQLite format 3\x00" + b"\x01" * 128)
+        (r17_shared / "Default" / "Preferences").write_text(
+            json.dumps(
+                {
+                    "account_info": [
+                        {"email": "first@example.com", "gaia": "111"},
+                        {"email": "second@example.com", "gaia": "222"},
+                        {"email": "slot5@example.com", "gaia": "555"},
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        r17_cfg_path = r17_root / "accounts_pool.json"
+        r17_cfg_path.write_text(
+            json.dumps(
+                {
+                    "profile_dir": str(r17_shared),
+                    "active_slot": "/u/5/",
+                    "accounts": [{"index": 5, "slot": "/u/5/", "email": "slot5@example.com", "status": "active"}],
+                }
+            ),
+            encoding="utf-8",
+        )
+        r17_cfg = PoolConfig(config_path=r17_cfg_path)
+        if not r17_cfg.is_shared_profile_slot("/u/5/") or r17_cfg.get_account_index("/u/5/") != 2:
+            print("[ERROR] Round 17 shared profile account_index verification failed!", file=sys.stderr)
+            return EXIT_PREFLIGHT_FAILED
+        print("  Shared /u/<index>/  : OK (shared_profile=True by default, /u/5/ verified at browser index /u/2/)")
+
     # Run browser self-test (Playwright when available, or Selenium Chromium fallback)
     browser_ran = False
     try:
@@ -7694,40 +7771,48 @@ def _resolve_reopen_url(
     task_state: TaskState,
     session_store: SessionStore,
     isolated_profile: bool = False,
+    lane: Optional[str] = None,
 ) -> str:
     """Return the best conversation URL to reopen for an in-progress or resumed task.
 
-    `isolated_profile` must be True only for a per-slot profile (one account,
-    browser index 0). The shared master profile holds every account, so its URL
-    has to keep the slot index - defaulting to True would open the wrong one.
+    Uses `/u/0/` only for an isolated slot profile and `/u/<account_index>/` from
+    `PoolConfig.get_account_index(active_slot)` in the shared Argon Bridge browser.
+    Prioritizes the recorded `chat_id` from `TaskState` (lane-aware) so `--resume`
+    always reopens the exact recorded conversation.
     """
-    slot_part = "/u/0/" if isolated_profile else (normalize_slot(active_slot) if active_slot else "/u/0/")
+    slot_part = _url_slot_for_account(active_slot, isolated_profile=isolated_profile)
 
     def _url_for_chat_id(cid: str) -> str:
         return f"https://gemini.google.com{slot_part}app/{cid}"
 
-    # 1. Check current_url for a conversation id
-    cid = _extract_chat_id(current_url or "")
-    if cid:
-        return _url_for_chat_id(cid)
-
-    # 2. Check TaskState for a recorded chat_id or chat_url
-    ts_entry = task_state.get(proj_root) or {}
+    # 1. Check TaskState (lane-specific first, then project top-level) for a recorded chat_id
+    ts_entry = (task_state.get(proj_root, lane=lane) if lane else None) or task_state.get(proj_root) or {}
     ts_cid = str(ts_entry.get("chat_id") or "").strip() or _extract_chat_id(str(ts_entry.get("chat_url") or ""))
     if ts_cid:
         return _url_for_chat_id(ts_cid)
 
-    # 3. Check SessionStore for this project and mode
+    # 2. Check current_url for a conversation id
+    cid = _extract_chat_id(current_url or "")
+    if cid:
+        return _url_for_chat_id(cid)
+
+    # 3. Check SessionStore (lane-specific first, then project top-level) for this project and mode
     ss_entry = session_store.lookup(proj_root, mode=mode) or {}
+    if lane and isinstance(ss_entry.get("lanes"), dict):
+        ss_lane = ss_entry["lanes"].get(lane) or {}
+        if isinstance(ss_lane, dict):
+            ss_lane_cid = str(ss_lane.get("chat_id") or "").strip() or _extract_chat_id(str(ss_lane.get("chat_url") or ""))
+            if ss_lane_cid:
+                return _url_for_chat_id(ss_lane_cid)
     ss_cid = str(ss_entry.get("chat_id") or "").strip() or _extract_chat_id(str(ss_entry.get("chat_url") or ""))
     if ss_cid:
         return _url_for_chat_id(ss_cid)
 
     if ts_entry.get("chat_url"):
-        return _normalize_gemini_chat_url(str(ts_entry["chat_url"]), isolated_profile=isolated_profile)
+        return _normalize_gemini_chat_url(str(ts_entry["chat_url"]), isolated_profile=isolated_profile, slot=active_slot)
     if current_url:
-        return _normalize_gemini_chat_url(current_url, isolated_profile=isolated_profile)
-    return _normalize_gemini_chat_url(fallback_url, isolated_profile=isolated_profile)
+        return _normalize_gemini_chat_url(current_url, isolated_profile=isolated_profile, slot=active_slot)
+    return _normalize_gemini_chat_url(fallback_url, isolated_profile=isolated_profile, slot=active_slot)
 
 
 GEMINI_ERROR_MARKERS = (
@@ -8751,7 +8836,7 @@ def _start_fresh_chat(
     If not proven, opens another new chat; if it still cannot, reports the exact
     `chat_id` it ended up in and returns False (never silently continues an old chat).
     """
-    slot_part = "/u/0/" if isolated_profile else (normalize_slot(slot) if slot else "/u/0/")
+    slot_part = _url_slot_for_account(slot, isolated_profile=isolated_profile)
     app_url = f"https://gemini.google.com{slot_part}app"
     forbidden: set = set(forbidden_chat_ids or set())
     forbidden.update(_known_chat_ids_for_slot(slot))
@@ -9815,18 +9900,25 @@ def dispatch_to_argon(
                 )
                 task_registry.register_done(proj_root, lane=lane, status="superseded")
 
-    # RESUME: the browser was closed during an earlier run. The task state
-    # remembers which conversation the task was in, so the run reopens it
-    # instead of packaging and sending a second prompt.
+    # RESUME: reopen the RECORDED conversation (chat_id / chat_url from TaskState, or
+    # SessionStore fallback) instead of packaging and sending a duplicate prompt (Round 17 Section 1.7).
     resume_entry = (task_state_store.get(proj_root, lane=lane) or task_state_store.get(proj_root)) if resume else None
+    if resume and isinstance(resume_entry, dict) and not (resume_entry.get("chat_id") or resume_entry.get("chat_url")):
+        ss_fallback = session_store.lookup(proj_root, mode=mode) or {}
+        if ss_fallback.get("chat_id") or ss_fallback.get("chat_url"):
+            resume_entry = dict(resume_entry)
+            resume_entry.setdefault("chat_id", ss_fallback.get("chat_id", ""))
+            resume_entry.setdefault("chat_url", ss_fallback.get("chat_url", ""))
+            resume_entry.setdefault("slot", ss_fallback.get("slot", "/u/0/"))
     resume_chat = bool(
         resume_entry
-        and resume_entry.get("chat_url")
-        and resume_entry.get("state") in ("sent", "waiting", "delivered")
+        and (resume_entry.get("chat_id") or resume_entry.get("chat_url"))
+        and str(resume_entry.get("state") or "waiting").strip().lower()
+        in ("sent", "waiting", "delivered", "running", "delivery_failed", "failed")
     )
     if resume and not resume_chat:
         print(
-            f"[!] No unfinished task found in {task_state_store.path} for {proj_root}.",
+            f"[!] No recorded task conversation found in {task_state_store.path} for {proj_root}.",
             file=sys.stderr,
         )
         return EXIT_FAILURE
@@ -9946,6 +10038,7 @@ def dispatch_to_argon(
             task_state=task_state_store,
             session_store=session_store,
             isolated_profile=isolated_slot,
+            lane=lane,
         )
     elif is_continuation and session is not None:
         if slot is None and session.get("slot"):
@@ -9955,7 +10048,7 @@ def dispatch_to_argon(
         active_account = pool_cfg.get_by_slot(active_slot)
         target_email = active_account.get("email") if active_account else None
         isolated_slot = _profile_is_isolated_slot(slot_profile)
-        target_url = _normalize_gemini_chat_url(str(session["chat_url"]), isolated_profile=isolated_slot)
+        target_url = _normalize_gemini_chat_url(str(session["chat_url"]), isolated_profile=isolated_slot, slot=active_slot)
     else:
         pool_cfg.set_active_slot(active_slot)
         active_account = pool_cfg.get_by_slot(active_slot)
@@ -10184,6 +10277,7 @@ def dispatch_to_argon(
                 page.on("download", _on_download)
             except Exception:
                 pass
+            _install_drive_id_listener(page)
 
             # D4: Register the task as running in TaskRegistry before navigation
             task_registry.register_start(
@@ -10542,14 +10636,15 @@ def dispatch_to_argon(
                     handled_delivery_hashes.add(prev_hash)
             except Exception:
                 prev_state = {}
-            for stale in (active_downloads_dir / "apply_changes.ps1", proj_root / "downloads" / "apply_changes.ps1"):
-                try:
-                    if stale.is_file():
-                        st_txt = stale.read_text(encoding="utf-8", errors="replace")
-                        handled_delivery_hashes.add(_hash_text(st_txt))
-                        handled_delivery_hashes.add(_sha256_full(st_txt))
-                except Exception:
-                    pass
+            if not resume_chat:
+                for stale in (active_downloads_dir / "apply_changes.ps1", proj_root / "downloads" / "apply_changes.ps1"):
+                    try:
+                        if stale.is_file():
+                            st_txt = stale.read_text(encoding="utf-8", errors="replace")
+                            handled_delivery_hashes.add(_hash_text(st_txt))
+                            handled_delivery_hashes.add(_sha256_full(st_txt))
+                    except Exception:
+                        pass
 
             sent_hms = time.strftime("%H:%M:%S")
             just_sent_prompt = False
@@ -11610,26 +11705,46 @@ def dispatch_to_argon(
                     screenshot_path=str(failed_shot or ""),
                 )
                 carried = None
+                has_delivery_in_recorded_chat = bool(
+                    _generated_file_chip(page) is not None
+                    or _generated_file_chip_indices_after_user(page)
+                    or getattr(page, "_argon_chip_capture_exhausted", False)
+                    or extract_powershell_patch(previous_body)
+                )
                 if carry_over and final_state_name != "superseded":
-                    carried = _carry_over_to_new_session(
-                        page=page,
-                        prompt_text=prompt_text,
-                        proj_root=proj_root,
-                        mode=mode,
-                        slot=active_slot,
-                        email=target_email,
-                        zip_path=zip_path,
-                        manual_setup=manual_setup,
-                        task_state=task_state,
-                        session_store=session_store,
-                        previous_text=previous_body,
-                        notes=_notes_from_body(previous_body),
-                        reason=reason,
-                        task=task,
-                        target_files=target_files,
-                        profile_dir=profile_dir,
-                        diagnostic_evidence=diag_ev,
-                    )
+                    if has_delivery_in_recorded_chat:
+                        print(
+                            f"[!] Carry-over skipped: the recorded conversation ({live_url}) already has a delivery "
+                            f"chip or patch in the chat (capture failed: {reason}). Refusing to open a new session "
+                            "or re-send the prompt so a Gemini round is not wasted. Re-run with --resume to capture it.",
+                            file=sys.stderr,
+                        )
+                    else:
+                        print(
+                            f"[!] Recorded conversation ({live_url}) finished and really has no delivery "
+                            f"(0 delivery chips after the last user message and no inline patch block; reason: {reason}) - "
+                            "carrying over to a new session.",
+                            file=sys.stderr,
+                        )
+                        carried = _carry_over_to_new_session(
+                            page=page,
+                            prompt_text=prompt_text,
+                            proj_root=proj_root,
+                            mode=mode,
+                            slot=active_slot,
+                            email=target_email,
+                            zip_path=zip_path,
+                            manual_setup=manual_setup,
+                            task_state=task_state,
+                            session_store=session_store,
+                            previous_text=previous_body,
+                            notes=_notes_from_body(previous_body),
+                            reason=reason,
+                            task=task,
+                            target_files=target_files,
+                            profile_dir=profile_dir,
+                            diagnostic_evidence=diag_ev,
+                        )
                 if carried is not None:
                     delivered_path = carried
                     _, summary_text = _copy_and_save_response_summary(
@@ -11725,7 +11840,10 @@ def dispatch_to_argon(
             pass
         if context is not None:
             try:
-                _close_browser_safely(context, profile_dir)
+                if attached_to_host and host_tab_id:
+                    release_host_tab(context, page, profile_dir, tab_id=host_tab_id)
+                else:
+                    _close_browser_safely(context, profile_dir)
             except Exception:
                 pass
             context = None
@@ -11972,7 +12090,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--shared-profile",
         action="store_true",
-        help="Opt-in: run this slot as a tab inside the shared multi-account browser profile instead of an isolated slot profile.",
+        help="Run this slot as a tab inside the shared Argon Bridge browser profile (~/.gemini/argon_browser_profile; default).",
+    )
+    parser.add_argument(
+        "--isolated-profile",
+        action="store_true",
+        help="Escape hatch: run this slot in an isolated per-slot browser profile (~/.gemini/argon_profiles/slot-uN).",
+    )
+    parser.add_argument(
+        "--enable-shared-profile",
+        action="store_true",
+        help="Persist shared Argon Bridge browser mode in accounts_pool.json and record verified /u/<index>/ account indices.",
+    )
+    parser.add_argument(
+        "--reclaim-slot-profiles",
+        action="store_true",
+        help="Safely reclaim the ~68 GB of old per-slot profiles (~/.gemini/argon_profiles/slot-u*) after verifying each account is in the shared profile.",
     )
     parser.add_argument(
         "--append-followup",
@@ -12100,7 +12233,7 @@ def append_followup_to_running_task(
     prof_dir_str = str(ts_entry.get("profile_dir") or "")
     profile_dir = Path(prof_dir_str) if prof_dir_str else _profile_dir_for_slot(pool_cfg.profile_dir, eff_slot)
     isolated = _profile_is_isolated_slot(profile_dir)
-    norm_chat_url = _normalize_gemini_chat_url(chat_url, isolated_profile=isolated)
+    norm_chat_url = _normalize_gemini_chat_url(chat_url, isolated_profile=isolated, slot=eff_slot)
 
     marker_header = f"{APPEND_FOLLOWUP_MARKER} | task_id={running_task_id} | label={running_label}]"
     formatted_message = f"{marker_header}\n\n{append_text}"
@@ -12266,13 +12399,19 @@ def select_account_slot(
 
     base_prof = pool_cfg.profile_dir if pool_cfg is not None else (Path.home() / ".gemini" / "argon_browser_profile")
 
+    def _is_isolated_prof_busy(slot_str: str) -> bool:
+        c_prof = _profile_dir_for_slot(base_prof, slot_str)
+        if not _profile_is_isolated_slot(c_prof):
+            return False
+        return _profile_is_busy(c_prof)
+
     # Pass 1: Slot under MAX_TASKS_PER_SLOT with 0 running tasks, different from last_ran_slots
     for cand in ordered_pool:
         norm_c = normalize_slot(cand)
         if norm_c in last_ran_slots:
             continue
         active_on_slot = reg.active_tasks_for_slot(norm_c)
-        if len(active_on_slot) == 0 and not _profile_is_busy(_profile_dir_for_slot(base_prof, norm_c)):
+        if len(active_on_slot) == 0 and not _is_isolated_prof_busy(norm_c):
             return (
                 norm_c,
                 f"NEW-TASK policy: selected idle account {norm_c} (registry load 0/{MAX_TASKS_PER_SLOT})",
@@ -12311,7 +12450,7 @@ def select_account_slot(
         key=lambda s: (
             len(reg.active_tasks_for_slot(s)),
             1 if s in last_ran_slots else 0,
-            1 if _profile_is_busy(_profile_dir_for_slot(base_prof, s)) else 0,
+            1 if _is_isolated_prof_busy(s) else 0,
         ),
     )
     ll_count = len(reg.active_tasks_for_slot(least_loaded))
@@ -12410,11 +12549,35 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
 
-    if getattr(args, "shared_profile", False):
+    if getattr(args, "isolated_profile", False):
+        os.environ["ARGON_SHARED_PROFILE"] = "0"
+        os.environ["ARGON_PROFILE_MODE"] = "isolated"
+    elif getattr(args, "shared_profile", False):
         os.environ["ARGON_SHARED_PROFILE"] = "1"
+        os.environ["ARGON_PROFILE_MODE"] = "shared"
 
     if getattr(args, "no_extension", False):
         os.environ["ARGON_DISABLE_COMPANION_EXTENSION"] = "1"
+
+    if getattr(args, "enable_shared_profile", False):
+        cfg_en = PoolConfig()
+        rep_en = cfg_en.enable_shared_profile_mode()
+        print("=" * 78)
+        print("  ARGON BRIDGE SHARED BROWSER PROFILE ENABLED")
+        print("=" * 78)
+        print(f"  Shared profile : {rep_en['profile_dir']}")
+        print(f"  Verified slots : {len(rep_en['verified'])}")
+        for s_k, idx_v in sorted(rep_en["verified"].items()):
+            print(f"    - {s_k} -> /u/{idx_v}/")
+        if rep_en["unverified"]:
+            print(f"  Pending sign-in: {', '.join(rep_en['unverified'])}")
+        print("=" * 78)
+        return EXIT_SUCCESS
+
+    if getattr(args, "reclaim_slot_profiles", False):
+        from safe_browser import reclaim_slot_profiles_cli
+
+        return reclaim_slot_profiles_cli()
 
     if getattr(args, "self_test", False):
         return run_preflight_selftest_cli(
@@ -12426,6 +12589,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         from safe_browser import close_browser_cli
 
         return close_browser_cli(slot=args.slot, project_path=args.project_path)
+
+    if getattr(args, "close_tab", None) is not None:
+        from safe_browser import close_tab_cli
+
+        eff_tab = args.tab if args.close_tab == "__USE_TAB_ARG__" else (args.close_tab or args.tab or "")
+        return close_tab_cli(tab_id=str(eff_tab or ""), slot=args.slot, project_path=args.project_path)
+
+    if getattr(args, "list_browsers", False):
         from safe_browser import list_browsers_cli
 
         return list_browsers_cli(project_path=args.project_path)

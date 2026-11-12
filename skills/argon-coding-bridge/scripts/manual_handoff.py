@@ -278,34 +278,23 @@ def open_browser_for_slot(slot: str, chat_url: str, chrome_exe: Optional[str] = 
         print("[!] Cannot open browser: Google Chrome executable was not found.", file=sys.stderr)
         return False
 
+    from argon_pool_login import PoolConfig, is_isolated_slot_profile
+
+    cfg = PoolConfig()
     if profile_dir is None:
-        raw = (slot or "/u/0/").strip()
-        m = re.search(r"/u/(\d+)/?", raw)
-        slot_k = f"u{int(m.group(1))}" if m else (f"u{int(raw)}" if raw.isdigit() else raw.strip("/").replace("/", "-") or "u0")
-        profile_dir = Path.home() / ".gemini" / "argon_profiles" / f"slot-{slot_k}"
+        profile_dir = cfg.profile_dir_for_slot(slot or "/u/0/")
 
     profile_dir.mkdir(parents=True, exist_ok=True)
-    target_url = chat_url or "https://gemini.google.com/u/0/app"
+    default_url_slot = "/u/0/" if is_isolated_slot_profile(profile_dir) else f"/u/{cfg.get_account_index(slot)}/"
+    target_url = chat_url or f"https://gemini.google.com{default_url_slot}app"
 
-    # The CDP host: one Chrome per profile, with a debugging endpoint.
+    # The CDP host: one Chrome for the whole Argon Bridge browser, with a debugging endpoint.
     try:
-        from safe_browser import ensure_browser_host, find_chrome_pids_for_profile
+        from safe_browser import open_browser_cli
 
-        host = ensure_browser_host(profile_dir, chrome_exe=exe, headless=False)
-        if not host and find_chrome_pids_for_profile(profile_dir):
-            print(
-                "[i] A Chrome without a debugging endpoint already holds this profile - "
-                "closing it safely and starting the browser host instead."
-            )
-            from safe_browser import close_browser_safely
-
-            close_browser_safely(context=None, profile_dir=profile_dir)
-            host = ensure_browser_host(profile_dir, chrome_exe=exe, headless=False)
-        if host:
-            http_ep = str(host.get("http_endpoint") or "")
-            print(f"[+] Browser opened in real Chrome profile for slot {slot} and left open.")
+        if open_browser_cli(slot=slot, profile_dir=profile_dir, url=target_url) == 0:
+            print(f"[+] Browser opened in Argon Bridge profile for slot {slot} and left open.")
             print(f"    Chat URL: {target_url}")
-            print(f"    Debug endpoint: {http_ep}")
             return True
         print(
             "[!] The browser host could not be started for this profile; falling back to "
@@ -377,7 +366,19 @@ def run_manual_handoff_cli(
                 email = str(acc.get("email") or "")
                 break
 
-    chat_url = task_entry.get("chat_url") or sess_entry.get("chat_url") or "https://gemini.google.com/u/0/app"
+    from argon_pool_login import is_isolated_slot_profile
+
+    profile_dir = (
+        pool_cfg.profile_dir_for_slot(eff_slot)
+        if pool_cfg is not None
+        else (Path.home() / ".gemini" / "argon_browser_profile")
+    )
+    url_slot = (
+        "/u/0/"
+        if is_isolated_slot_profile(profile_dir)
+        else f"/u/{pool_cfg.get_account_index(eff_slot) if pool_cfg is not None else 0}/"
+    )
+    chat_url = task_entry.get("chat_url") or sess_entry.get("chat_url") or f"https://gemini.google.com{url_slot}app"
 
     prompt_text = str(task_entry.get("task") or "").strip()
     prompt_path = None
@@ -411,7 +412,6 @@ def run_manual_handoff_cli(
                 last_screenshot = shots[0]
 
     chrome_exe = find_chrome_executable()
-    profile_dir = Path.home() / ".gemini" / "argon_profiles" / f"slot-{_slot_key(eff_slot)}"
 
     md_path, json_path = write_manual_handoff_pack(
         proj_root=proj_root,

@@ -47,28 +47,32 @@ GOOGLE_ADD_SESSION_URL = (
     "https://accounts.google.com/ServiceLogin"
     "?continue=https%3A%2F%2Fgemini.google.com%2Fu%2F0%2Fapp"
 )
+GOOGLE_ADD_MULTI_SESSION_URL = (
+    "https://accounts.google.com/AddSession"
+    "?hl=en&continue=https%3A%2F%2Fgemini.google.com%2Fapp"
+)
 GEMINI_WEB_URL = "https://gemini.google.com{slot}app"
 
 
 def is_isolated_slot_profile(profile_dir: Optional[Union[str, Path]]) -> bool:
-    """Return True when profile_dir is a per-slot profile (holds one account at index 0)."""
-    if profile_dir is None:
-        return True
+    """Return True ONLY when profile_dir is an isolated per-slot profile (argon_profiles/slot-uN)."""
+    if profile_dir is None or not str(profile_dir).strip():
+        return False
     try:
-        resolved = Path(profile_dir).expanduser().resolve()
+        resolved = Path(str(profile_dir)).expanduser().resolve()
         return resolved.parent.name == "argon_profiles" or resolved.name.startswith("slot-")
     except Exception:
         return False
 
 
 def build_signin_url(isolated_profile: bool = True) -> str:
-    """Return the Google sign-in URL for a slot profile.
+    """Return the Google sign-in URL for a slot or shared Argon Bridge browser profile.
 
-    Never derives `authuser` from the slot number: in a per-slot profile the
-    account index is always 0, the `continue` target is
-    `https://gemini.google.com/u/0/app`, and no `authuser` parameter is sent.
+    In isolated mode, uses `ServiceLogin` targeting `https://gemini.google.com/u/0/app`, and no `authuser` parameter is sent.
+    In shared multi-account mode, uses `AddSession` so every pooled account is added into the single
+    shared Argon Bridge browser profile without redirecting to an already-signed-in account.
     """
-    return GOOGLE_ADD_SESSION_URL
+    return GOOGLE_ADD_SESSION_URL if isolated_profile else GOOGLE_ADD_MULTI_SESSION_URL
 
 
 def sanitize_signin_url(url: str, isolated_profile: bool = True) -> str:
@@ -514,12 +518,14 @@ class PoolConfig:
             self.data = json.loads(raw_text)
         else:
             self.data = {
-                "version": "1.3.0",
+                "version": "1.4.0",
                 "description": (
                     "Multi-Account Pool configuration for the Gemini 4 Argon Dispatcher. "
-                    "Each Google account runs in its own isolated slot profile."
+                    "All Google accounts share the single Argon Bridge browser profile and switch via verified /u/<index>/ paths."
                 ),
                 "profile_dir": "~/.gemini/argon_browser_profile",
+                "shared_profile": True,
+                "profile_mode": "shared",
                 "active_slot": "/u/0/",
                 "accounts": [],
             }
@@ -585,26 +591,61 @@ class PoolConfig:
         return self.data.setdefault("accounts", [])
 
     def is_shared_profile_slot(self, slot: Optional[Union[str, int]] = None) -> bool:
-        """Return True when `slot` is configured to run inside the shared multi-account profile (Section 2.3.C)."""
-        if os.environ.get("ARGON_SHARED_PROFILE") == "1":
-            return True
-        if bool(self.data.get("shared_profile")) or str(self.data.get("profile_mode") or "").lower() == "shared":
+        """Return True when `slot` runs inside the shared Argon Bridge browser profile (Round 17 Section 1.1).
+
+        TRUE by default for every slot so the whole bridge uses ONE Chrome process (`~/.gemini/argon_browser_profile`).
+        Preserves escape hatches (`ARGON_SHARED_PROFILE=0` / `ARGON_PROFILE_MODE=isolated` or per-account/top-level
+        `shared_profile: false` / `profile_mode: "isolated"`).
+        """
+        env_shared = (os.environ.get("ARGON_SHARED_PROFILE") or "").strip().lower()
+        env_mode = (os.environ.get("ARGON_PROFILE_MODE") or "").strip().lower()
+        if env_shared in ("0", "false", "no") or env_mode == "isolated":
+            return False
+        if env_shared in ("1", "true", "yes") or env_mode == "shared":
             return True
         target_slot = normalize_slot(slot) if slot is not None and str(slot).strip() else self.active_slot()
         acc = self.get_by_slot(target_slot)
         if isinstance(acc, dict):
-            if bool(acc.get("shared_profile")) or str(acc.get("profile_mode") or "").lower() == "shared":
+            acc_mode = str(acc.get("profile_mode") or "").strip().lower()
+            if acc.get("shared_profile") is False or acc_mode == "isolated":
+                return False
+            if bool(acc.get("shared_profile")) or acc_mode == "shared":
                 return True
-        return False
+        top_mode = str(self.data.get("profile_mode") or "").strip().lower()
+        if self.data.get("shared_profile") is False or top_mode == "isolated":
+            return False
+        if bool(self.data.get("shared_profile")) or top_mode == "shared":
+            return True
+        return True
 
     def get_account_index(self, slot: Optional[Union[str, int]] = None) -> int:
-        """Return the Gemini `/u/<index>/` account index owned by `slot` in its profile (Section 2.3.C)."""
+        """Return the verified Gemini `/u/<index>/` account index owned by `slot` in the shared Argon Bridge browser."""
         target_slot = normalize_slot(slot) if slot is not None and str(slot).strip() else self.active_slot()
-        acc = self.get_by_slot(target_slot)
-        if isinstance(acc, dict) and isinstance(acc.get("account_index"), int):
-            return int(acc["account_index"])
         if not self.is_shared_profile_slot(target_slot):
             return 0
+        acc = self.get_by_slot(target_slot)
+        if isinstance(acc, dict):
+            email = str(acc.get("email") or "").strip()
+            if email:
+                try:
+                    from safe_browser import verify_account_index_in_preferences
+
+                    _, found_idx, _ = verify_account_index_in_preferences(self.profile_dir, email)
+                    if found_idx is not None:
+                        if acc.get("account_index") != int(found_idx):
+                            acc["account_index"] = int(found_idx)
+                            if self.path.exists():
+                                try:
+                                    self.save()
+                                except Exception:
+                                    pass
+                        return int(found_idx)
+                except Exception:
+                    pass
+            if isinstance(acc.get("account_index"), int):
+                return int(acc["account_index"])
+            if isinstance(acc.get("index"), int):
+                return int(acc["index"])
         s_num = slot_number(target_slot)
         return s_num if s_num is not None else 0
 
@@ -615,11 +656,48 @@ class PoolConfig:
             acc["account_index"] = int(account_index)
             self.save()
 
+    def enable_shared_profile_mode(self) -> Dict[str, Any]:
+        """Persist shared-profile mode in `accounts_pool.json` and sync account_index from Default/Preferences."""
+        self.data["shared_profile"] = True
+        self.data["profile_mode"] = "shared"
+        verified_map: Dict[str, int] = {}
+        unverified_slots: List[str] = []
+        try:
+            from safe_browser import verify_account_index_in_preferences
+        except Exception:
+            verify_account_index_in_preferences = None  # type: ignore
+
+        for acc in self.accounts:
+            if not isinstance(acc, dict):
+                continue
+            s_norm = normalize_slot(acc.get("slot", f"/u/{acc.get('index', 0)}/"))
+            acc.pop("profile_dir", None)
+            acc["shared_profile"] = True
+            acc["profile_mode"] = "shared"
+            email = str(acc.get("email") or "").strip()
+            found_idx = None
+            if email and verify_account_index_in_preferences is not None:
+                try:
+                    _, found_idx, _ = verify_account_index_in_preferences(self.profile_dir, email)
+                except Exception:
+                    found_idx = None
+            if found_idx is not None:
+                acc["account_index"] = int(found_idx)
+                verified_map[s_norm] = int(found_idx)
+            else:
+                unverified_slots.append(s_norm)
+        self.save()
+        return {
+            "profile_dir": str(self.profile_dir),
+            "verified": verified_map,
+            "unverified": unverified_slots,
+        }
+
     def profile_dir_for_slot(self, slot: Optional[Union[str, int]] = None) -> Path:
-        """Return the browser profile directory for `slot` (per-slot by default, or shared when opted in)."""
+        """Return the browser profile directory for `slot` (shared Argon Bridge profile by default)."""
         target_slot = normalize_slot(slot) if slot is not None and str(slot).strip() else self.active_slot()
         acc = self.get_by_slot(target_slot)
-        if isinstance(acc, dict) and acc.get("profile_dir"):
+        if isinstance(acc, dict) and acc.get("profile_dir") and not self.is_shared_profile_slot(target_slot):
             return Path(str(acc["profile_dir"])).expanduser().resolve()
         if self.is_shared_profile_slot(target_slot):
             return self.profile_dir
@@ -1071,6 +1149,9 @@ class GoogleLogin:
             for token in (
                 "/signin/identifier",
                 "/signin/v2/identifier",
+                "/v3/signin",
+                "/signin/",
+                "/addsession",
                 "/servicelogin",
                 "/challenge/",
                 "/signin/rejected",
@@ -1443,11 +1524,21 @@ class GoogleLogin:
                 _emit("Detected rejected or authuser-bound sign-in URL; retrying sanitized sign-in URL without clearing session cookies...")
                 page.goto(sanitize_signin_url(signin_url, isolated_profile=isolated_prof), wait_until="domcontentloaded", timeout=45000)
                 page.wait_for_timeout(800)
+                cur_url = (page.url or "").lower()
 
-            # If Google displays an account chooser first, click "Use another account"
+            # In shared multi-account mode, if ServiceLogin redirected straight to Gemini because
+            # an earlier account is already signed in, force AddSession so this account is added too.
+            ident_locator = page.locator("input#identifierId, input[type='email']")
+            if (ident_locator.count() == 0 or not ident_locator.first.is_visible()) and not isolated_prof:
+                if "gemini.google.com" in cur_url or "myaccount.google.com" in cur_url:
+                    _emit("Shared profile already has an active session; opening Google AddSession flow to add this account...")
+                    page.goto(GOOGLE_ADD_MULTI_SESSION_URL, wait_until="domcontentloaded", timeout=45000)
+                    page.wait_for_timeout(800)
+
+            # If Google displays an account chooser first, click "Use another account" / "Add another account"
             ident_locator = page.locator("input#identifierId, input[type='email']")
             if ident_locator.count() == 0 or not ident_locator.first.is_visible():
-                for text_cand in ("Use another account", "Add account"):
+                for text_cand in ("Use another account", "Add another account", "Add account", "অন্য অ্যাকাউন্ট ব্যবহার করুন"):
                     cand = page.get_by_text(text_cand, exact=False)
                     if cand.count() > 0 and cand.first.is_visible():
                         cand.first.click(timeout=5000)
@@ -1681,17 +1772,45 @@ class GoogleLogin:
                     slot=slot,
                 )
             else:
-                if use_slot_profiles:
-                    slot_profile = self.pool_config.profile_dir_for_slot(slot)
-                    if is_profile_busy(slot_profile):
+                slot_profile = self.pool_config.profile_dir_for_slot(slot) if use_slot_profiles else self.profile_dir
+                already_open_here = bool(
+                    self.context is not None and self.profile_dir.resolve() == slot_profile.resolve()
+                )
+                if not already_open_here and is_profile_busy(slot_profile):
+                    res = LoginResult(
+                        status=STATUS_FAILED,
+                        detail=f"Profile {slot_profile} for {slot} is currently in use by another browser. Close it with --close-browser first.",
+                        email=email,
+                        slot=slot,
+                    )
+                else:
+                    if use_slot_profiles:
+                        self.switch_to_slot_profile(slot, reset_accounts=False)
+                    else:
+                        self.start()
+
+                    # Check if this account is already signed in and verified in Default/Preferences
+                    already_verified_idx: Optional[int] = None
+                    try:
+                        from safe_browser import verify_account_index_in_preferences
+
+                        ok_pre, pre_idx, _ = verify_account_index_in_preferences(slot_profile, email)
+                        if ok_pre and pre_idx is not None:
+                            chk_idx = 0 if is_isolated_slot_profile(slot_profile) else pre_idx
+                            if self.verify_session(expected_email=email, expected_index=chk_idx):
+                                already_verified_idx = pre_idx
+                    except Exception:
+                        already_verified_idx = None
+
+                    if already_verified_idx is not None:
+                        self.pool_config.set_account_index(slot, already_verified_idx)
                         res = LoginResult(
-                            status=STATUS_FAILED,
-                            detail=f"Slot profile {slot_profile} for {slot} is currently in use by another browser.",
+                            status=STATUS_OK,
+                            detail=f"Verified existing signed-in session for {email} at /u/{already_verified_idx}/ in {slot_profile.name}.",
                             email=email,
                             slot=slot,
                         )
                     else:
-                        self.switch_to_slot_profile(slot, reset_accounts=False)
                         res = self.login(
                             email=email,
                             password=password,
@@ -1700,42 +1819,43 @@ class GoogleLogin:
                             on_status=on_status,
                         )
                         res.slot = slot
-                        expected_idx = 0 if is_isolated_slot_profile(slot_profile) else slot_number(slot)
-                        if res.status == STATUS_OK and not self.verify_session(expected_email=email, expected_index=expected_idx):
-                            diag_reason = getattr(self, "last_session_diagnosis", "guest page or unverified session")
-                            res.status = STATUS_FAILED
-                            res.detail = (
-                                (res.detail + " | " if res.detail else "")
-                                + f"session verification failed: {diag_reason}"
-                            )
-                        elif res.status == STATUS_OK:
+                        found_idx: Optional[int] = None
+                        if res.status == STATUS_OK:
                             try:
                                 from safe_browser import verify_account_index_in_preferences
 
-                                _, found_idx, _ = verify_account_index_in_preferences(slot_profile, email)
+                                for _ in range(10):
+                                    _, found_idx, _ = verify_account_index_in_preferences(slot_profile, email)
+                                    if found_idx is not None:
+                                        break
+                                    time.sleep(0.5)
                                 if found_idx is not None:
                                     self.pool_config.set_account_index(slot, found_idx)
                             except Exception:
-                                pass
-                else:
-                    self.start()
-                    res = self.login(
-                        email=email,
-                        password=password,
-                        wait_minutes=wait_minutes,
-                        on_challenge=on_challenge,
-                        on_status=on_status,
-                    )
-                    res.slot = slot
-                    if res.status == STATUS_OK:
-                        try:
-                            from safe_browser import verify_account_index_in_preferences
+                                found_idx = None
+                            expected_idx = (
+                                0
+                                if is_isolated_slot_profile(slot_profile)
+                                else (found_idx if found_idx is not None else self.pool_config.get_account_index(slot))
+                            )
+                            if not self.verify_session(expected_email=email, expected_index=expected_idx):
+                                diag_reason = getattr(self, "last_session_diagnosis", "guest page or unverified session")
+                                res.status = STATUS_FAILED
+                                res.detail = (
+                                    (res.detail + " | " if res.detail else "")
+                                    + f"session verification failed: {diag_reason}"
+                                )
+                            else:
+                                if found_idx is None:
+                                    try:
+                                        from safe_browser import verify_account_index_in_preferences
 
-                            _, found_idx, _ = verify_account_index_in_preferences(self.profile_dir, email)
-                            if found_idx is not None:
-                                self.pool_config.set_account_index(slot, found_idx)
-                        except Exception:
-                            pass
+                                        _, found_idx, _ = verify_account_index_in_preferences(slot_profile, email)
+                                    except Exception:
+                                        found_idx = None
+                                rec_idx = found_idx if found_idx is not None else expected_idx
+                                self.pool_config.set_account_index(slot, int(rec_idx))
+                                res.detail = f"{res.detail} (recorded account_index=/u/{int(rec_idx)}/)"
 
             status_map = {
                 STATUS_OK: "active",
@@ -1758,7 +1878,7 @@ class GoogleLogin:
         return results
 
     def open_gemini(self, slot: Optional[str] = None) -> Any:
-        """Open Gemini Web (https://gemini.google.com/u/0/app) in the slot's persistent profile."""
+        """Open Gemini Web (https://gemini.google.com/u/<account_index>/app) in the slot's persistent profile."""
         if slot:
             try:
                 self.pool_config.set_active_slot(slot)
@@ -1767,7 +1887,10 @@ class GoogleLogin:
         slot_part = normalize_slot(slot) if slot else self.pool_config.active_slot()
         self.switch_to_slot_profile(slot_part)
         page = self._active_page()
-        url_slot = "/u/0/" if is_isolated_slot_profile(self.profile_dir) else slot_part
+        if is_isolated_slot_profile(self.profile_dir):
+            url_slot = "/u/0/"
+        else:
+            url_slot = f"/u/{self.pool_config.get_account_index(slot_part)}/"
         page.goto(GEMINI_WEB_URL.format(slot=url_slot), wait_until="domcontentloaded", timeout=45000)
         return page
 
@@ -1784,7 +1907,7 @@ class GoogleLogin:
 
 
 def is_signed_in(profile_dir: Optional[Union[str, Path]] = None, slot: Optional[str] = None) -> bool:
-    """Module-level helper to check whether the slot (or base) pool profile is signed into Google."""
+    """Module-level helper to check whether the slot (or shared Argon Bridge) profile is signed into Google."""
     cfg = PoolConfig(profile_dir_override=profile_dir)
     if profile_dir is not None:
         target_profile = Path(profile_dir).expanduser().resolve()
@@ -1796,19 +1919,32 @@ def is_signed_in(profile_dir: Optional[Union[str, Path]] = None, slot: Optional[
 
 
 def open_gemini(profile_dir: Optional[Union[str, Path]] = None, slot: Optional[str] = None) -> None:
-    """Launch Chrome on the slot profile directory directly at https://gemini.google.com/u/<slot>/app."""
+    """Open the shared Argon Bridge browser (or isolated slot profile) at `https://gemini.google.com/u/<account_index>/app` and leave it running."""
     cfg = PoolConfig(profile_dir_override=profile_dir)
     slot_part = cfg.set_active_slot(slot) if slot else cfg.active_slot()
     if profile_dir is not None:
         target_profile = Path(profile_dir).expanduser().resolve()
     else:
         target_profile = cfg.profile_dir_for_slot(slot_part)
-        if not (target_profile.is_dir() and (target_profile / "Default").is_dir()):
+        if is_isolated_slot_profile(target_profile) and not (
+            target_profile.is_dir() and (target_profile / "Default").is_dir()
+        ):
             seed_slot_profile(cfg.profile_dir, target_profile)
-    # The slot profile holds exactly ONE Google account, and /u/N/ is an index
-    # into the account list of THIS browser - so it must be /u/0/. Opening
-    # /u/<n>/ here lands on the anonymous guest page.
-    _launch_detached_browser(target_profile, GEMINI_WEB_URL.format(slot="/u/0/"))
+    url_slot = (
+        "/u/0/"
+        if is_isolated_slot_profile(target_profile)
+        else f"/u/{cfg.get_account_index(slot_part)}/"
+    )
+    target_url = GEMINI_WEB_URL.format(slot=url_slot)
+    try:
+        from safe_browser import open_browser_cli
+
+        rc = open_browser_cli(slot=slot_part, profile_dir=target_profile, url=target_url)
+        if rc == 0:
+            return
+    except Exception:
+        pass
+    _launch_detached_browser(target_profile, target_url)
 
 
 def open_aistudio(profile_dir: Optional[Union[str, Path]] = None, slot: Optional[str] = None) -> None:
@@ -1932,6 +2068,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional path to accounts_pool.json.",
     )
+    parser.add_argument(
+        "--enable-shared-profile",
+        action="store_true",
+        help="Switch accounts_pool.json to the shared Argon Bridge browser profile and sync verified /u/<index>/ indices from Default/Preferences.",
+    )
+    parser.add_argument(
+        "--reclaim-slot-profiles",
+        action="store_true",
+        help="Safely reclaim the ~68 GB of old per-slot profiles (~/.gemini/argon_profiles/slot-u*) after verifying each account is signed into the shared profile.",
+    )
     return parser
 
 
@@ -1940,6 +2086,26 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     pool_cfg = PoolConfig(config_path=args.config, profile_dir_override=args.profile_dir)
+
+    if getattr(args, "enable_shared_profile", False):
+        rep = pool_cfg.enable_shared_profile_mode()
+        print("=" * 72)
+        print("  ARGON BRIDGE SHARED BROWSER PROFILE ENABLED")
+        print("=" * 72)
+        print(f"  Shared profile : {rep['profile_dir']}")
+        print(f"  Verified slots : {len(rep['verified'])}")
+        for s_k, idx_v in sorted(rep["verified"].items()):
+            print(f"    - {s_k} -> /u/{idx_v}/")
+        if rep["unverified"]:
+            print(f"  Pending sign-in: {', '.join(rep['unverified'])} (run with --all to sign in)")
+        print("=" * 72)
+        if not (args.all or args.slot or args.add or args.import_file or getattr(args, "reclaim_slot_profiles", False)):
+            return 0
+
+    if getattr(args, "reclaim_slot_profiles", False):
+        from safe_browser import reclaim_slot_profiles_cli
+
+        return reclaim_slot_profiles_cli(profile_dir=pool_cfg.profile_dir)
 
     target_accounts: List[Dict[str, Any]] = []
 

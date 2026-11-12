@@ -48,6 +48,8 @@ from dispatch_argon import (
     _pool_slots_in_order,
     _profile_dir_for_slot,
     _profile_is_busy,
+    _profile_is_isolated_slot,
+    _url_slot_for_account,
     build_followup_prompt,
     build_new_session_prompt,
     build_surgical_prompt,
@@ -89,7 +91,7 @@ def _is_slot_free(base_profile: Path, slot: str, require_zero_tasks: bool = Fals
     if not ok_reg:
         return False
     slot_prof = _profile_dir_for_slot(base_profile, norm)
-    if _profile_is_busy(slot_prof):
+    if _profile_is_isolated_slot(slot_prof) and _profile_is_busy(slot_prof):
         return False
     lock = SlotLock(norm, profile_dir=slot_prof)
     if not lock.acquire(slot_prof):
@@ -160,7 +162,12 @@ def pick_new_session_slot(
         candidates,
         key=lambda c: (
             len(reg.active_tasks_for_slot(c)),
-            1 if _profile_is_busy(_profile_dir_for_slot(base_profile, c)) else 0,
+            1
+            if (
+                _profile_is_isolated_slot(_profile_dir_for_slot(base_profile, c))
+                and _profile_is_busy(_profile_dir_for_slot(base_profile, c))
+            )
+            else 0,
         ),
     )
     ll_load = len(reg.active_tasks_for_slot(least_loaded))

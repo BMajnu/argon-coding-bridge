@@ -36,12 +36,14 @@ except ImportError:
 from argon_pool_login import (
     CHROME_LAUNCH_ARGS,
     GEMINI_WEB_URL,
+    GOOGLE_ADD_MULTI_SESSION_URL,
     GOOGLE_ADD_SESSION_URL,
     STATUS_OK,
     GoogleLogin,
     LoginResult,
     PoolConfig,
     find_chrome_executable,
+    is_isolated_slot_profile,
     is_profile_busy,
     reset_slot_profile_accounts,
     seed_slot_profile,
@@ -715,16 +717,27 @@ class PoolLoginAssistantApp:
         allowed_badge_statuses = {"active", "signed_in", "configured", "not_signed_in", "failed", "needs_human"}
         status = raw_status if raw_status.lower() in allowed_badge_statuses else "signed_in"
 
-        self.slot_label.configure(text=f"Slot {slot}")
+        rec_idx = acc.get("account_index")
+        if self.pool_config.is_shared_profile_slot(slot):
+            eff_idx = self.pool_config.get_account_index(slot)
+            rec_idx = acc.get("account_index")
+            idx_badge = f"/u/{rec_idx}/" if isinstance(rec_idx, int) else f"/u/{eff_idx}/ (unverified)"
+            self.slot_label.configure(text=f"Slot {slot}  •  Index {idx_badge}")
+        else:
+            self.slot_label.configure(text=f"Slot {slot}")
         self.tier_label.configure(text=tier)
         self.role_label.configure(text=f"{role}  •  {status}")
         self.counter_label.configure(text=f"Account {self.current_index + 1} of {total}")
         self.email_var.set(acc.get("email", ""))
         self.password_var.set(acc.get("password", ""))
         try:
-            self.profile_dir_label.configure(
-                text=f"Slot Profile: {self.pool_config.profile_dir_for_slot(slot)}"
-            )
+            prof_for_slot = self.pool_config.profile_dir_for_slot(slot)
+            if self.pool_config.is_shared_profile_slot(slot):
+                self.profile_dir_label.configure(
+                    text=f"Shared Argon Bridge Profile: {prof_for_slot} (Index /u/{self.pool_config.get_account_index(slot)}/)"
+                )
+            else:
+                self.profile_dir_label.configure(text=f"Slot Profile: {prof_for_slot}")
         except Exception:
             pass
 
@@ -773,50 +786,52 @@ class PoolLoginAssistantApp:
         acc = self._current_account()
         target_slot = slot or (acc.get("slot", "/u/0/") if acc else self.pool_config.active_slot())
         profile_dir = self.pool_config.profile_dir_for_slot(target_slot)
-        if is_profile_busy(profile_dir):
-            self.set_status(
-                f"Slot {target_slot} profile ({profile_dir}) is busy in another run.",
-                "#fbbf24",
-            )
-            return
-        if not (profile_dir.is_dir() and (profile_dir / "Default").is_dir()):
+        if is_isolated_slot_profile(profile_dir) and not (profile_dir.is_dir() and (profile_dir / "Default").is_dir()):
             seed_slot_profile(self.pool_config.profile_dir, profile_dir)
         profile_dir.mkdir(parents=True, exist_ok=True)
-        chrome_exe = find_chrome_executable()
-        if chrome_exe:
+
+        def _bg_open() -> None:
             try:
-                subprocess.Popen(
-                    [
-                        chrome_exe,
-                        f"--user-data-dir={profile_dir}",
-                        *CHROME_LAUNCH_ARGS,
-                        url,
-                    ],
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-                self.set_status(
-                    f"Opened {description} in Google Chrome (slot profile {profile_dir.name}).",
-                    "#34d399",
+                from safe_browser import open_browser_cli
+
+                rc = open_browser_cli(slot=target_slot, profile_dir=profile_dir, url=url)
+                if rc == 0:
+                    self.set_status_threadsafe(
+                        f"Opened {description} in Argon Bridge browser ({profile_dir.name}).",
+                        "#34d399",
+                    )
+                    return
+            except Exception:
+                pass
+            if is_profile_busy(profile_dir):
+                self.set_status_threadsafe(
+                    f"Profile ({profile_dir}) is busy in a non-host browser. Close it with --close-browser first.",
+                    "#fbbf24",
                 )
                 return
-            except Exception as exc:
-                self.set_status(f"Failed to launch Chrome directly: {exc}", "#f87171")
+            chrome_exe = find_chrome_executable()
+            if chrome_exe:
+                try:
+                    subprocess.Popen(
+                        [
+                            chrome_exe,
+                            f"--user-data-dir={profile_dir}",
+                            *CHROME_LAUNCH_ARGS,
+                            url,
+                        ],
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                    self.set_status_threadsafe(
+                        f"Opened {description} in Google Chrome ({profile_dir.name}).",
+                        "#34d399",
+                    )
+                    return
+                except Exception as exc:
+                    self.set_status_threadsafe(f"Failed to launch Chrome directly: {exc}", "#f87171")
 
-        def _bg() -> None:
-            try:
-                gl = GoogleLogin(profile_dir=profile_dir, pool_config=self.pool_config, slot=target_slot)
-                page = gl._active_page()
-                page.goto(url, wait_until="domcontentloaded")
-                self.set_status_threadsafe(
-                    f"Opened {description} in Playwright Chromium ({profile_dir.name}).",
-                    "#34d399",
-                )
-            except Exception as exc:
-                self.set_status_threadsafe(f"Error opening browser: {exc}", "#f87171")
-
-        threading.Thread(target=_bg, daemon=True).start()
+        threading.Thread(target=_bg_open, daemon=True).start()
 
     def open_add_account_page(self) -> None:
         acc = self._current_account()
@@ -824,18 +839,24 @@ class PoolLoginAssistantApp:
         if acc:
             self.copy_email()
         profile_dir = self.pool_config.profile_dir_for_slot(slot)
-        if not is_profile_busy(profile_dir):
+        isolated = is_isolated_slot_profile(profile_dir)
+        if isolated and not is_profile_busy(profile_dir):
             if not (profile_dir.is_dir() and (profile_dir / "Default").is_dir()):
                 seed_slot_profile(self.pool_config.profile_dir, profile_dir)
             reset_slot_profile_accounts(profile_dir, clear_cookies=True)
-        self._launch_chrome_url(GOOGLE_ADD_SESSION_URL, "Google Add Account Page", slot=slot)
+        add_url = GOOGLE_ADD_SESSION_URL if isolated else GOOGLE_ADD_MULTI_SESSION_URL
+        self._launch_chrome_url(add_url, "Google Add Account Page", slot=slot)
 
     def open_gemini_web(self) -> None:
         acc = self._current_account()
         slot = self.pool_config.set_active_slot(acc.get("slot", "/u/0/")) if acc else self.pool_config.active_slot()
-        # A per-slot profile holds exactly one account at index 0. Opening /u/<N>/
-        # lands on the guest page and makes manual sign-in fail with authuser=N.
-        url = GEMINI_WEB_URL.format(slot="/u/0/")
+        profile_dir = self.pool_config.profile_dir_for_slot(slot)
+        url_slot = (
+            "/u/0/"
+            if is_isolated_slot_profile(profile_dir)
+            else f"/u/{self.pool_config.get_account_index(slot)}/"
+        )
+        url = GEMINI_WEB_URL.format(slot=url_slot)
         self._launch_chrome_url(url, f"Gemini Web ({slot} -> {url})", slot=slot)
 
     def open_ai_studio(self) -> None:

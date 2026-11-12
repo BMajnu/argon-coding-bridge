@@ -647,22 +647,109 @@ def _format_tab_owners(tabs: Dict[str, Any]) -> str:
     return ", ".join(parts) if parts else "none"
 
 
+def _discover_running_cdp_endpoint(
+    prof: Path,
+    existing_state: Optional[Dict[str, Any]] = None,
+    existing_pids: Optional[List[int]] = None,
+) -> Optional[Tuple[str, Dict[str, Any]]]:
+    """Discover a live CDP HTTP endpoint for a Chrome process already running on `prof`."""
+    candidate_endpoints: List[str] = []
+    if isinstance(existing_state, dict):
+        ep_raw = str(existing_state.get("http_endpoint") or "").strip()
+        if ep_raw:
+            candidate_endpoints.append(ep_raw)
+        port_raw = existing_state.get("port")
+        if port_raw and str(port_raw).isdigit():
+            ep_port = f"http://127.0.0.1:{int(port_raw)}"
+            if ep_port not in candidate_endpoints:
+                candidate_endpoints.append(ep_port)
+
+    devtools_port_file = prof / "DevToolsActivePort"
+    if devtools_port_file.is_file():
+        try:
+            lines = devtools_port_file.read_text(encoding="utf-8", errors="ignore").splitlines()
+            if lines and lines[0].strip().isdigit():
+                dt_port = int(lines[0].strip())
+                if dt_port > 0:
+                    ep_dt = f"http://127.0.0.1:{dt_port}"
+                    if ep_dt not in candidate_endpoints:
+                        candidate_endpoints.append(ep_dt)
+        except Exception:
+            pass
+
+    try:
+        import psutil  # type: ignore
+
+        for pid in (existing_pids or []):
+            try:
+                cmdline = " ".join(psutil.Process(int(pid)).cmdline() or [])
+                m_port = re.search(r"--remote-debugging-port=(\d+)", cmdline)
+                if m_port:
+                    ep_cmd = f"http://127.0.0.1:{int(m_port.group(1))}"
+                    if ep_cmd not in candidate_endpoints:
+                        candidate_endpoints.append(ep_cmd)
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    for ep in candidate_endpoints:
+        for timeout_s in (2.0, 3.5):
+            probed = probe_cdp_endpoint(ep, timeout=timeout_s)
+            if probed is not None:
+                return ep, probed
+    return None
+
+
 def ensure_browser_host(
     profile_dir: Union[str, Path],
     chrome_exe: Optional[str] = None,
     headless: bool = False,
     extra_args: Optional[List[str]] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Ensure a single detached Chrome host with `--remote-debugging-port` is running for `profile_dir`."""
+    """Ensure the single detached Argon Bridge Chrome host with `--remote-debugging-port` is running for `profile_dir`.
+
+    In shared mode the Argon Bridge browser is supposed to stay running across accounts and tasks,
+    so when Chrome is already running on `profile_dir` and publishes a CDP endpoint (in `.argon_browser_endpoint`,
+    `DevToolsActivePort`, or `--remote-debugging-port`), this function attaches to it and returns its host state.
+    Only refuses (`return None`) when a running Chrome on `profile_dir` publishes no CDP endpoint at all.
+    """
     prof = Path(profile_dir).expanduser().resolve()
     prof.mkdir(parents=True, exist_ok=True)
 
     existing = read_host_state(prof)
     if existing:
-        probed = probe_cdp_endpoint(str(existing.get("http_endpoint") or ""))
+        probed = probe_cdp_endpoint(str(existing.get("http_endpoint") or ""), timeout=2.5)
         if probed is not None:
             existing["ws_endpoint"] = probed.get("ws_endpoint") or existing.get("ws_endpoint", "")
             return existing
+
+    existing_pids = find_chrome_pids_for_profile(prof)
+    if existing_pids:
+        discovered = _discover_running_cdp_endpoint(prof, existing_state=existing, existing_pids=existing_pids)
+        if discovered is not None:
+            http_ep, probed_info = discovered
+            m_p = re.search(r":(\d+)$", http_ep)
+            port_val = int(m_p.group(1)) if m_p else int((existing or {}).get("port") or 0)
+            ext_dir_existing = get_companion_extension_dir()
+            recovered_state: Dict[str, Any] = {
+                "profile_dir": str(prof),
+                "pid": int(existing_pids[0]),
+                "pids": [int(p) for p in existing_pids],
+                "port": port_val,
+                "http_endpoint": http_ep,
+                "ws_endpoint": str(probed_info.get("ws_endpoint") or (existing or {}).get("ws_endpoint") or ""),
+                "companion_extension": str((existing or {}).get("companion_extension") or (ext_dir_existing or "")),
+                "started_at": str((existing or {}).get("started_at") or time.strftime("%Y-%m-%d %H:%M:%S")),
+                "tabs": dict((existing or {}).get("tabs") or {}),
+            }
+            write_host_state(prof, recovered_state)
+            return recovered_state
+        if existing is not None:
+            remove_host_state(prof)
+        return None
+
+    if existing is not None:
         remove_host_state(prof)
 
     if not chrome_exe:
@@ -673,10 +760,6 @@ def ensure_browser_host(
         except Exception:
             chrome_exe = None
     if not chrome_exe or not Path(chrome_exe).is_file():
-        return None
-
-    existing_pids = find_chrome_pids_for_profile(prof)
-    if existing_pids:
         return None
 
     port = _allocate_free_port()
@@ -836,9 +919,22 @@ def acquire_host_tab(
         page = context.pages[0] if reuse_blank else context.new_page()
         slot_clean = re.sub(r"[^A-Za-z0-9]+", "", str(slot or "u0")) or "u0"
         tab_id = f"tab-{slot_clean}-{os.getpid()}-{int(time.time() * 1000) % 100000}"
+        target_id = ""
+        try:
+            cdp_sess = context.new_cdp_session(page)
+            t_info = cdp_sess.send("Target.getTargetInfo") or {}
+            target_id = str((t_info.get("targetInfo") or {}).get("targetId") or "")
+            cdp_sess.detach()
+        except Exception:
+            target_id = ""
+        try:
+            page.evaluate("(tid) => { try { window.name = tid; } catch (e) {} }", tab_id)
+        except Exception:
+            pass
 
         tabs[tab_id] = {
             "tab_id": tab_id,
+            "target_id": target_id,
             "pid": os.getpid(),
             "slot": str(slot or "/u/0/"),
             "account": str(account_email or ""),
@@ -1161,10 +1257,79 @@ def close_browser_cli(
     profile_dir: Optional[Union[str, Path]] = None,
     project_path: str = ".",
 ) -> int:
-    """CLI handler for `dispatch_argon.py --close-browser --slot /u/N/` (Section 2.2.C & 2.3.D)."""
+    """CLI handler for `dispatch_argon.py --close-browser --slot /u/N/` (Round 17 Section 1.3).
+
+    In shared mode, `--close-browser --slot /u/N/` closes ONLY the tabs of that account
+    (reusing `close_tab_cli`) and leaves the Argon Bridge browser running for the other
+    accounts. The browser itself is closed politely (with cookie flush) only when no task
+    tab is left (or when `--close-browser` is invoked without `--slot`).
+    """
+    from argon_pool_login import PoolConfig, is_isolated_slot_profile, normalize_slot
+
     eff_slot, prof = _resolve_slot_and_profile(slot=slot, profile_dir=profile_dir)
+    cfg = PoolConfig(profile_dir_override=profile_dir)
     host_state = read_host_state(prof)
     tabs_before = dict((host_state or {}).get("tabs") or {})
+
+    # Reap any dead-PID tab entries before counting active task tabs
+    live_tabs: Dict[str, Any] = {}
+    for tid, tinfo in tabs_before.items():
+        if not isinstance(tinfo, dict):
+            continue
+        tpid = int(tinfo.get("pid") or 0)
+        if tpid and tpid != os.getpid() and not pid_is_alive(tpid):
+            continue
+        live_tabs[tid] = tinfo
+    if host_state is not None and len(live_tabs) != len(tabs_before):
+        host_state["tabs"] = live_tabs
+        write_host_state(prof, host_state)
+
+    if slot is not None and not is_isolated_slot_profile(prof):
+        acct_idx = cfg.get_account_index(eff_slot)
+        acct_url_token = f"/u/{acct_idx}/"
+        slot_tab_ids = [
+            tid
+            for tid, tinfo in live_tabs.items()
+            if normalize_slot(str(tinfo.get("slot") or "/u/0/")) == eff_slot
+        ]
+        closed_tabs: List[str] = []
+        for tid in slot_tab_ids:
+            if close_tab_cli(tab_id=tid, slot=eff_slot, profile_dir=prof, project_path=project_path) == 0:
+                closed_tabs.append(tid)
+
+        # Also close any unregistered tab in the CDP host whose URL belongs to this account's /u/<acct_idx>/ path
+        state_now = read_host_state(prof)
+        http_ep = str((state_now or {}).get("http_endpoint") or "")
+        probed = probe_cdp_endpoint(http_ep) if http_ep else None
+        if probed is not None:
+            for t_obj in (probed.get("targets") or []):
+                t_url = str((t_obj or {}).get("url") or "")
+                if acct_url_token in t_url:
+                    if close_tab_cli(tab_id=acct_url_token, slot=eff_slot, profile_dir=prof, project_path=project_path) == 0:
+                        closed_tabs.append(t_url)
+
+        state_after = read_host_state(prof) or {}
+        remaining_tabs: Dict[str, Any] = {
+            tid: tinfo
+            for tid, tinfo in dict(state_after.get("tabs") or {}).items()
+            if isinstance(tinfo, dict) and (not int(tinfo.get("pid") or 0) or pid_is_alive(int(tinfo.get("pid") or 0)))
+        }
+        if len(remaining_tabs) > 0:
+            snap_ok, _ = snapshot_profile_session(prof)
+            print("=" * 78)
+            print(f"  SAFE ACCOUNT TAB CLOSE ({eff_slot} -> /u/{acct_idx}/)")
+            print("=" * 78)
+            print(f"  Profile path    : {prof}")
+            print(f"  Slot / Index    : {eff_slot} (browser index /u/{acct_idx}/)")
+            print(
+                f"  Close status    : closed {len(closed_tabs)} tab(s) for {eff_slot}; "
+                f"Argon Bridge browser kept running for {len(remaining_tabs)} remaining task tab(s) ({_format_tab_owners(remaining_tabs)})"
+            )
+            print(f"  Cookie snapshot : taken={'yes' if snap_ok else 'no'}, restored=no (browser still running)")
+            print("  Session status  : intact (other accounts and shared Argon Bridge browser untouched)")
+            print("=" * 78)
+            return 0
+
     res = close_browser_safely(context=None, profile_dir=prof)
 
     print("=" * 78)
@@ -1177,7 +1342,7 @@ def close_browser_cli(
         print(f"  Cookie snapshot : {'taken' if res['snapshot_taken'] else 'not needed (no active browser)'}, restored=no")
         print("  Session status  : intact (no account was signed out)")
     else:
-        print(f"  Close status    : {res['mode']} close completed ({len(tabs_before)} registered tab(s) closed)")
+        print(f"  Close status    : {res['mode']} close completed (0 task tabs remaining; browser closed politely with cookie flush)")
         print(
             f"  Cookie snapshot : taken={'yes' if res['snapshot_taken'] else 'no'}, "
             f"restored={'yes' if res['snapshot_restored'] else 'no (clean exit flushed cookies)'}"
@@ -1221,6 +1386,7 @@ def close_tab_cli(
                 continue
             if (
                 wanted in tid
+                or wanted == str(tinfo.get("target_id") or "")
                 or wanted == str(tinfo.get("chat_id") or "")
                 or wanted in str(tinfo.get("chat_url") or "")
                 or wanted in str(tinfo.get("page_url") or "")
@@ -1230,8 +1396,10 @@ def close_tab_cli(
 
     closed_in_browser = False
     target_url_hint = ""
+    target_id_hint = ""
     if matched_tab_id and isinstance(tabs.get(matched_tab_id), dict):
         target_url_hint = str(tabs[matched_tab_id].get("page_url") or tabs[matched_tab_id].get("chat_url") or "")
+        target_id_hint = str(tabs[matched_tab_id].get("target_id") or "")
 
     try:
         from playwright.sync_api import sync_playwright
@@ -1244,6 +1412,24 @@ def close_tab_cli(
                 target_page = None
                 for idx, pg in enumerate(pages):
                     pg_url = str(getattr(pg, "url", "") or "")
+                    pg_win_name = ""
+                    try:
+                        pg_win_name = str(pg.evaluate("() => window.name || ''") or "")
+                    except Exception:
+                        pg_win_name = ""
+                    if matched_tab_id and pg_win_name == matched_tab_id:
+                        target_page = pg
+                        break
+                    if target_id_hint:
+                        try:
+                            cdp_s = ctx.new_cdp_session(pg)
+                            t_inf = cdp_s.send("Target.getTargetInfo") or {}
+                            cdp_s.detach()
+                            if str((t_inf.get("targetInfo") or {}).get("targetId") or "") == target_id_hint:
+                                target_page = pg
+                                break
+                        except Exception:
+                            pass
                     if (
                         (target_url_hint and pg_url == target_url_hint)
                         or (wanted in pg_url)
@@ -1430,21 +1616,17 @@ def open_browser_cli(
     except Exception as exc:
         print(f"[i] The slot profile could not be seeded ({exc}); continuing anyway.")
 
-    # An isolated slot profile holds exactly ONE account, at index 0. Opening
-    # /u/<N>/ for an isolated profile lands on the guest page.
+    # An isolated slot profile holds ONE account at /u/0/. In the shared Argon Bridge
+    # browser profile, the URL uses the account's verified Default/Preferences index
+    # from PoolConfig.get_account_index(eff_slot) (Round 17 Section 1.2 #2).
     target_url = url.strip()
     if not target_url:
         try:
             if is_isolated_slot_profile(prof):
                 target_url = GEMINI_WEB_URL.format(slot="/u/0/")
             else:
-                cfg = PoolConfig()
-                acc = cfg.get_by_slot(eff_slot) or {}
-                idx = 0
-                try:
-                    idx = int(str(acc.get("index") or 0))
-                except Exception:
-                    idx = 0
+                cfg = PoolConfig(profile_dir_override=profile_dir)
+                idx = cfg.get_account_index(eff_slot)
                 target_url = GEMINI_WEB_URL.format(slot=f"/u/{idx}/")
         except Exception:
             target_url = GEMINI_WEB_URL.format(slot="/u/0/")
@@ -1538,5 +1720,239 @@ def open_browser_cli(
     )
     print(f"  Session         : {'signed in' if profile_has_signed_in_account(prof) else 'NOT signed in'}")
     print("  Browser status  : OPEN and reachable - a prompt can be sent now")
+    print("=" * 78)
+    return 0
+
+
+RECLAIMABLE_CACHE_RELPATHS = (
+    "Default/Cache",
+    "Default/Code Cache",
+    "Default/GPUCache",
+    "Default/Service Worker/CacheStorage",
+    "Default/Service Worker/ScriptCache",
+    "Default/DawnCache",
+    "Default/Blob_storage",
+    "ShaderCache",
+    "GrShaderCache",
+    "GraphiteDawnCache",
+    "BrowserMetrics",
+    "Crashpad",
+)
+
+
+def _dir_byte_size(path: Path) -> int:
+    total = 0
+    if not path.exists():
+        return 0
+    try:
+        for root, _, files in os.walk(path):
+            for fname in files:
+                fpath = Path(root) / fname
+                try:
+                    if not fpath.is_symlink():
+                        total += fpath.stat().st_size
+                except OSError:
+                    continue
+    except Exception:
+        pass
+    return total
+
+
+def reclaim_isolated_slot_profiles(
+    shared_profile_dir: Optional[Union[str, Path]] = None,
+    profiles_root: Optional[Union[str, Path]] = None,
+    archive_root: Optional[Union[str, Path]] = None,
+    config_path: Optional[Union[str, Path]] = None,
+) -> Dict[str, Any]:
+    """Safely reclaim disk space from old isolated `~/.gemini/argon_profiles/slot-uN/` profiles (Round 17 Section 1.5).
+
+    Safety contract:
+      1. Never runs automatically - only when explicitly invoked via `--reclaim-slot-profiles`.
+      2. Refuses to touch any slot profile whose Chrome process is currently running.
+      3. Verifies that the shared Argon Bridge profile (`~/.gemini/argon_browser_profile`) has a valid
+         cookie DB AND holds every Google account email registered in the slot profile (and configured
+         for that slot in `PoolConfig`) inside `Default/Preferences` (`account_info`), recording the
+         verified `account_index` in `PoolConfig`.
+      4. Moves each verified slot directory to a recoverable archive folder
+         (`~/.gemini/argon_reclaimed_profiles/<timestamp>/slot-uN`) rather than deleting its session
+         files, and purges only regenerable Chromium caches inside the archived copy so the ~68 GB of
+         cache bloat is freed immediately while `Cookies`, `Preferences`, and `Local State` remain
+         recoverable.
+    """
+    from argon_pool_login import PoolConfig, normalize_slot
+
+    cfg = PoolConfig(config_path=config_path, profile_dir_override=shared_profile_dir)
+    shared_prof = Path(shared_profile_dir).expanduser().resolve() if shared_profile_dir else cfg.profile_dir
+    prof_root = (
+        Path(profiles_root).expanduser().resolve()
+        if profiles_root
+        else (shared_prof.parent / "argon_profiles")
+    )
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    rec_root = (
+        Path(archive_root).expanduser().resolve()
+        if archive_root
+        else (shared_prof.parent / "argon_reclaimed_profiles" / stamp)
+    )
+
+    reclaimed: List[Dict[str, Any]] = []
+    skipped: List[Dict[str, Any]] = []
+    total_reclaimed_bytes = 0
+
+    if not prof_root.is_dir():
+        return {
+            "shared_profile": str(shared_prof),
+            "profiles_root": str(prof_root),
+            "archive_root": str(rec_root),
+            "reclaimed": reclaimed,
+            "skipped": skipped,
+            "total_reclaimed_bytes": 0,
+        }
+
+    shared_has_cookies = has_cookie_db(shared_prof)
+    shared_pref_accounts = get_preferences_accounts(shared_prof)
+    shared_emails_map = {
+        str(a.get("email") or "").strip().lower(): int(a["index"])
+        for a in shared_pref_accounts
+        if str(a.get("email") or "").strip()
+    }
+
+    for slot_dir in sorted(prof_root.iterdir()):
+        if not slot_dir.is_dir() or not slot_dir.name.startswith("slot-"):
+            continue
+        m_slot = re.search(r"slot-u(\d+)", slot_dir.name, flags=re.IGNORECASE)
+        slot_norm = normalize_slot(int(m_slot.group(1))) if m_slot else "/u/0/"
+
+        live_pids = find_chrome_pids_for_profile(slot_dir)
+        if live_pids:
+            skipped.append(
+                {
+                    "slot": slot_norm,
+                    "path": str(slot_dir),
+                    "reason": f"slot profile is currently in use by Chrome PID(s) {live_pids}",
+                }
+            )
+            continue
+
+        slot_pref_accounts = get_preferences_accounts(slot_dir)
+        required_emails: List[str] = [
+            str(a.get("email") or "").strip().lower()
+            for a in slot_pref_accounts
+            if str(a.get("email") or "").strip()
+        ]
+        cfg_acc = cfg.get_by_slot(slot_norm)
+        if isinstance(cfg_acc, dict):
+            cfg_email = str(cfg_acc.get("email") or "").strip().lower()
+            if cfg_email and cfg_email not in required_emails:
+                required_emails.append(cfg_email)
+
+        if not shared_has_cookies:
+            skipped.append(
+                {
+                    "slot": slot_norm,
+                    "path": str(slot_dir),
+                    "reason": f"shared profile {shared_prof} has no valid cookie DB yet",
+                }
+            )
+            continue
+
+        if not required_emails:
+            skipped.append(
+                {
+                    "slot": slot_norm,
+                    "path": str(slot_dir),
+                    "reason": "slot profile has no identifiable account email to verify against shared profile",
+                }
+            )
+            continue
+
+        missing_emails = [em for em in required_emails if em not in shared_emails_map]
+        if missing_emails:
+            skipped.append(
+                {
+                    "slot": slot_norm,
+                    "path": str(slot_dir),
+                    "reason": f"shared profile does NOT hold account(s): {', '.join(missing_emails)}",
+                }
+            )
+            continue
+
+        verified_idx = shared_emails_map[required_emails[0]]
+        try:
+            cfg.set_account_index(slot_norm, verified_idx)
+        except Exception:
+            pass
+
+        bytes_before = _dir_byte_size(slot_dir)
+        rec_root.mkdir(parents=True, exist_ok=True)
+        dest_dir = rec_root / slot_dir.name
+        if dest_dir.exists():
+            dest_dir = rec_root / f"{slot_dir.name}_{int(time.time() * 1000) % 100000}"
+
+        shutil.move(str(slot_dir), str(dest_dir))
+        for cache_rel in RECLAIMABLE_CACHE_RELPATHS:
+            cache_target = dest_dir / cache_rel
+            if cache_target.is_dir():
+                shutil.rmtree(cache_target, ignore_errors=True)
+
+        bytes_after = _dir_byte_size(dest_dir)
+        reclaimed_now = max(0, bytes_before - bytes_after)
+        total_reclaimed_bytes += bytes_before
+        reclaimed.append(
+            {
+                "slot": slot_norm,
+                "email": required_emails[0],
+                "account_index": verified_idx,
+                "original_path": str(slot_dir),
+                "archived_to": str(dest_dir),
+                "bytes_before": bytes_before,
+                "bytes_archived_session": bytes_after,
+                "bytes_freed_from_cache": reclaimed_now,
+            }
+        )
+
+    return {
+        "shared_profile": str(shared_prof),
+        "profiles_root": str(prof_root),
+        "archive_root": str(rec_root),
+        "reclaimed": reclaimed,
+        "skipped": skipped,
+        "total_reclaimed_bytes": total_reclaimed_bytes,
+    }
+
+
+def reclaim_slot_profiles_cli(
+    profile_dir: Optional[Union[str, Path]] = None,
+    profiles_root: Optional[Union[str, Path]] = None,
+    archive_root: Optional[Union[str, Path]] = None,
+) -> int:
+    """CLI handler for `--reclaim-slot-profiles` (Round 17 Section 1.5)."""
+    rep = reclaim_isolated_slot_profiles(
+        shared_profile_dir=profile_dir,
+        profiles_root=profiles_root,
+        archive_root=archive_root,
+    )
+    total_mb = rep["total_reclaimed_bytes"] / (1024.0 * 1024.0)
+    total_gb = total_mb / 1024.0
+    print("=" * 78)
+    print("  ARGON ISOLATED SLOT PROFILE RECLAMATION")
+    print("=" * 78)
+    print(f"  Shared profile  : {rep['shared_profile']}")
+    print(f"  Slot profiles   : {rep['profiles_root']}")
+    print(f"  Recoverable dir : {rep['archive_root']}")
+    if rep["reclaimed"]:
+        print(f"  Reclaimed slots : {len(rep['reclaimed'])} ({total_mb:.1f} MB / {total_gb:.2f} GB reclaimed)")
+        for item in rep["reclaimed"]:
+            mb_i = item["bytes_before"] / (1024.0 * 1024.0)
+            print(
+                f"    - {item['slot']} ({item['email']} -> /u/{item['account_index']}/): "
+                f"{mb_i:.1f} MB moved to {item['archived_to']}"
+            )
+    else:
+        print("  Reclaimed slots : 0")
+    if rep["skipped"]:
+        print(f"  Refused/Skipped : {len(rep['skipped'])}")
+        for sk in rep["skipped"]:
+            print(f"    - {sk['slot']} ({sk['path']}): REFUSED ({sk['reason']})")
     print("=" * 78)
     return 0
