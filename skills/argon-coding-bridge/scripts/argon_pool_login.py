@@ -643,6 +643,18 @@ class PoolConfig:
                                 except Exception:
                                     pass
                         return int(found_idx)
+                    # The account is NOT registered in the Argon browser. Falling back
+                    # to the slot number would silently run the task under a DIFFERENT
+                    # Google account, so a slot that still needs a sign-in must fail
+                    # loudly instead (Round 18 - never the wrong account).
+                    if acc.get("needs_signin"):
+                        raise RuntimeError(
+                            "slot %s (%s) is not signed into the Argon browser yet - sign "
+                            "this account in once (Open_Argon_Login.bat -> Auto Login All) "
+                            "before dispatching to it" % (target_slot, email)
+                        )
+                except RuntimeError:
+                    raise
                 except Exception:
                     pass
             if isinstance(acc.get("account_index"), int):
