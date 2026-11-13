@@ -49,6 +49,13 @@ DEFAULT_HOST_ARGS = [
     "--enable-unsafe-extension-debugging",
 ]
 
+# How long the host-start wait may block: Chrome is running but has not published
+# its CDP endpoint yet (the other lane is still LAUNCHING it). Without these two
+# constants `ensure_browser_host` raised `NameError` in exactly that state - see
+# `round23_reliability.py`, which carries the same values.
+HOST_START_WAIT_SECONDS = 90.0
+HOST_START_POLL_SECONDS = 0.5
+
 
 def get_companion_extension_dir(ext_dir: Optional[Union[str, Path]] = None) -> Optional[Path]:
     """Return the unpacked MV3 companion extension directory when `manifest.json` exists, else None.
