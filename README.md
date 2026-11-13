@@ -338,6 +338,44 @@ buried inside the patch script.
 
 ---
 
+## 🔄 Keeping the plugin itself up to date
+
+The plugin is installed in **three** places: this repository, the MiniMax plugin root
+(`~/.minimax/plugins/argon-coding-bridge`) and the Gemini/Antigravity plugin root
+(`~/.gemini/config/plugins/argon-coding-bridge`). When they drift, an agent that runs from an
+installed root uses old code while GitHub already has the new one - the symptom is "the plugin is
+not updated".
+
+**Any agent can fix that itself, with one command** - no human, no other agent:
+
+```powershell
+python ./skills/argon-coding-bridge/scripts/sync_plugin.py            # update every installed root
+python ./skills/argon-coding-bridge/scripts/sync_plugin.py --check    # verify only (exit 1 = drift)
+python ./skills/argon-coding-bridge/scripts/sync_plugin.py --dry-run  # show what would change
+pwsh -File ./skills/argon-coding-bridge/scripts/Sync-ArgonPlugin.ps1   # the Windows wrapper
+```
+
+On Windows there is also the one-click **`Open_Argon_Update.bat`** at the repository root.
+
+What it does:
+
+| Step | What happens |
+| --- | --- |
+| Find | the source repo - the git checkout of the plugin (auto-detected, or `--repo <path>`) |
+| Copy | the PACKAGE (every git-tracked file + the published `API_INDEX.md`) into every installed root |
+| Align | a root that is its own git clone is brought back to `origin/main` - the branch pointer moves, the files stay, and the old HEAD is kept in a `backup/pre-sync-<sha>` branch |
+| Verify | byte identity, every script compiles, the git state is clean |
+
+What it never does: it never copies the live account pool (`accounts_pool.json`, `login_report.json` -
+each root keeps its own live state), it never creates a generic `plugin.json` inside a MiniMax root
+(which uses its own `.minimax-plugin/plugin.json`), and it never deletes anything.
+
+The behaviour is proven by the plugin's own self-test - 19 checks, all in a throwaway directory:
+
+```powershell
+python ./skills/argon-coding-bridge/scripts/test_sync_plugin.py
+```
+
 ## 📦 Delivery Contract: File In, One Click Applied
 
 Argon does **not** paste the patch into the chat. It delivers `apply_changes.ps1` as a **downloadable

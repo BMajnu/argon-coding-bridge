@@ -229,6 +229,32 @@ still THINKING is not a failed run:
 
 Only when none of these hold is the run treated as "finished without a delivery"
 and carried over into a new session. `--no-carry-over` turns the rule off.
+### Keeping every installed copy of the plugin in step
+
+The plugin is installed in three places: the git repository, the MiniMax plugin root and the
+Gemini/Antigravity plugin root. When they drift, the agent that runs from an installed root uses
+old code while GitHub already has the new one.
+
+**Any agent updates it itself, with one command:**
+
+```powershell
+python ./skills/argon-coding-bridge/scripts/sync_plugin.py            # update every installed root
+python ./skills/argon-coding-bridge/scripts/sync_plugin.py --check    # verify only (exit 1 = drift)
+python ./skills/argon-coding-bridge/scripts/sync_plugin.py --dry-run  # show what would change
+pwsh -File ./skills/argon-coding-bridge/scripts/Sync-ArgonPlugin.ps1   # the Windows wrapper
+```
+
+- It copies the PACKAGE - every git-tracked file plus the published `API_INDEX.md` - into every
+  installed root, and aligns a root that is its own git clone with `origin/main` (the branch pointer
+  moves, the files stay, the old HEAD is kept in a `backup/pre-sync-<sha>` branch).
+- It never copies the live account pool (`config/accounts_pool.json`, `config/login_report.json`) -
+  each root keeps its own live state - it never creates a generic `plugin.json` inside a MiniMax
+  root, and it never deletes anything.
+- The source repo is found automatically; `--repo <path>` overrides it, and the plugin remembers the
+  source it was synced from in `~/.gemini/argon_plugin_source.json`.
+- The self-test proves the behaviour: `python ./skills/argon-coding-bridge/scripts/test_sync_plugin.py`
+  (19 checks).
+
 ### The delivery rule - In-Gemini Export -> Download, whole files, and `argon_delivery.zip` bundle
 
 A round can deliver **more than the page file**: in addition to `apply_changes.ps1`, Argon may

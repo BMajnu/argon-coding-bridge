@@ -193,6 +193,40 @@ to run out.
 
 ---
 
+### 13. Keep every installed copy of the plugin in step - the agent updates the plugin itself
+
+- **The plugin lives in THREE places**: the git repository, the MiniMax plugin root
+  (`~/.minimax/plugins/argon-coding-bridge`) and the Gemini/Antigravity plugin root
+  (`~/.gemini/config/plugins/argon-coding-bridge`). When they drift, the agent that runs from an
+  installed root uses OLD code while GitHub already has the new one, and the symptom is "the plugin
+  is not updated". Fix it yourself - you do NOT need the owner or another agent for this:
+  ```powershell
+  python "./skills/argon-coding-bridge/scripts/sync_plugin.py"                  # update every root
+  python "./skills/argon-coding-bridge/scripts/sync_plugin.py" --check          # verify only (exit 1 = drift)
+  python "./skills/argon-coding-bridge/scripts/sync_plugin.py" --dry-run        # show what would change
+  pwsh -File "./skills/argon-coding-bridge/scripts/Sync-ArgonPlugin.ps1"        # the Windows wrapper
+  ```
+  On Windows there is also the one-click **`Open_Argon_Update.bat`** at the plugin root.
+- **What it does**: finds the source repo (the git checkout), copies the PACKAGE - every git-tracked
+  file plus the published `API_INDEX.md` - into every installed root, aligns a root that is its own
+  git clone with `origin/main` (the branch pointer moves, the files stay, the old HEAD is kept in a
+  `backup/pre-sync-<sha>` branch), and then verifies: byte identity, every script compiles, the git
+  state is clean.
+- **What it NEVER does**: it never copies the live account pool
+  (`skills/argon-coding-bridge/config/accounts_pool.json`, `login_report.json`) - each root keeps its
+  own live state; it never creates a generic `plugin.json` inside a MiniMax root, which uses its own
+  `.minimax-plugin/plugin.json`; and it never deletes anything.
+- **Run it whenever you changed the plugin itself** (a new script, a changed SKILL.md, a new
+  reference doc, a new manifest version) and before you hand the work over. The self-test proves the
+  behaviour: `python "./skills/argon-coding-bridge/scripts/test_sync_plugin.py"` (19 checks: the
+  package is copied, the live pool survives, a MiniMax root never gets a generic manifest, `--check`
+  finds drift, the sync is idempotent, and a git-clone root is aligned with its files intact).
+
+---
+
+
+---
+
 ## The production workflow
 
 Work through these steps ONE AT A TIME. Do not fire a batch of commands.

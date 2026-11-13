@@ -1,8 +1,8 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "argon-coding-bridge",
-  "version": "1.3.0",
-  "description": "Bridge any local coding agent with Gemini 4 Argon in Gemini Web (Task mode). Works with any Agent Plugins 1.0 compatible coding agent - Claude Code, Cursor, Gemini CLI, Antigravity, OpenCode, MiniMax Code and others. Packages codebase context respecting .gitignore, crafts surgical prompts preventing UI distortion, and provides one-click PowerShell patch execution. The Gemini 4 Argon workspace (Task mode + 4 Argon) is configured and verified automatically before a prompt is sent. Drives ONE Argon browser that holds every pooled Google account and is switched with Google's own /u/<index>/ paths; the browser never closes on its own, and the pool's /u/N order is always resolved from the browser's live account list. Can also control ANY website live: the browser pushes an interactive-element map to the agent and the agent sends actions back, one round trip, with a stale-element guard.",
+  "version": "1.4.0",
+  "description": "Bridge any local coding agent with Gemini 4 Argon in Gemini Web (Task mode). Works with any Agent Plugins 1.0 compatible coding agent - Claude Code, Cursor, Gemini CLI, Antigravity, OpenCode, MiniMax Code and others. Packages codebase context respecting .gitignore, crafts surgical prompts preventing UI distortion, and provides one-click PowerShell patch execution. The Gemini 4 Argon workspace (Task mode + 4 Argon) is configured and verified automatically before a prompt is sent. Drives ONE Argon browser that holds every pooled Google account and is switched with Google's own /u/<index>/ paths; the browser never closes on its own, and the pool's /u/N order is always resolved from the browser's live account list. Can also control ANY website live: the browser pushes an interactive-element map to the agent and the agent sends actions back, one round trip, with a stale-element guard. Any agent can bring every installed copy of the plugin up to date itself with one command (scripts/sync_plugin.py) - it copies the package into every plugin root, aligns a root that is its own git clone with origin/main, and verifies byte identity and compilation, without ever touching the live account pool.",
   "author": {
     "name": "Argon Coding Bridge Contributors"
   },
@@ -15,6 +15,7 @@
     "patch-applicator",
     "browser-automation",
     "live-browser-control",
-    "agent-plugin"
+    "agent-plugin",
+    "plugin-self-update"
   ]
 }
