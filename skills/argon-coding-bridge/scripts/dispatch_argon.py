@@ -10723,14 +10723,25 @@ def _verify_project_locally(
 # into the composer as real images. Upstream parsed the flag but never forwarded it
 # and attached only AFTER the send; both are fixed here.
 def _expand_attach_images(spec) -> List[Path]:
-    """Turn a directory, a glob or a comma-separated list into a file list."""
+    """Turn a directory, a glob or a comma-separated list into a file list.
+
+    `--attach-images` is declared with `nargs="*"`, so argparse hands the value
+    over as a LIST of strings - never a single string. Measured on 2026-11-14:
+    the list form reached this helper as the literal text "['dir']", every
+    lookup failed and NO screenshot was ever attached. The list is flattened
+    first here; every element may itself be a comma-separated list.
+    """
     if not spec:
         return []
+    raw_parts: List[str] = []
+    items = list(spec) if isinstance(spec, (list, tuple, set)) else [spec]
+    for item in items:
+        for part in str(item).split(","):
+            part = part.strip()
+            if part:
+                raw_parts.append(part)
     out: List[Path] = []
-    for part in str(spec).split(","):
-        part = part.strip()
-        if not part:
-            continue
+    for part in raw_parts:
         p = Path(part).expanduser()
         if p.is_dir():
             for pat in ("*.png", "*.jpg", "*.jpeg", "*.webp", "*.svg"):
