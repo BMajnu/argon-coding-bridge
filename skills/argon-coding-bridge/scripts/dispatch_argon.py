@@ -7609,7 +7609,9 @@ def _execute_composer_send_sequence(
     setattr(page, "_argon_last_operation_error", None)
 
     # Step 1: Find the prompt box and select Task mode + 4 Argon model.
-    composer = _find_composer(page)
+    # The lookup WAITS: the Task composer only replaces the Chat composer while
+    # the page hydrates, and a lookup that lands in that window finds nothing.
+    composer = _find_composer(page, wait_seconds=45.0)
     if composer is None:
         reason = "composer editable is missing from the page DOM"
         p_log.append(f"composer : MISSING ({reason})")
@@ -7744,7 +7746,7 @@ def _execute_composer_send_sequence(
     body_len_before = len(body_before)
     snippet_count_before = body_before.count(probe_snippet) if probe_snippet else 0
 
-    composer = _find_composer(page) or composer
+    composer = _find_composer(page, wait_seconds=15.0) or composer
     landed_text = _paste_into_composer(page, composer, prompt_text)
     if len(landed_text) < expected_min_len and len(clean_prompt) <= 2000:
         _focus_composer_dom(composer)
@@ -8722,7 +8724,31 @@ def run_preflight_selftest_cli(headless: bool = True, require_extension: bool = 
     return EXIT_SUCCESS
 
 
-def _find_composer(page):
+# --- Phase 7: the composer lookup WAITS for the Task composer ---
+# Gemini renders the CHAT composer first and replaces it with the TASK composer
+# while the page hydrates (measured 2026-11-14 on the live Phase-7 chat: the
+# `<textarea class="gds-body-l">` exists at 0 s, the `rich-textarea` composer at
+# ~2 s). A single snapshot taken in between finds NOTHING at all, and the send
+# dies with "composer editable is missing from the page DOM".
+def _find_composer(page, wait_seconds: float = 0.0):
+    """Return the prompt composer element, or None when there is none.
+
+    `wait_seconds` makes the lookup WAIT instead of taking a single snapshot.
+    """
+    deadline = time.monotonic() + max(0.0, float(wait_seconds))
+    while True:
+        found = _find_composer_once(page)
+        if found is not None:
+            return found
+        if time.monotonic() >= deadline:
+            return None
+        try:
+            page.wait_for_timeout(1000)
+        except Exception:
+            time.sleep(1.0)
+
+
+def _find_composer_once(page):
     """Return the prompt composer element, or None when there is none.
 
     A loaded conversation can hold MORE than one editable: the real composer
@@ -8735,36 +8761,58 @@ def _find_composer(page):
     screen wins - that is the real composer, in a fresh chat as well as in a
     long one.
     """
-    best = None
-    best_y = -1.0
-    for sel in (
-        "rich-textarea div[contenteditable='true']",
-        "div.input-area-container div[contenteditable='true']",
-        "div[contenteditable='true']",
-        "textarea[aria-label*='prompt']",
-        "textarea",
+    # Tier 1 is the TASK composer (`rich-textarea` / `input-area-container`),
+    # tier 2 is every other editable. The tier wins first and the bottom-most
+    # element wins inside a tier, so the floating quick-action bar (a generic
+    # contenteditable in the middle of the page) never beats the real composer.
+    for sels in (
+        (
+            "rich-textarea div[contenteditable='true']",
+            "div.input-area-container div[contenteditable='true']",
+        ),
+        (
+            "div[contenteditable='true']",
+            "textarea[aria-label*='prompt']",
+            "textarea",
+        ),
     ):
-        try:
-            loc = page.locator(sel)
-            count = min(loc.count(), 12)
-        except Exception:
-            continue
-        for i in range(count):
+        best = None
+        best_y = -1.0
+        for sel in sels:
             try:
-                el = loc.nth(i)
-                if not _safe_visible(el):
-                    continue
-                try:
-                    box = el.bounding_box(timeout=1500)
-                except Exception:
-                    box = None
-                y = float(box["y"]) if box else 0.0
+                loc = page.locator(sel)
+                count = min(loc.count(), 12)
             except Exception:
                 continue
-            if y >= best_y:
-                best_y = y
-                best = el
-    return best
+            for i in range(count):
+                try:
+                    el = loc.nth(i)
+                    if not _safe_visible(el):
+                        continue
+                    # The CHAT composer of Gemini
+                    # (`<textarea class="gds-body-l" placeholder="Ask Gemini">`)
+                    # is NOT a composer for a Task prompt: a prompt pasted there
+                    # is answered in Chat mode. It is skipped so the lookup waits
+                    # for the real TASK composer instead.
+                    try:
+                        cls = (el.get_attribute("class") or "")
+                    except Exception:
+                        cls = ""
+                    if "gds-body-l" in cls:
+                        continue
+                    try:
+                        box = el.bounding_box(timeout=1500)
+                    except Exception:
+                        box = None
+                    y = float(box["y"]) if box else 0.0
+                except Exception:
+                    continue
+                if y >= best_y:
+                    best_y = y
+                    best = el
+        if best is not None:
+            return best
+    return None
 
 
 def manual_setup_instructions(mode: str, screenshot: Optional[str] = None) -> str:
