@@ -146,6 +146,66 @@ Round 22: the prompt was sent at 15:11:39; the lane gave up at 15:38; Argon was 
 
 ### F6 — The delivery viewer OVERFLOWS the screen, the composer lands on top of it, and then the WHOLE TAB HANGS
 
+### F6.1 - THE EXACT SYMPTOM (the owner's own words and screenshots)
+
+> "Always it keeping hanged and not taking click or response on it and you are trying with creating new tab and
+> trying again and again but same. But after few try now it release but you are not able to send it again."
+
+What happens, step by step:
+
+1. The Gemini conversation is open. The **generated-file viewer** (the `apply_changes.ps1` panel) or the
+   **"Keep the chat reply brief..." tooltip** is drawn over the page. The composer's
+   "Ask a follow-up" box is drawn ON TOP of that panel, and the whole page grows past the viewport.
+2. **The tab stops taking clicks ANYWHERE.** Not the Download button - the sidebar, the model chip,
+   the composer, the tabs. Nothing responds. The page is not "the button is in the wrong place"; the
+   **renderer is blocked**.
+3. **Creating a new tab does NOT help** - the new tab loads the same heavy Gemini UI in the same
+   wedged browser and is unresponsive too. Retrying over and over makes it worse: each attempt
+   leaves another half-loaded document and another overlay.
+4. After a few attempts it "releases" - the page answers again - **but the send does not work any
+   more.** The composer is in a state where the prompt does not go out (the paste lands, the send
+   does not fire, or the attachment does not attach).
+
+### F6.2 - WHAT THE BRIDGE MEASURED
+
+```
+the tab stops responding entirely: it takes NO click anywhere at all
+the CDP endpoint stops answering: connect_over_cdp reaches "ws connected" and then TIMES OUT
+the DevTools HTTP endpoint stops responding; the browser process is alive but its renderer is blocked
+the browser stayed wedged for about an hour (15:38 -> 16:41)
+every dispatch in that window made ZERO progress (the round-23 lane started at 16:36 and could do nothing)
+the owner's own work was blocked too - a parallel session's tabs sit in the same browser
+recovery that works: a GRACEFUL browser close (cookie snapshot taken, session intact) + relaunch
+                -> the CDP endpoint answered again in 34 ms
+recovery that does NOT work: opening new tabs, clicking around, retrying the send
+```
+
+### F6.3 - WHY IT HAPPENS
+
+Three things combine:
+
+- The bridge **clicks into a panel whose geometry it does not control** (the generated-file viewer),
+  in a page that can reflow to any height, and then **leaves the panel open**.
+- The bridge and **the owner drive the SAME page at the same time**. A page cannot have two drivers.
+- The bridge's **retry ladder keeps retrying into a dead page**, and every retry opens another
+  document in a renderer that is already blocked.
+
+### F6.4 - THE FIX (this is the heart of the round)
+
+- **One driver at a time.** The bridge must never open a tab and drive it while the owner is using
+  the same browser. If the owner has a tab open in the Argon browser, the bridge attaches to THAT
+  browser but must leave the owner's tab alone.
+- **Probe before and after every page interaction.** A cheap round-trip into the page before
+  acting and another one after. A page that does not answer is "wedged" - never "try again".
+- **On a wedge: STOP. Do not retry in a loop and do not open new tabs to try again.** Close the
+  wedged tab; if the CDP endpoint does not answer, close the browser GRACEFULLY (the cookie
+  snapshot keeps the session intact) and relaunch it. Then continue.
+- **Never leave an overlay on the page.** The capture must close the viewer and restore the
+  composer before it reports anything.
+- **The lane must say "the page is wedged", never "a newer prompt superseded me"** (that was a
+  wrong-chat read, see R16).
+
+
 The owner reports (and the screenshot shows) that when the **Download** button is clicked - by the
 owner or by the agent - the download section sometimes **hangs** and the whole screen **overflows**:
 the generated-file viewer expands into a full-height code panel, the floating `Download / Drive`
@@ -276,6 +336,18 @@ fallback in shared mode: the fallback must be an error, never a guess.
   conversation) through a channel that does not need the wedged renderer, and the lane must then
   continue. After any capture the bridge must PROVE the page is still responsive (a cheap
   round-trip into the page) and say so.
+- **R13a** On a wedge the bridge must **STOP, not loop**: it must NOT retry the same operation in a
+  loop and it must NOT open new tabs to "try again" - a new tab loads the same heavy UI in the same
+  blocked renderer and makes it worse. The recovery is: close the wedged tab; if the CDP endpoint
+  does not answer, close the browser GRACEFULLY (the cookie snapshot keeps the session intact) and
+  relaunch it (measured: the endpoint answered again in **34 ms** afterwards); then continue.
+- **R13b** **One driver at a time.** The bridge must never drive a page while the owner is driving
+  the same browser. If the owner has a tab open in the Argon browser, the bridge may attach to that
+  browser but must leave the owner's tab alone, and must not leave an overlay on it.
+- **R13c** After a wedge the page may answer again but the **send may still not work** (measured:
+  "after few try now it release but you are not able to send it again"). So a wedge must end with a
+  **fresh page** - reload the conversation, re-set the mode and the model, re-attach, and only then
+  paste and send.
 - **R14** Every launch flag must be justified by a measurement, and an unsupported flag that
   changes nothing must be removed. `--disable-blink-features=AutomationControlled` must GO
   (measured: `navigator.webdriver` is false with and without it) - it only produces the
@@ -370,7 +442,9 @@ skills/argon-coding-bridge/extension/manifest.json     a "key" so the extension 
 - [ ] **A wedged page is detected and recovered**: the regression suite wedges a page on purpose
       (a blocked renderer), and the bridge must notice, reload the tab through a path that does
       not need the wedged renderer, continue, and report the recovery - instead of hanging until
-      its deadline.
+      its deadline. It must NOT open new tabs to try again, and after the recovery it must use a
+      FRESH page (reload, re-set the mode and the model, re-attach) before pasting and sending,
+      because a released page may still refuse to send.
 - [ ] The browser no longer shows the "unsupported command-line flag" banner, and
       `navigator.webdriver` is still `false` (measured after the change).
 - [ ] A slot whose account is not signed in is REFUSED with a clear message; no code path can
