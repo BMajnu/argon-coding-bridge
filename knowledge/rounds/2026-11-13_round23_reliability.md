@@ -185,6 +185,32 @@ viewer closed, so the composer is not left overlapped afterwards.
   round-trip into the page) and say so. A page that does not answer is a failed run, and the
   failure must be reported with the recovery that was attempted.
 
+### F7 — Chrome warns about a launch flag that does absolutely nothing
+
+Every page in the Argon browser carries this banner:
+
+> "You are using an unsupported command-line flag: `--disable-blink-features=AutomationControlled`.
+> Stability and security will suffer."
+
+The flag is in `DEFAULT_HOST_ARGS` (`safe_browser.py`). Its only job is to hide
+`navigator.webdriver`. **Measured on the owner's machine, with and without it:**
+
+```
+WITH the flag    : navigator.webdriver = false, languages 2, plugins 5, chrome = false
+WITHOUT the flag : navigator.webdriver = false, languages 2, plugins 5, chrome = false
+the flag changes anything? NO - it is pointless here
+```
+
+It is pointless **because** the bridge launches Chrome with an EXPLICIT
+`--remote-debugging-port=<n>` (not `--remote-debugging-port=0`) and without
+`--enable-automation`, so Chrome never sets the automation flag in the first place. The flag
+therefore buys the owner nothing and costs a warning banner on every single page.
+
+**R14 (hard rule): every launch flag must be justified by a measurement, and an unsupported flag
+that changes nothing must be removed.** `--disable-blink-features=AutomationControlled` must go
+(measured above). The same rule applies to any other flag the bridge passes: if it is not in
+`DEFAULT_HOST_ARGS` for a measured reason, it does not belong there.
+
 ---
 
 ## SECTION 3 — THE DESIGN PRINCIPLE (this is what "easy, smart, simple" means here)
