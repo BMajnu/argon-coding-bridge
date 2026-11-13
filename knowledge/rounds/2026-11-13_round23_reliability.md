@@ -140,7 +140,7 @@ Round 22: the prompt was sent at 15:11:39; the lane gave up at 15:38; Argon was 
 bridge already accepts `--deadline-seconds`; the DEFAULT must be raised, and the launcher used by
 the operators must pass a generous value).
 
-### F6 — The delivery viewer overflows the screen and the composer lands on top of it
+### F6 — The delivery viewer OVERFLOWS the screen, the composer lands on top of it, and then the WHOLE TAB HANGS
 
 The owner reports (and the screenshot shows) that when the **Download** button is clicked - by the
 owner or by the agent - the download section sometimes **hangs** and the whole screen **overflows**:
@@ -148,8 +148,24 @@ the generated-file viewer expands into a full-height code panel, the floating `D
 menu is left hanging over it, the composer ("Ask a follow-up") is drawn ON TOP of the code, and the
 Download button can no longer be clicked (or the click lands on nothing).
 
+**And then it gets worse - the whole browser wedges.** Measured on the owner's machine while this
+round was being dispatched:
+
+- The tab **stops responding entirely**: it takes **no click anywhere at all**, not even on the
+  sidebar, not on the model chip, not on the composer. It is not "the button is in the wrong
+  place" - the page is dead.
+- The CDP endpoint stops answering too: `connect_over_cdp` reaches "ws connected" and then
+  **times out**, and the DevTools HTTP endpoint stops responding. The browser process is alive but
+  its renderer/main thread is blocked.
+- The browser had been wedged for **about an hour** (from ~15:38, when the round-22 capture left
+  the viewer open, until ~16:41 when the owner noticed). Every dispatch in that window was
+  affected - the round-23 lane started at 16:36 and made **zero progress** because the page it
+  needed to drive was already dead.
+- The owner's own work was blocked too: a parallel session's tabs sit in the same browser.
+
 That is exactly the operation the bridge performs to collect `apply_changes.ps1`. The bridge clicks
-into a panel whose geometry it does not control, in a page that can reflow to any height.
+into a panel whose geometry it does not control, in a page that can reflow to any height, and then
+leaves the panel open.
 
 **R11 (hard rule): the delivery capture must never depend on clicking into an uncontrolled,
 overflowing panel.** It must (a) put the viewer into a known geometry first (collapse it, or
@@ -157,6 +173,17 @@ scroll the real button into a bounded viewport) before clicking, (b) verify that
 produced a download within a bounded time, and (c) on any doubt fall back to the path that is
 already proven - the Drive text endpoint - instead of hanging. The capture must also leave the
 viewer closed, so the composer is not left overlapped afterwards.
+
+**R13 (hard rule): a wedged page must be DETECTED and RECOVERED, never waited on.**
+- Every step that touches the page must be bounded by a timeout, and a timeout on the page must be
+  treated as "the page is wedged", not as "try the next step".
+- A wedged tab must be recovered by reloading it (or navigating it back to the conversation)
+  through a channel that does not need the wedged renderer, and the lane must then continue.
+- The capture must never leave the viewer open: close it and put the composer back before the
+  lane reports anything to the owner.
+- After any capture attempt, the bridge must PROVE the page is still responsive (a cheap
+  round-trip into the page) and say so. A page that does not answer is a failed run, and the
+  failure must be reported with the recovery that was attempted.
 
 ---
 
@@ -273,6 +300,10 @@ memory - read the workspace copies, and make each one idempotent and re-appliabl
 - [ ] The delivery capture survives the **overflowing viewer**: the regression suite opens the
       generated-file viewer, lets it overflow, and still captures the patch - and the viewer is
       closed afterwards, with the composer no longer overlapped.
+- [ ] **A wedged page is detected and recovered**: the regression suite wedges a page on purpose
+      (a blocked renderer), and the bridge must notice, reload the tab through a path that does
+      not need the wedged renderer, continue, and report the recovery - instead of hanging until
+      its deadline.
 
 ---
 
