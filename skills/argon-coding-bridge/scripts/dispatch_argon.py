@@ -3850,49 +3850,52 @@ def get_target_url(
 
 
 _build_app_url = get_target_url
-
-
 def _url_slot_for_account(
     slot: Optional[str],
     isolated_profile: bool = False,
     strict: bool = True,
+    profile_dir_override: Optional[Union[str, Path]] = None,
 ) -> str:
-    """Return `/u/0/` for an isolated slot profile, or `/u/<account_index>/` from `PoolConfig.get_account_index(slot)` in shared mode.
+    """Return `/u/0/` for an isolated slot profile, or `/u/<account_index>/` from `PoolConfig.get_account_index(slot)` in shared mode (Rule R15).
 
-    Always resyncs against `Default/Preferences` (`account_info`) first and raises
-    `AccountNotSignedInError` when a configured pool slot is not signed in to the Argon
-    browser (Round 20 FIX 4.3).
-
-    There is NO correct fallback in shared mode: the pool slot number is NOT the browser
-    account index. Falling back to it silently opened a DIFFERENT Google account - the
-    owner measured a lane that was supposed to run on `/u/6/` opening `/u/7/` and
-    working under the wrong identity. The only tolerated fallback is when the pool has
-    no accounts configured at all.
-
-    `strict=False` is for the paths that RE-OPEN a conversation whose own URL already
-    carries the right `/u/<index>/`; they must keep working even while the pool file is
-    out of step with the browser.
+    A pool slot number is NOT an account index: in shared mode this function NEVER falls back
+    to `normalize_slot(slot)`. When the slot's account is not signed into the Argon browser
+    (`Default/Preferences`), it raises `RuntimeError` so the lane stops with a clear message.
     """
     if isolated_profile:
         return "/u/0/"
-    from argon_pool_login import AccountNotSignedInError
-
-    cfg = PoolConfig()
+    cfg = PoolConfig(profile_dir_override=profile_dir_override)
+    # Round 21: keep the pool file in step with the browser before resolving, so a
+    # stale snapshot can never be used and the file itself stays corrected.
     try:
         cfg.resync_account_indexes()
     except Exception:
         pass
-    try:
-        acct_idx = cfg.get_account_index(slot)
-        return f"/u/{acct_idx}/"
-    except AccountNotSignedInError:
-        if strict:
-            raise
-        return normalize_slot(slot) if slot else "/u/0/"
-    except Exception:
-        if strict and cfg.accounts:
-            raise
-        return normalize_slot(slot) if slot else "/u/0/"
+    target_slot = normalize_slot(slot) if slot else cfg.active_slot()
+    acc = cfg.get_by_slot(target_slot)
+    email = str((acc or {}).get("email") or "").strip()
+    from safe_browser import verify_account_index_in_preferences
+
+    _, found_idx, all_pref_emails = verify_account_index_in_preferences(cfg.profile_dir, email)
+    if email and found_idx is not None:
+        return f"/u/{int(found_idx)}/"
+    if not email and target_slot != "/u/0/":
+        raise RuntimeError(
+            f"Slot {target_slot} has no configured account email in PoolConfig; "
+            f"refusing to fall back to slot number {target_slot} (Rule R15)."
+        )
+    if all_pref_emails or (cfg.profile_dir / "Default" / "Preferences").is_file() or not isinstance(acc, dict):
+        if not strict:
+            # Only for the paths that RE-OPEN a conversation whose own URL already carries
+            # the right /u/<index>/ - they must keep working while the pool file is out of
+            # step with the browser.
+            return normalize_slot(slot) if slot else "/u/0/"
+        raise RuntimeError(
+            f"Slot {target_slot} ({email or 'unconfigured'}) is not signed into the Argon browser "
+            f"(registered_accounts={len(all_pref_emails)}); refusing to fall back to slot number {target_slot} (Rule R15)."
+        )
+    acct_idx = cfg.get_account_index(target_slot)
+    return f"/u/{int(acct_idx)}/"
 
 
 def _profile_is_isolated_slot(profile_dir: Any) -> bool:
@@ -4625,6 +4628,61 @@ def _launch_with_fallback(p, launch_kwargs: dict, chrome_exe: Optional[str], pro
     if last_exc is not None:
         raise last_exc
     return None
+
+_r23_orig_launch_with_fallback = _launch_with_fallback
+
+
+def _launch_with_fallback(p, launch_kwargs: dict, chrome_exe: Optional[str], profile_dir: Path):
+    """Round 23 wrapper for `_launch_with_fallback` (Rules R2, R4, R8, R14).
+
+    Waits if the profile is busy, strips `--disable-blink-features=AutomationControlled` and
+    `--disable-extensions-except`, and prints 'Companion extension loaded' ONLY when verified via CDP.
+    """
+    wait_deadline = time.monotonic() + 60.0
+    while _profile_is_busy(profile_dir) and time.monotonic() < wait_deadline:
+        print(f"[i] Profile {profile_dir} is busy; waiting for the active browser session (Rule R4)...")
+        time.sleep(1.5)
+
+    eff_kwargs = dict(launch_kwargs)
+    clean_args = [
+        str(a)
+        for a in (eff_kwargs.get("args") or [])
+        if not str(a).startswith("--disable-extensions-except=")
+        and str(a) != "--disable-blink-features=AutomationControlled"
+    ]
+    if "--enable-unsafe-extension-debugging" not in clean_args:
+        clean_args.append("--enable-unsafe-extension-debugging")
+    eff_kwargs["args"] = clean_args
+
+    prev_env = os.environ.get("ARGON_DISABLE_COMPANION_EXTENSION")
+    ctx = None
+    try:
+        os.environ["ARGON_DISABLE_COMPANION_EXTENSION"] = "1"
+        ctx = _r23_orig_launch_with_fallback(p, eff_kwargs, chrome_exe, profile_dir)
+    finally:
+        if prev_env is None:
+            os.environ.pop("ARGON_DISABLE_COMPANION_EXTENSION", None)
+        else:
+            os.environ["ARGON_DISABLE_COMPANION_EXTENSION"] = prev_env
+
+    if ctx is not None:
+        from safe_browser import ensure_companion_extension_installed, get_companion_extension_dir
+
+        ext_dir = get_companion_extension_dir()
+        if ext_dir is not None:
+            ext_rep = ensure_companion_extension_installed(browser=ctx, profile_dir=profile_dir, ext_dir=ext_dir)
+            if ext_rep.get("ok"):
+                print(
+                    f"[+] Companion extension loaded and verified via CDP: "
+                    f"{ext_rep.get('name')} {ext_rep.get('version')} (id={ext_rep.get('id')})"
+                )
+            else:
+                print(
+                    f"[!] Companion extension could not be verified via CDP ({ext_rep.get('reason')}); "
+                    "using pure-Python fallback path."
+                )
+    return ctx
+
 
 class TaskState:
     """Remembers, per project, which conversation the current task is in and how
@@ -5615,7 +5673,12 @@ RE_THINK_HIGH = re.compile(r"(^|\b)(high|উচ্চ|হাই)(\b|$)", re.IGNO
 RE_PLUS = re.compile(r"^\s*\+\s*$")
 RE_THINKING = re.compile(r"(thinking|চিন্তা|reasoning)", re.IGNORECASE)
 RE_FLASH = re.compile(
-    r"(?:^|\b)(?:3\.8\s*flash|2\.5\s*flash|2\.0\s*flash|gemini[\s\-_]*flash|flash|ফ্ল্যাশ)(?:\b|$)",
+    r"(?:^|\b)(?:3\.8\s*flash|2\.5\s*flash|2\.0\s*flash|gemini[\s\-_]*flash|flash|ফ্ল্যাশ|"
+    r"4\s*hydrogen|gemini[\s\-_]*4[\s\-_]*hydrogen|hydrogen|হাইড্রোজেন|everyday\s*help)(?:\b|$)",
+    re.IGNORECASE,
+)
+RE_HYDROGEN = re.compile(
+    r"(?:^|\b)(?:4\s*hydrogen|gemini[\s\-_]*4[\s\-_]*hydrogen|hydrogen|হাইড্রোজেন|everyday\s*help)(?:\b|$)",
     re.IGNORECASE,
 )
 
@@ -8593,6 +8656,48 @@ def run_preflight_selftest_cli(headless: bool = True, require_extension: bool = 
     return EXIT_SUCCESS
 
 
+try:
+    from round23_reliability import (
+        DEFAULT_WAIT_DEADLINE_SECONDS,
+        MAX_BASE64_ATTACH_BYTES,
+        _attach_zip_via_cdp_dom_file_input,
+        _check_page_responsive,
+        _is_toggle_control,
+        _normalize_viewer_geometry,
+        _prove_page_responsive_after_capture,
+        _recover_wedged_tab_via_cdp,
+        _verify_tab_on_own_conversation,
+        attach_images_to_composer,
+        install_round23_bridge_hooks,
+    )
+    install_round23_bridge_hooks(globals())
+except Exception as _r23_import_exc:
+    print(f"[ERROR] Could not load round23_reliability hooks: {_r23_import_exc}", file=sys.stderr)
+    raise
+
+_r23_orig_run_preflight_selftest_cli = run_preflight_selftest_cli
+
+
+def run_preflight_selftest_cli(headless: bool = True, require_extension: bool = False) -> int:
+    """Run preflight self-tests plus Round 23 reliability & single-session verification suite."""
+    rc = _r23_orig_run_preflight_selftest_cli(headless=headless, require_extension=require_extension)
+    if rc != EXIT_SUCCESS:
+        return rc
+    from test_round23_reliability import run_round23_reliability_suite
+
+    r23_rep = run_round23_reliability_suite()
+    if not r23_rep.get("ok"):
+        print(f"[ERROR] Round 23 reliability self-test failed: {r23_rep}", file=sys.stderr)
+        return EXIT_PREFLIGHT_FAILED
+    e2e = r23_rep["e2e_single_session"]
+    print(
+        f"  Round 23 reliability: OK (R1-R16 verified in {r23_rep.get('elapsed_ms')} ms: "
+        f"model={e2e.get('model_verified')!r}, ext_id={e2e.get('extension_id')}, "
+        f"overflow_viewer=clamped, wedge_recovery={e2e.get('wedge_recovery_method')})"
+    )
+    return EXIT_SUCCESS
+
+
 def _find_composer(page):
     """Return the prompt composer element, or None when there is none.
 
@@ -10561,8 +10666,9 @@ def dispatch_to_argon(
     lane: Optional[str] = None,
     skip_package: bool = False,
     force: bool = False,
-    deadline_seconds: int = 1800,
+    deadline_seconds: int = 5400,
     brief_summary: Optional[str] = None,
+    attach_images: Optional[List[str]] = None,
 ) -> int:
     proj_root = Path(project_path).resolve()
     zip_path = proj_root / output_zip if not Path(output_zip).is_absolute() else Path(output_zip)
@@ -11965,10 +12071,16 @@ def dispatch_to_argon(
                     "will start a fresh chat."
                 )
 
+            if just_sent_prompt and attach_images:
+                img_ok, img_list, img_err = attach_images_to_composer(page, attach_images, open_upload_menu_fn=_open_upload_menu)
+                if not img_ok:
+                    print(f"[ERROR] --attach-images failed: {img_err}", file=sys.stderr)
+                    return EXIT_PREFLIGHT_FAILED
+
             if just_sent_prompt:
                 _print_prompt_sent_banner(sent_hms, chat_title, effective_chat_url)
 
-            eff_deadline_secs = max(60, int(deadline_seconds or 1800))
+            eff_deadline_secs = max(60, int(deadline_seconds or 5400))
             print(f"[+] Waiting for Gemini 4 Argon response (deadline: {_format_elapsed(eff_deadline_secs)})...")
             deadline = time.monotonic() + float(eff_deadline_secs)
             extracted_patch: Optional[str] = None
@@ -13031,8 +13143,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--deadline-seconds",
         type=int,
-        default=1800,
-        help="Maximum seconds to wait for Argon's response before saving state for --resume (default: 1800 = 30 min).",
+        default=5400,
+        help="Maximum seconds to wait for Argon's response before saving state for --resume (default: 5400 = 90 min).",
     )
     parser.add_argument(
         "--register-task-start",
@@ -13126,6 +13238,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--self-test",
         action="store_true",
         help="Run the fast local preflight self-test against a synthetic Gemini page (verifying attach, paste, model/mode, send, and paged Drive text capture in seconds).",
+    )
+    parser.add_argument(
+        "--install-extension",
+        action="store_true",
+        help="Install (or verify) the MV3 companion extension into the Argon browser via CDP Extensions.loadUnpacked and confirm its content script is alive on a Gemini page.",
+    )
+    parser.add_argument(
+        "--attach-images",
+        nargs="*",
+        default=None,
+        metavar="IMAGE",
+        help="Attach one or more image files (.png, .jpg, .webp, .svg) to the composer via CDP DOM.setFileInputFiles before sending.",
     )
     parser.add_argument(
         "--no-extension",
@@ -13758,6 +13882,15 @@ def main(argv: Optional[List[str]] = None) -> int:
             selftest=bool(getattr(args, "browser_loop_selftest", False)),
             allow_eval=bool(getattr(args, "browser_allow_eval", False)),
             slot=args.slot,
+        )
+
+    if getattr(args, "install_extension", False):
+        from safe_browser import install_companion_extension_cli
+
+        return install_companion_extension_cli(
+            slot=args.slot,
+            project_path=args.project_path,
+            headless=bool(getattr(args, "headless", False)),
         )
 
     if getattr(args, "close_browser", False):

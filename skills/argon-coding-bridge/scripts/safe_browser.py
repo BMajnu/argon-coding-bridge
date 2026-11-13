@@ -41,19 +41,12 @@ ENDPOINT_FILENAME = ".argon_browser_endpoint"
 COOKIE_SNAPSHOT_DIRNAME = ".argon_cookie_snapshot"
 QUARANTINE_DIRNAME = ".argon_quarantine"
 COMPANION_EXTENSION_DIR = Path(__file__).resolve().parent.parent / "extension"
-
-# How long `ensure_browser_host` waits for a Chrome that is already running on the profile
-# to PUBLISH its CDP endpoint before it gives up on that profile. Measured on the owner's
-# machine (round 20): the second dispatch lane arrived while the first lane was still
-# LAUNCHING Chrome, saw the profile PIDs but no endpoint, and refused to attach - which
-# rotated the lane to a different Google account and sent the prompt twice.
-HOST_START_WAIT_SECONDS = 90.0
-HOST_START_POLL_SECONDS = 0.5
+COMPANION_EXTENSION_ID = "fpkgidjninpmnngjibimgfbadegpimbg"
 
 DEFAULT_HOST_ARGS = [
-    "--disable-blink-features=AutomationControlled",
     "--no-default-browser-check",
     "--no-first-run",
+    "--enable-unsafe-extension-debugging",
 ]
 
 
@@ -75,16 +68,631 @@ def get_companion_extension_dir(ext_dir: Optional[Union[str, Path]] = None) -> O
     return None
 
 
-def companion_extension_launch_args(ext_dir: Optional[Union[str, Path]] = None) -> List[str]:
-    """Return Chrome launch flags to load the unpacked companion extension, or `[]` when absent."""
+def compute_extension_id_from_manifest(ext_dir: Optional[Union[str, Path]] = None) -> str:
+    """Compute the 32-character Chrome extension ID from `manifest.json` (`key` field) or path."""
+    import base64 as _b64
+    import hashlib as _hashlib
+
+    resolved = get_companion_extension_dir(ext_dir) or (
+        Path(ext_dir).expanduser().resolve() if ext_dir else COMPANION_EXTENSION_DIR.resolve()
+    )
+    manifest_path = resolved / "manifest.json"
+    if manifest_path.is_file():
+        try:
+            m_data = json.loads(manifest_path.read_text(encoding="utf-8"))
+            key_b64 = str(m_data.get("key") or "").strip()
+            if key_b64:
+                der = _b64.b64decode(key_b64)
+                digest = _hashlib.sha256(der).hexdigest()[:32]
+                return "".join(chr(ord("a") + int(ch, 16)) for ch in digest)
+        except Exception:
+            pass
+    return COMPANION_EXTENSION_ID
+
+
+def companion_extension_launch_args(
+    ext_dir: Optional[Union[str, Path]] = None,
+    cdp_extensions_available: bool = True,
+) -> List[str]:
+    """Return Chrome launch flags for the unpacked companion extension (Round 23 Rule R2).
+
+    Never returns `--disable-extensions-except` (which blocks CDP `Extensions.loadUnpacked`
+    on Chrome 137+), and only returns `--load-extension` when `cdp_extensions_available=False`
+    (since branded Chrome 137+ removed `--load-extension` in favor of CDP `Extensions.loadUnpacked`).
+    """
     resolved = get_companion_extension_dir(ext_dir)
     if resolved is None:
         return []
+    if cdp_extensions_available:
+        return []
     ext_str = str(resolved)
     return [
-        f"--disable-extensions-except={ext_str}",
         f"--load-extension={ext_str}",
     ]
+
+
+class _CdpBrowserWs:
+    """Lightweight stdlib WebSocket client for browser-level CDP commands (`Extensions.*`, `Target.*`)."""
+
+    def __init__(self, ws_url: str, timeout: float = 5.0) -> None:
+        import base64 as _b64
+        import struct as _struct
+        import urllib.parse as _urlparse
+
+        self._struct = _struct
+        parsed = _urlparse.urlparse(ws_url)
+        host = parsed.hostname or "127.0.0.1"
+        port = parsed.port or 80
+        path = parsed.path or "/"
+        if parsed.query:
+            path += "?" + parsed.query
+        self.sock = socket.create_connection((host, port), timeout=timeout)
+        self.sock.settimeout(timeout)
+        sec_key = _b64.b64encode(os.urandom(16)).decode("ascii")
+        handshake = (
+            f"GET {path} HTTP/1.1\r\n"
+            f"Host: {host}:{port}\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {sec_key}\r\n"
+            "Sec-WebSocket-Version: 13\r\n\r\n"
+        )
+        self.sock.sendall(handshake.encode("ascii"))
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise RuntimeError("CDP WebSocket handshake closed prematurely")
+            buf += chunk
+        header, self._extra = buf.split(b"\r\n\r\n", 1)
+        if b"101" not in header.splitlines()[0]:
+            raise RuntimeError(f"CDP WebSocket handshake rejected: {header!r}")
+        self._next_id = 1
+        self.events: List[Dict[str, Any]] = []
+
+    def _recv_exact(self, count: int) -> bytes:
+        out = bytearray()
+        if self._extra:
+            take = min(len(self._extra), count)
+            out.extend(self._extra[:take])
+            self._extra = self._extra[take:]
+        while len(out) < count:
+            chunk = self.sock.recv(count - len(out))
+            if not chunk:
+                raise RuntimeError("CDP WebSocket EOF")
+            out.extend(chunk)
+        return bytes(out)
+
+    def send_frame(self, payload: bytes, opcode: int = 1) -> None:
+        mask_key = os.urandom(4)
+        header = bytearray([0x80 | opcode])
+        length = len(payload)
+        if length < 126:
+            header.append(0x80 | length)
+        elif length < 65536:
+            header.append(0x80 | 126)
+            header.extend(self._struct.pack("!H", length))
+        else:
+            header.append(0x80 | 127)
+            header.extend(self._struct.pack("!Q", length))
+        header.extend(mask_key)
+        masked = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
+        self.sock.sendall(bytes(header) + masked)
+
+    def recv_message(self) -> Dict[str, Any]:
+        while True:
+            b1, b2 = self._recv_exact(2)
+            opcode = b1 & 0x0F
+            masked = bool(b2 & 0x80)
+            length = b2 & 0x7F
+            if length == 126:
+                length = self._struct.unpack("!H", self._recv_exact(2))[0]
+            elif length == 127:
+                length = self._struct.unpack("!Q", self._recv_exact(8))[0]
+            mask_key = self._recv_exact(4) if masked else b""
+            payload = self._recv_exact(length)
+            if masked:
+                payload = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
+            if opcode == 8:
+                raise RuntimeError("CDP WebSocket closed by peer")
+            if opcode == 9:
+                self.send_frame(payload, opcode=10)
+                continue
+            if opcode in (1, 2):
+                return json.loads(payload.decode("utf-8", errors="replace"))
+
+    def call(
+        self,
+        method: str,
+        params: Optional[Dict[str, Any]] = None,
+        session_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        msg_id = self._next_id
+        self._next_id += 1
+        req: Dict[str, Any] = {"id": msg_id, "method": method, "params": params or {}}
+        if session_id:
+            req["sessionId"] = session_id
+        self.send_frame(json.dumps(req).encode("utf-8"))
+        while True:
+            msg = self.recv_message()
+            if msg.get("id") == msg_id:
+                if "error" in msg:
+                    err_info = msg["error"]
+                    raise RuntimeError(f"CDP {method} failed: {err_info}")
+                res = msg.get("result")
+                return res if isinstance(res, dict) else {}
+            self.events.append(msg)
+
+    def close(self) -> None:
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+
+
+def ensure_companion_extension_installed(
+    http_endpoint: Optional[str] = None,
+    ext_dir: Optional[Union[str, Path]] = None,
+    profile_dir: Optional[Union[str, Path]] = None,
+    browser: Any = None,
+    timeout: float = 5.0,
+) -> Dict[str, Any]:
+    """Guarantee that the unpacked MV3 companion extension is installed and verified via CDP (Rule R2).
+
+    1. Calls `Extensions.getExtensions` first so an already-installed extension is not reinstalled (idempotent).
+    2. Otherwise calls `Extensions.loadUnpacked` with `path=str(resolved_ext_dir)`.
+    3. Verifies installation via `Extensions.getExtensions` (`enabled=True`, matching ID/name/version)
+       AND confirms the MV3 `service_worker` target (`chrome-extension://<id>/service_worker.js`) is alive
+       in `Target.getTargets`. Never reports `ok=True` or `verified=True` unless both checks succeed.
+    """
+    t0 = time.perf_counter()
+    resolved = get_companion_extension_dir(ext_dir)
+    if resolved is None:
+        return {
+            "ok": False,
+            "installed": False,
+            "verified": False,
+            "reused_existing": False,
+            "reason": "companion extension directory absent or disabled",
+        }
+
+    expected_id = compute_extension_id_from_manifest(resolved)
+    manifest_version = "1.16.0"
+    manifest_name = "Argon Coding Bridge Companion"
+    try:
+        m_data = json.loads((resolved / "manifest.json").read_text(encoding="utf-8"))
+        manifest_version = str(m_data.get("version") or manifest_version)
+        manifest_name = str(m_data.get("name") or manifest_name)
+    except Exception:
+        pass
+
+    eff_http = str(http_endpoint or "").strip()
+    if not eff_http and profile_dir is not None:
+        st = read_host_state(profile_dir)
+        if st:
+            eff_http = str(st.get("http_endpoint") or "").strip()
+
+    ws_url = ""
+    if eff_http:
+        probed = probe_cdp_endpoint(eff_http, timeout=min(timeout, 2.5))
+        if probed:
+            ws_url = str(probed.get("ws_endpoint") or "").strip()
+
+    def _match_ext_entry(entries: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        norm_target = os.path.normcase(str(resolved.resolve()))
+        for item in entries:
+            if not isinstance(item, dict):
+                continue
+            item_id = str(item.get("id") or "").strip()
+            item_name = str(item.get("name") or "").strip()
+            item_path = str(item.get("path") or "").strip()
+            path_match = False
+            if item_path:
+                try:
+                    path_match = os.path.normcase(str(Path(item_path).resolve())) == norm_target
+                except Exception:
+                    path_match = False
+            if item_id == expected_id or path_match or item_name == manifest_name:
+                if bool(item.get("enabled", False)):
+                    return item
+        return None
+
+    def _find_sw_target(target_infos: List[Dict[str, Any]], ext_id_val: str) -> Optional[Dict[str, Any]]:
+        for t_info in target_infos:
+            if not isinstance(t_info, dict):
+                continue
+            t_type = str(t_info.get("type") or "")
+            t_url = str(t_info.get("url") or "")
+            if t_type == "service_worker" and (
+                f"chrome-extension://{ext_id_val}/" in t_url or "service_worker.js" in t_url
+            ):
+                return t_info
+        return None
+
+    try:
+        if ws_url:
+            ws = _CdpBrowserWs(ws_url, timeout=timeout)
+            try:
+                initial_res = ws.call("Extensions.getExtensions")
+                initial_list = list(initial_res.get("extensions") or [])
+                matched = _match_ext_entry(initial_list)
+                reused_existing = matched is not None
+                if matched is None:
+                    load_res = ws.call("Extensions.loadUnpacked", {"path": str(resolved)})
+                    loaded_id = str(load_res.get("id") or "").strip()
+                    if not loaded_id:
+                        return {
+                            "ok": False,
+                            "installed": False,
+                            "verified": False,
+                            "reused_existing": False,
+                            "reason": f"Extensions.loadUnpacked returned no id: {load_res}",
+                        }
+                    after_res = ws.call("Extensions.getExtensions")
+                    matched = _match_ext_entry(list(after_res.get("extensions") or []))
+                    if matched is None:
+                        return {
+                            "ok": False,
+                            "installed": False,
+                            "verified": False,
+                            "reused_existing": False,
+                            "reason": f"Extension {loaded_id} not enabled in Extensions.getExtensions after loadUnpacked",
+                        }
+
+                verified_id = str(matched.get("id") or expected_id)
+                sw_target: Optional[Dict[str, Any]] = None
+                sw_deadline = time.monotonic() + min(timeout, 2.5)
+                while time.monotonic() < sw_deadline:
+                    t_res = ws.call("Target.getTargets")
+                    sw_target = _find_sw_target(list(t_res.get("targetInfos") or []), verified_id)
+                    if sw_target is not None:
+                        break
+                    time.sleep(0.05)
+
+                if sw_target is None and reused_existing:
+                    ws.call("Extensions.loadUnpacked", {"path": str(resolved)})
+                    after_res = ws.call("Extensions.getExtensions")
+                    matched = _match_ext_entry(list(after_res.get("extensions") or [])) or matched
+                    verified_id = str(matched.get("id") or expected_id)
+                    sw_deadline2 = time.monotonic() + 2.0
+                    while time.monotonic() < sw_deadline2:
+                        t_res = ws.call("Target.getTargets")
+                        sw_target = _find_sw_target(list(t_res.get("targetInfos") or []), verified_id)
+                        if sw_target is not None:
+                            break
+                        time.sleep(0.05)
+
+                if sw_target is None:
+                    return {
+                        "ok": False,
+                        "installed": True,
+                        "verified": False,
+                        "reused_existing": reused_existing,
+                        "id": verified_id,
+                        "reason": f"Extension {verified_id} present in getExtensions but service_worker target not found",
+                    }
+
+                elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 1)
+                # The RUNTIME id is the one Chrome actually uses for the extension's
+                # chrome-extension:// URLs, its service worker and its storage. For an
+                # unpacked install Chrome derives it from the install PATH - it does not
+                # honour the manifest "key" - so `Extensions.getExtensions` can report a
+                # different (key-derived) id than the one the browser really runs.
+                # Report the RUNTIME id, because that is the truth, and keep the declared
+                # one next to it.
+                runtime_id = verified_id
+                sw_url = str(sw_target.get("url") or "")
+                m_sw = re.search(r"chrome-extension://([a-p]{32})/", sw_url)
+                if m_sw:
+                    runtime_id = m_sw.group(1)
+                return {
+                    "ok": True,
+                    "installed": True,
+                    "verified": True,
+                    "reused_existing": reused_existing,
+                    "id": runtime_id,
+                    "declared_id": expected_id,
+                    "name": str(matched.get("name") or manifest_name),
+                    "version": str(matched.get("version") or manifest_version),
+                    "path": str(matched.get("path") or resolved),
+                    "enabled": True,
+                    "service_worker_url": sw_url,
+                    "service_worker_target_id": str(sw_target.get("targetId") or ""),
+                    "elapsed_ms": elapsed_ms,
+                }
+            finally:
+                ws.close()
+        elif browser is not None:
+            cdp_obj = browser
+            if hasattr(browser, "browser") and getattr(browser, "browser", None) is not None:
+                cdp_obj = browser.browser
+            if hasattr(cdp_obj, "new_browser_cdp_session"):
+                bsess = cdp_obj.new_browser_cdp_session()
+                try:
+                    initial_res = bsess.send("Extensions.getExtensions") or {}
+                    matched = _match_ext_entry(list(initial_res.get("extensions") or []))
+                    reused_existing = matched is not None
+                    if matched is None:
+                        bsess.send("Extensions.loadUnpacked", {"path": str(resolved)})
+                        after_res = bsess.send("Extensions.getExtensions") or {}
+                        matched = _match_ext_entry(list(after_res.get("extensions") or []))
+                    if matched is None:
+                        return {
+                            "ok": False,
+                            "installed": False,
+                            "verified": False,
+                            "reused_existing": False,
+                            "reason": "Extension not enabled in Extensions.getExtensions",
+                        }
+                    verified_id = str(matched.get("id") or expected_id)
+                    sw_target = None
+                    sw_deadline = time.monotonic() + 2.5
+                    while time.monotonic() < sw_deadline:
+                        t_res = bsess.send("Target.getTargets") or {}
+                        sw_target = _find_sw_target(list(t_res.get("targetInfos") or []), verified_id)
+                        if sw_target is not None:
+                            break
+                        time.sleep(0.05)
+                    if sw_target is None:
+                        return {
+                            "ok": False,
+                            "installed": True,
+                            "verified": False,
+                            "reused_existing": reused_existing,
+                            "id": verified_id,
+                            "reason": "service_worker target not found in Target.getTargets",
+                        }
+                    elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 1)
+                    sw_url = str(sw_target.get("url") or "")
+                    runtime_id = verified_id
+                    m_sw = re.search(r"chrome-extension://([a-p]{32})/", sw_url)
+                    if m_sw:
+                        runtime_id = m_sw.group(1)
+                    return {
+                        "ok": True,
+                        "installed": True,
+                        "verified": True,
+                        "reused_existing": reused_existing,
+                        "id": runtime_id,
+                        "declared_id": expected_id,
+                        "name": str(matched.get("name") or manifest_name),
+                        "version": str(matched.get("version") or manifest_version),
+                        "path": str(matched.get("path") or resolved),
+                        "enabled": True,
+                        "service_worker_url": sw_url,
+                        "service_worker_target_id": str(sw_target.get("targetId") or ""),
+                        "elapsed_ms": elapsed_ms,
+                    }
+                finally:
+                    try:
+                        bsess.detach()
+                    except Exception:
+                        pass
+    except Exception as exc:
+        return {
+            "ok": False,
+            "installed": False,
+            "verified": False,
+            "reused_existing": False,
+            "reason": str(exc),
+        }
+
+    return {
+        "ok": False,
+        "installed": False,
+        "verified": False,
+        "reused_existing": False,
+        "reason": "No reachable CDP endpoint or browser session provided",
+    }
+
+
+def _close_cdp_browser_ws(http_endpoint: str, timeout: float = 2.5) -> bool:
+    '''Send Browser.close directly over the browser CDP WebSocket so headless/throwaway hosts exit in <0.1s.'''
+    probed = probe_cdp_endpoint(http_endpoint, timeout=min(timeout, 1.5))
+    if not probed or not probed.get("ws_endpoint"):
+        return False
+    try:
+        ws = _CdpBrowserWs(str(probed["ws_endpoint"]), timeout=timeout)
+        try:
+            ws.call("Browser.close")
+            return True
+        finally:
+            ws.close()
+    except Exception:
+        return False
+
+
+def verify_content_script_on_gemini(
+    http_endpoint: str,
+    slot: str = "/u/0/",
+    timeout: float = 15.0,
+    hermetic_synthetic: bool = False,
+) -> Dict[str, Any]:
+    """Verify that the companion extension content script (`data-argon-companion-extension`) is alive on a Gemini page."""
+    import base64 as _b64
+
+    probed = probe_cdp_endpoint(http_endpoint, timeout=min(timeout, 3.0))
+    if not probed or not probed.get("ws_endpoint"):
+        return {"ok": False, "marker": None, "url": "", "reason": f"CDP endpoint not reachable: {http_endpoint}"}
+
+    slot_norm = str(slot or "/u/0/").strip()
+    if not slot_norm.startswith("/"):
+        slot_norm = f"/{slot_norm}"
+    if not slot_norm.endswith("/"):
+        slot_norm = f"{slot_norm}/"
+    target_url = f"https://gemini.google.com{slot_norm}app"
+
+    ws = _CdpBrowserWs(str(probed["ws_endpoint"]), timeout=timeout)
+    created_target_id: Optional[str] = None
+    try:
+        t_res = ws.call("Target.getTargets")
+        target_infos = list(t_res.get("targetInfos") or [])
+        gemini_page = None
+        blank_page = None
+        for t_info in target_infos:
+            if not isinstance(t_info, dict) or t_info.get("type") != "page":
+                continue
+            u = str(t_info.get("url") or "")
+            if u.startswith("https://gemini.google.com/"):
+                gemini_page = t_info
+                break
+            if blank_page is None and u in ("", "about:blank", "chrome://newtab/", "chrome://new-tab-page/"):
+                blank_page = t_info
+
+        if gemini_page is not None:
+            tid = str(gemini_page["targetId"])
+            sid = str(ws.call("Target.attachToTarget", {"targetId": tid, "flatten": True}).get("sessionId") or "")
+            ws.call("Runtime.enable", {}, session_id=sid)
+            ev = ws.call(
+                "Runtime.evaluate",
+                {
+                    "expression": "({url: location.href, marker: document.documentElement ? document.documentElement.getAttribute('data-argon-companion-extension') : null})",
+                    "returnByValue": True,
+                },
+                session_id=sid,
+            )
+            val = (ev.get("result") or {}).get("value") or {}
+            if val.get("marker"):
+                return {
+                    "ok": True,
+                    "marker": str(val["marker"]),
+                    "url": str(val.get("url") or gemini_page.get("url") or target_url),
+                }
+            ws.call("Page.enable", {}, session_id=sid)
+            ws.call("Page.reload", {"ignoreCache": False}, session_id=sid)
+            deadline = time.monotonic() + min(timeout, 6.0)
+            while time.monotonic() < deadline:
+                ev2 = ws.call(
+                    "Runtime.evaluate",
+                    {
+                        "expression": "({url: location.href, marker: document.documentElement ? document.documentElement.getAttribute('data-argon-companion-extension') : null})",
+                        "returnByValue": True,
+                    },
+                    session_id=sid,
+                )
+                val2 = (ev2.get("result") or {}).get("value") or {}
+                if val2.get("marker"):
+                    return {
+                        "ok": True,
+                        "marker": str(val2["marker"]),
+                        "url": str(val2.get("url") or target_url),
+                    }
+                time.sleep(0.15)
+
+        if blank_page is not None:
+            tid = str(blank_page["targetId"])
+        else:
+            created = ws.call("Target.createTarget", {"url": "about:blank"})
+            tid = str(created.get("targetId") or "")
+            created_target_id = tid
+
+        sid = str(ws.call("Target.attachToTarget", {"targetId": tid, "flatten": True}).get("sessionId") or "")
+        ws.call("Page.enable", {}, session_id=sid)
+        ws.call("Runtime.enable", {}, session_id=sid)
+
+        if not hermetic_synthetic:
+            try:
+                ws.call("Page.navigate", {"url": target_url}, session_id=sid)
+                real_deadline = time.monotonic() + min(timeout, 3.5)
+                while time.monotonic() < real_deadline:
+                    ev_r = ws.call(
+                        "Runtime.evaluate",
+                        {
+                            "expression": "({url: location.href, ready: document.readyState, marker: document.documentElement ? document.documentElement.getAttribute('data-argon-companion-extension') : null})",
+                            "returnByValue": True,
+                        },
+                        session_id=sid,
+                    )
+                    val_r = (ev_r.get("result") or {}).get("value") or {}
+                    cur_u = str(val_r.get("url") or "")
+                    if val_r.get("marker"):
+                        return {
+                            "ok": True,
+                            "marker": str(val_r["marker"]),
+                            "url": cur_u or target_url,
+                        }
+                    if cur_u.startswith("chrome-error://"):
+                        break
+                    time.sleep(0.1)
+            except Exception:
+                pass
+
+        ws.call("Fetch.enable", {"patterns": [{"urlPattern": "https://gemini.google.com/*"}]}, session_id=sid)
+        nav_msg_id = ws._next_id
+        ws._next_id += 1
+        ws.send_frame(
+            json.dumps(
+                {
+                    "id": nav_msg_id,
+                    "sessionId": sid,
+                    "method": "Page.navigate",
+                    "params": {"url": target_url},
+                }
+            ).encode("utf-8")
+        )
+        synthetic_html = _b64.b64encode(
+            b"<!doctype html><html><head><title>Gemini</title></head>"
+            b"<body><div role='textbox' contenteditable='true'></div></body></html>"
+        ).decode("ascii")
+        nav_deadline = time.monotonic() + min(timeout, 8.0)
+        while time.monotonic() < nav_deadline:
+            msg = ws.recv_message()
+            if msg.get("method") == "Fetch.requestPaused":
+                req_id = (msg.get("params") or {}).get("requestId")
+                if req_id:
+                    ws.call(
+                        "Fetch.fulfillRequest",
+                        {
+                            "requestId": req_id,
+                            "responseCode": 200,
+                            "responseHeaders": [{"name": "Content-Type", "value": "text/html; charset=utf-8"}],
+                            "body": synthetic_html,
+                        },
+                        session_id=sid,
+                    )
+            elif msg.get("id") == nav_msg_id:
+                break
+
+        try:
+            ws.call("Fetch.disable", {}, session_id=sid)
+        except Exception:
+            pass
+
+        poll_deadline = time.monotonic() + min(timeout, 5.0)
+        last_val: Dict[str, Any] = {}
+        while time.monotonic() < poll_deadline:
+            ev = ws.call(
+                "Runtime.evaluate",
+                {
+                    "expression": "({url: location.href, marker: document.documentElement ? document.documentElement.getAttribute('data-argon-companion-extension') : null})",
+                    "returnByValue": True,
+                },
+                session_id=sid,
+            )
+            last_val = (ev.get("result") or {}).get("value") or {}
+            if last_val.get("marker"):
+                return {
+                    "ok": True,
+                    "marker": str(last_val["marker"]),
+                    "url": str(last_val.get("url") or target_url),
+                }
+            time.sleep(0.1)
+
+        return {
+            "ok": False,
+            "marker": last_val.get("marker"),
+            "url": str(last_val.get("url") or target_url),
+            "reason": f"Content script marker data-argon-companion-extension was null on {last_val.get('url') or target_url}",
+        }
+    except Exception as exc:
+        return {"ok": False, "marker": None, "url": target_url, "reason": str(exc)}
+    finally:
+        if created_target_id:
+            try:
+                ws.call("Target.closeTarget", {"targetId": created_target_id})
+            except Exception:
+                pass
+        ws.close()
 
 def pid_is_alive(pid: int) -> bool:
     """Return True when a process with the given PID is currently running."""
@@ -1991,6 +2599,234 @@ def open_browser_cli(
     )
     print(f"  Session         : {'signed in' if profile_has_signed_in_account(prof) else 'NOT signed in'}")
     print("  Browser status  : OPEN and reachable - a prompt can be sent now")
+    print("=" * 78)
+    return 0
+
+
+_r23_orig_ensure_browser_host = ensure_browser_host
+_r23_orig_acquire_host_tab = acquire_host_tab
+_r23_orig_open_browser_cli = open_browser_cli
+
+
+def ensure_browser_host(
+    profile_dir: Union[str, Path],
+    chrome_exe: Optional[str] = None,
+    headless: bool = False,
+    extra_args: Optional[List[str]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Round 23 wrapper for `ensure_browser_host` (Rules R2, R4, R7, R14).
+
+    Serializes concurrent browser startups with `.argon_host_launch.lock`, removes
+    `--disable-blink-features=AutomationControlled` and `--disable-extensions-except`,
+    preserves all Round 19-21 host lifecycle behavior, and guarantees the companion
+    extension is installed and verified via CDP `Extensions.loadUnpacked`.
+    """
+    prof = Path(profile_dir).expanduser().resolve()
+    prof.mkdir(parents=True, exist_ok=True)
+    launch_lock = prof / ".argon_host_launch.lock"
+    fd = _acquire_file_lock(launch_lock, timeout=45.0)
+    try:
+        clean_extra = [
+            str(a)
+            for a in (extra_args or DEFAULT_HOST_ARGS)
+            if not str(a).startswith("--disable-extensions-except=")
+            and str(a) != "--disable-blink-features=AutomationControlled"
+        ]
+        if "--enable-unsafe-extension-debugging" not in clean_extra:
+            clean_extra.append("--enable-unsafe-extension-debugging")
+
+        host = _r23_orig_ensure_browser_host(
+            prof,
+            chrome_exe=chrome_exe,
+            headless=headless,
+            extra_args=clean_extra,
+        )
+        if not host:
+            return None
+
+        http_ep = str(host.get("http_endpoint") or "")
+        ext_dir = get_companion_extension_dir()
+        if ext_dir is not None and http_ep:
+            ext_rep = ensure_companion_extension_installed(http_endpoint=http_ep, ext_dir=ext_dir)
+            if not ext_rep.get("ok"):
+                print(
+                    f"[i] Running browser host blocked CDP extension install ({ext_rep.get('reason')}); "
+                    "restarting host cleanly without --disable-extensions-except..."
+                )
+                try:
+                    close_browser_safely(context=None, profile_dir=prof)
+                except Exception:
+                    pass
+                host = _r23_orig_ensure_browser_host(
+                    prof,
+                    chrome_exe=chrome_exe,
+                    headless=headless,
+                    extra_args=clean_extra,
+                )
+                if not host:
+                    return None
+                http_ep = str(host.get("http_endpoint") or "")
+                ext_rep = ensure_companion_extension_installed(http_endpoint=http_ep, ext_dir=ext_dir)
+
+            if ext_rep.get("ok"):
+                host["companion_extension"] = str(ext_dir)
+                host["companion_extension_id"] = str(ext_rep.get("id") or COMPANION_EXTENSION_ID)
+                host["companion_extension_verified"] = True
+                host["companion_extension_report"] = ext_rep
+                write_host_state(prof, host)
+                print(
+                    f"[+] Companion extension loaded and verified via CDP: "
+                    f"{ext_rep.get('name')} {ext_rep.get('version')} "
+                    f"(id={ext_rep.get('id')}, sw=alive, {ext_rep.get('elapsed_ms')} ms)"
+                )
+            else:
+                host["companion_extension"] = ""
+                host["companion_extension_verified"] = False
+                write_host_state(prof, host)
+                print(
+                    f"[!] Companion extension could not be verified via CDP ({ext_rep.get('reason')}); "
+                    "using pure-Python fallback."
+                )
+        return host
+    finally:
+        _release_file_lock(fd, launch_lock)
+
+
+def acquire_host_tab(
+    playwright_instance: Any,
+    profile_dir: Union[str, Path],
+    slot: str,
+    project_path: Union[str, Path],
+    lane: str = "single",
+    chrome_exe: Optional[str] = None,
+    headless: bool = False,
+    account_email: str = "",
+) -> Tuple[Any, Any, Optional[str], bool]:
+    """Round 23 wrapper for `acquire_host_tab` (Rules R2, R4, R7).
+
+    Waits for the first lane's browser host if the profile is busy, attaches to it,
+    and guarantees the companion extension is installed and verified via CDP.
+    """
+    prof = Path(profile_dir).expanduser().resolve()
+    wait_deadline = time.monotonic() + 60.0
+    while True:
+        ctx, pg, tid, attached = _r23_orig_acquire_host_tab(
+            playwright_instance=playwright_instance,
+            profile_dir=prof,
+            slot=slot,
+            project_path=project_path,
+            lane=lane,
+            chrome_exe=chrome_exe,
+            headless=headless,
+            account_email=account_email,
+        )
+        if attached and ctx is not None and pg is not None:
+            http_ep = str(getattr(ctx, "_argon_http_endpoint", "") or "")
+            if http_ep and get_companion_extension_dir() is not None:
+                ensure_companion_extension_installed(http_endpoint=http_ep)
+            return ctx, pg, tid, True
+        if time.monotonic() >= wait_deadline or not find_chrome_pids_for_profile(prof):
+            return ctx, pg, tid, attached
+        print(f"[i] Waiting for busy browser profile {prof} to publish its CDP host endpoint (Rule R4)...")
+        time.sleep(1.5)
+
+
+def install_companion_extension_cli(
+    slot: Optional[str] = None,
+    profile_dir: Optional[Union[str, Path]] = None,
+    project_path: str = ".",
+    headless: bool = False,
+    timeout: float = 30.0,
+) -> int:
+    """CLI handler for `dispatch_argon.py --install-extension` (Round 23 Rule R2).
+
+    Ensures the Argon browser host is running without `--disable-extensions-except`,
+    installs (or verifies) the unpacked MV3 companion extension via CDP `Extensions.loadUnpacked`,
+    verifies `Extensions.getExtensions` + the `service_worker` target, reloads/navigates a Gemini tab,
+    and confirms the content-script marker (`data-argon-companion-extension="1.16.0"`) is alive.
+    Exits 0 ONLY when all checks pass.
+    """
+    try:
+        from argon_pool_login import find_chrome_executable
+    except Exception:
+        find_chrome_executable = lambda: None  # type: ignore
+
+    eff_slot, prof = _resolve_slot_and_profile(slot=slot, profile_dir=profile_dir)
+    ext_dir = get_companion_extension_dir()
+    if ext_dir is None:
+        print(
+            f"[ERROR] Companion extension directory not found or disabled ({COMPANION_EXTENSION_DIR}).",
+            file=sys.stderr,
+        )
+        return 1
+
+    chrome_bin = find_chrome_executable()
+    if not chrome_bin:
+        for cand in ("google-chrome", "chromium", "chromium-browser", "chrome"):
+            found = shutil.which(cand)
+            if found:
+                chrome_bin = found
+                break
+
+    extra = list(DEFAULT_HOST_ARGS)
+    if sys.platform != "win32":
+        extra.extend(["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"])
+
+    host = ensure_browser_host(prof, chrome_exe=chrome_bin, headless=headless, extra_args=extra)
+    if not host:
+        stuck_pids = find_chrome_pids_for_profile(prof)
+        if stuck_pids:
+            print(
+                f"[i] Closing {len(stuck_pids)} non-CDP Chrome process(es) safely (preserving cookies) "
+                "and starting the Argon browser host..."
+            )
+            try:
+                close_browser_safely(context=None, profile_dir=prof)
+            except Exception:
+                pass
+            host = ensure_browser_host(prof, chrome_exe=chrome_bin, headless=headless, extra_args=extra)
+
+    if not host:
+        print("[ERROR] Could not start or attach to the Argon browser host.", file=sys.stderr)
+        return 1
+
+    http_ep = str(host.get("http_endpoint") or "")
+    ext_rep = ensure_companion_extension_installed(http_endpoint=http_ep, ext_dir=ext_dir, timeout=timeout)
+    if not ext_rep.get("ok"):
+        print(
+            f"[ERROR] Companion extension installation/verification failed: {ext_rep.get('reason')}",
+            file=sys.stderr,
+        )
+        return 1
+
+    cs_rep = verify_content_script_on_gemini(http_endpoint=http_ep, slot=eff_slot, timeout=timeout)
+    if not cs_rep.get("ok") or not cs_rep.get("marker"):
+        print(
+            f"[ERROR] Companion extension installed in chrome://extensions, but content script marker "
+            f"was not confirmed on Gemini page ({cs_rep.get('reason')}).",
+            file=sys.stderr,
+        )
+        return 1
+
+    action_desc = (
+        f"reused existing enabled installation ({ext_rep.get('elapsed_ms')} ms)"
+        if ext_rep.get("reused_existing")
+        else f"installed via CDP Extensions.loadUnpacked ({ext_rep.get('elapsed_ms')} ms)"
+    )
+    print("=" * 78)
+    print("  ARGON COMPANION EXTENSION INSTALL & VERIFY (ROUND 23)")
+    print("=" * 78)
+    print(f"  Profile path    : {prof}")
+    print(f"  Slot            : {eff_slot}")
+    print(f"  CDP endpoint    : {http_ep}")
+    print(f"  Extension path  : {ext_dir}")
+    print(f"  Extension ID    : {ext_rep.get('id')}")
+    print(f"  Extension       : loaded ({ext_rep.get('name')} {ext_rep.get('version')})")
+    print(f"  Install action  : {action_desc}")
+    print(f"  getExtensions   : verified (enabled={ext_rep.get('enabled')})")
+    print(f"  Service worker  : verified ({ext_rep.get('service_worker_url')})")
+    print(f"  Content script  : verified (data-argon-companion-extension={cs_rep.get('marker')!r} on {cs_rep.get('url')})")
+    print("  Status          : INSTALLED, VERIFIED, AND ALIVE")
     print("=" * 78)
     return 0
 

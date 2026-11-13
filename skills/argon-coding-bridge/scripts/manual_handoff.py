@@ -80,18 +80,20 @@ def compute_manual_commands(
 ) -> List[str]:
     cmds: List[str] = []
     if chrome_exe and profile_dir:
-        ext_flags = ""
+        ext_flags = "--enable-unsafe-extension-debugging "
         try:
-            from safe_browser import get_companion_extension_dir
+            from safe_browser import companion_extension_launch_args, get_companion_extension_dir
 
             ext_dir = get_companion_extension_dir()
             if ext_dir is not None:
-                ext_flags = f'--disable-extensions-except="{ext_dir}" --load-extension="{ext_dir}" '
+                extra_ext_args = companion_extension_launch_args(ext_dir, cdp_extensions_available=True)
+                if extra_ext_args:
+                    ext_flags += " ".join(extra_ext_args) + " "
         except Exception:
-            ext_flags = ""
+            pass
         cmds.append(
             f'"{chrome_exe}" --user-data-dir="{profile_dir.resolve()}" '
-            '--disable-blink-features=AutomationControlled --no-default-browser-check '
+            '--no-default-browser-check '
             f'--no-first-run {ext_flags}"{chat_url}"'
         )
     cmds.append(
@@ -307,9 +309,9 @@ def open_browser_for_slot(slot: str, chat_url: str, chrome_exe: Optional[str] = 
     args = [
         str(exe),
         f"--user-data-dir={profile_dir.resolve()}",
-        "--disable-blink-features=AutomationControlled",
         "--no-default-browser-check",
         "--no-first-run",
+        "--enable-unsafe-extension-debugging",
         target_url,
     ]
 

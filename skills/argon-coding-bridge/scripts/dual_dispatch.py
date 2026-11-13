@@ -415,7 +415,11 @@ def run_dual_dispatch(
     if winner_info is not None:
         session_store.record_winner(proj_root, winner_label)
 
-    print("[+] Starting FOLLOW-UP and NEW-SESSION processes concurrently...")
+    followup_logs: List[str] = []
+    new_logs: List[str] = []
+    # Rule R4: The two lanes must never run concurrently against the same Argon browser.
+    # Run FOLLOW-UP first, then NEW-SESSION sequentially on the shared browser host.
+    print("[+] Running FOLLOW-UP and NEW-SESSION lanes sequentially on the single Argon browser (Rule R4)...")
     proc_followup = subprocess.Popen(
         followup_cmd,
         stdout=subprocess.PIPE,
@@ -424,6 +428,15 @@ def run_dual_dispatch(
         encoding="utf-8",
         errors="replace",
     )
+    t_f = threading.Thread(
+        target=_stream_pipe,
+        args=(proc_followup.stdout, f"[FOLLOWUP {followup_slot}]", followup_logs),
+        daemon=True,
+    )
+    t_f.start()
+    rc_followup = proc_followup.wait()
+    t_f.join(timeout=5.0)
+
     proc_new = subprocess.Popen(
         new_cmd,
         stdout=subprocess.PIPE,
@@ -432,25 +445,13 @@ def run_dual_dispatch(
         encoding="utf-8",
         errors="replace",
     )
-
-    followup_logs: List[str] = []
-    new_logs: List[str] = []
-    t_f = threading.Thread(
-        target=_stream_pipe,
-        args=(proc_followup.stdout, f"[FOLLOWUP {followup_slot}]", followup_logs),
-        daemon=True,
-    )
     t_n = threading.Thread(
         target=_stream_pipe,
         args=(proc_new.stdout, f"[NEW {new_slot}]", new_logs),
         daemon=True,
     )
-    t_f.start()
     t_n.start()
-
-    rc_followup = proc_followup.wait()
     rc_new = proc_new.wait()
-    t_f.join(timeout=5.0)
     t_n.join(timeout=5.0)
 
     followup_patch = _ensure_canonical_patch_path(followup_dir)

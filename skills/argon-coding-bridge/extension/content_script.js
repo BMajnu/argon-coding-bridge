@@ -11,8 +11,10 @@
   const EXTENSION_VERSION = "1.16.0";
   const RE_TASK = /^\s*(task|টাস্ক)\s*$/i;
   const RE_CHAT = /^\s*(chat|চ্যাট|চাট)\s*$/i;
-  const RE_ARGON = /(4\s*argon|gemini[\s\-_]*4[\s\-_]*argon|(?<![\w\-])argon(?![\w\-])|আর\u09cd?গন)/i;
-  const RE_FLASH = /(?:^|\b)(?:3\.8\s*flash|2\.5\s*flash|2\.0\s*flash|gemini[\s\-_]*flash|flash|ফ্ল্যাশ)(?:\b|$)/i;
+  const RE_ARGON = /(code\s*&\s*analysis\s*4\s*argon|4\s*argon|gemini[\s\-_]*4[\s\-_]*argon|(?<![\w\-])argon(?![\w\-])|আর\u09cd?গন)/i;
+  const RE_FLASH = /(?:^|\b)(?:3\.8\s*flash|2\.5\s*flash|2\.0\s*flash|gemini[\s\-_]*flash|flash|ফ্ল্যাশ|4\s*hydrogen|gemini[\s\-_]*4[\s\-_]*hydrogen|hydrogen|হাইড্রোজেন|everyday\s*help)(?:\b|$)/i;
+  const RE_HYDROGEN = /(?:^|\b)(?:4\s*hydrogen|gemini[\s\-_]*4[\s\-_]*hydrogen|hydrogen|হাইড্রোজেন|everyday\s*help)(?:\b|$)/i;
+  const MAX_BASE64_ATTACH_BYTES = 8 * 1024 * 1024;
   const RE_UPLOAD = /(upload|attach|file|আপলোড|ডিজাইসো|ফাইল|সংযুক্ত|টুল)/i;
   const RE_SEND = /(send|submit|পাঠান)/i;
 
@@ -411,8 +413,17 @@
     }
 
     let chip = findModelChipSemantic();
+    if (!chip) {
+      return {
+        ok: false,
+        operation: "model",
+        path: "extension",
+        model: "(missing)",
+        reason: "model picker chip is missing from the page DOM (Rule R1: a missing model picker is a failure, not a pass)"
+      };
+    }
     let chipName = readModelChipName(chip);
-    if (chip && RE_ARGON.test(chipName) && !RE_FLASH.test(chipName)) {
+    if (chip && RE_ARGON.test(chipName) && !RE_FLASH.test(chipName) && !RE_HYDROGEN.test(chipName)) {
       companionRuntime.lastModelSeen = chipName;
       installComposerMutationGuard();
       return {

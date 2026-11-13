@@ -194,9 +194,9 @@ def reset_slot_profile_accounts(
 
 
 CHROME_LAUNCH_ARGS = [
-    "--disable-blink-features=AutomationControlled",
     "--no-default-browser-check",
     "--no-first-run",
+    "--enable-unsafe-extension-debugging",
 ]
 
 STATUS_OK = "OK"

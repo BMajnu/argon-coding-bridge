@@ -2,6 +2,7 @@
   "manifest_version": 3,
   "name": "Argon Coding Bridge Companion",
   "version": "1.16.0",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAzlFp3UOwyM5beNuR9dZACJijauO0QIlHNE44GMo4xHe4kFRf1i7nEi4UGU4gIRaZYst0ZNTxY8dF08RHBYbmQ1i1vlJGtJKCCBWo+1UOQ4KyjfhgUUnOsDEge73D3rEy+jgxdB797Rzjdh5SYbAw8grkRo7bsEFPmSGXGfAilUzUG2beb5I93Otwiuv8dBs6c0CnlShoNFIskiqYDhh4diOAenfO3OoxUnxBP4gN1brWR8ffne6VFB/oIEudWW2ARDZQYmlSHjozm0jB6UQERnAd6REujnwLW5rpM1AzM2khe3s6nGT9H9WoOg2Fnf+WxKzXAbm/sVOS6s8BELfcrQIDAQAB",
   "description": "MV3 companion extension for the Gemini 4 Argon Coding Bridge: DOM-independent file attach via DataTransfer, synthetic paste without clipboard permissions, semantic model/mode/send with MutationObserver, paged Drive viewer/text delivery capture, and chrome.storage.local state.",
   "permissions": [
     "scripting",
