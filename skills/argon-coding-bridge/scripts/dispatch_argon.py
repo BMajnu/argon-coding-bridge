@@ -5903,6 +5903,60 @@ def _chip_is_flash(el) -> bool:
     return bool(RE_FLASH.search(name))
 
 
+def _live_account_email_for_index(profile_dir: Any, index: int) -> str:
+    """Return the email the Argon browser holds at `/u/<index>/`.
+
+    The source of truth is the browser's own live `Default/Preferences`
+    (`account_info`) list, NOT the pool entry: the pool slot and the `/u/<N>/`
+    path are two different things and they can disagree. Returns an empty string
+    when the browser has no account at that index.
+    """
+    from safe_browser import get_preferences_accounts
+
+    try:
+        want_idx = int(index)
+    except (TypeError, ValueError):
+        return ""
+    for live_acc in get_preferences_accounts(profile_dir):
+        try:
+            live_idx = int(live_acc.get("index"))
+        except (TypeError, ValueError):
+            continue
+        if live_idx == want_idx:
+            return str(live_acc.get("email") or "").strip()
+    return ""
+
+
+def _verify_model_chip_is_argon(page, stage: str = "before send") -> tuple[bool, str]:
+    """Read the model chip back from the DOM and prove that it names Argon.
+
+    `ensure_mode_and_model` (the companion extension) and `select_argon_model` (the
+    pure-Python fallback) can report success while the chip has already fallen back
+    to another model (for example 'Hydrogen'), so the chip is read back right before
+    the prompt goes out. A chip that is present and NOT Argon aborts the send - a
+    task must never leave on a different model.
+
+    Returns `(ok, chip_name)`; `chip_name` is empty when no chip is visible at all.
+    """
+    chip = _model_chip(page)
+    if chip is None:
+        return True, ""
+    name = (_model_name(chip) or "").strip()
+    if _chip_is_argon(chip):
+        return True, name
+    shown = name or "(not visible)"
+    print(
+        f"[ERROR] The model chip reads {shown!r}, not Argon - refusing to send on the wrong model.",
+        file=sys.stderr,
+    )
+    print(
+        f"        (checked {stage}: the chip has to read '4 Argon'. Pick '4 Argon' in the model "
+        "picker of the Argon browser window, then re-run this task.)",
+        file=sys.stderr,
+    )
+    return False, shown
+
+
 def _argon_visible(page) -> bool:
     """True when the MODEL is Argon.
 
@@ -7411,6 +7465,9 @@ def _execute_composer_send_sequence(
     recorded_ws_mode: str = "unknown",
     on_progress: Optional[Any] = None,
     preflight_log: Optional[List[str]] = None,
+    task_text: str = "",
+    prev_state: Optional[Dict[str, Any]] = None,
+    new_session: bool = False,
 ) -> tuple[bool, bool, bool]:
     """Execute the owner's unified send order in one place (Rule 5, Rule 6, Rule 7):
 
@@ -7516,8 +7573,50 @@ def _execute_composer_send_sequence(
             setattr(page, "_argon_last_operation_error", ModelSelectionError(model_reason, path_used=pipeline_path))
         print(f"[ERROR] Operation 'model' failed ({pipeline_path}): {model_reason}", file=sys.stderr)
 
+    # Round 21 (FIX 4): the model must be VERIFIED, not assumed. `ensure_mode_and_model`
+    # (extension) and `select_argon_model` (python fallback) can report success while the
+    # chip has already fallen back to another model (for example 'Hydrogen'), so the chip
+    # is read back from the DOM right here and a non-Argon chip aborts the send.
+    chip_ok, chip_name = _verify_model_chip_is_argon(page, stage="after the model was selected")
+    if not chip_ok:
+        model_ok = False
+        chip_reason = f"model chip reads {chip_name!r} instead of 4 Argon (after the model was selected)"
+        p_log.append(f"model = 4 Argon : FAILED ({chip_reason})")
+        if not getattr(page, "_argon_failed_operation", ""):
+            setattr(page, "_argon_failed_operation", "model")
+            setattr(page, "_argon_failed_reason", chip_reason)
+            setattr(page, "_argon_last_operation_error", ModelSelectionError(chip_reason, path_used=pipeline_path))
+
     if not (mode_ok and model_ok):
         return mode_ok, model_ok, False
+
+    # Round 21 (FIX 3): ONE prompt per lane. The retry ladder and the self-executed
+    # manual send fallback can both come back to this function, so before anything is
+    # pasted the prompt is proved to be absent from this conversation. If it is already
+    # there the send already happened: the send is skipped and the caller waits for
+    # the delivery instead of putting the same prompt into the chat a second time.
+    dup_reason = _check_duplicate_prompt(
+        page,
+        prompt_text=prompt_text,
+        task_text=task_text,
+        prev_state=prev_state,
+        new_session=new_session,
+    )
+    if dup_reason is None and new_session:
+        # A --new-session lane never consults the stored task state, but the DOM check
+        # still has to run: the retry ladder must never put the same prompt into the
+        # same conversation twice.
+        dup_reason = _check_duplicate_prompt(
+            page,
+            prompt_text=prompt_text,
+            task_text=task_text,
+            prev_state=None,
+            new_session=False,
+        )
+    if dup_reason is not None:
+        print("[i] The prompt is already in this conversation - not sending it again.")
+        p_log.append("prompt duplicate guard : SKIPPED (the prompt is already in this conversation)")
+        return mode_ok, model_ok, True
 
     # Step 2: Paste the prompt into the composer BEFORE attaching the archive.
     expected_min_len = max(1, min(len(clean_prompt) // 2, 40))
@@ -7599,6 +7698,19 @@ def _execute_composer_send_sequence(
             setattr(page, "_argon_failed_reason", repaste_reason)
             print(f"[ERROR] Operation 'paste' failed ({pipeline_path}): {repaste_reason}", file=sys.stderr)
             return mode_ok, model_ok, False
+
+    # Round 21 (FIX 4): verify the chip once more right before the send. The upload can
+    # take a while and the chip can fall back to another model meanwhile, so the model
+    # the prompt is about to go out on is read back from the DOM one last time.
+    chip_ok_send, chip_name_send = _verify_model_chip_is_argon(page, stage="right before the send")
+    if not chip_ok_send:
+        send_model_reason = f"model chip reads {chip_name_send!r} instead of 4 Argon (right before the send)"
+        p_log.append(f"model = 4 Argon : FAILED ({send_model_reason})")
+        setattr(page, "_argon_failed_operation", "model")
+        setattr(page, "_argon_failed_reason", send_model_reason)
+        setattr(page, "_argon_last_operation_error", ModelSelectionError(send_model_reason, path_used=pipeline_path))
+        print(f"[ERROR] Operation 'model' failed ({pipeline_path}): {send_model_reason}", file=sys.stderr)
+        return mode_ok, model_ok, False
 
     # Step 4: The moment the upload has finished, verify the Flash guard and click send immediately.
     sent_ok = _click_send_immediately(
@@ -8235,6 +8347,39 @@ def run_preflight_selftest_cli(headless: bool = True, require_extension: bool = 
         )
         print(
             "  Round 18 bundle     : OK (argon_delivery.zip + DELIVERY_MANIFEST.md verified with PS1, 2048x2048 PNG, SVG, and WAV)"
+        )
+
+    # Verify Round 20 persistent browser host lifecycle, locked host-state RMW, manual tab survival, and live /u/N account sync
+    from test_round20_lifecycle_and_sync import run_round20_regression_suite
+
+    r20_rep = run_round20_regression_suite()
+    if not r20_rep.get("ok"):
+        print(f"[ERROR] Round 20 lifecycle & account sync self-test failed: {r20_rep}", file=sys.stderr)
+        return EXIT_PREFLIGHT_FAILED
+    print(
+        f"  Round 20 lifecycle  : OK (5/5 regression cases passed in {r20_rep.get('elapsed_ms')} ms: "
+        "host kept alive, locked RMW, manual tab persisted, live /u/N sync & stale /u/7/->/u/9/ refused)"
+    )
+
+    # Round 21: the dispatch-lane failures measured during the round-20 dual dispatch
+    # (the second lane refused to attach to the ONE Argon browser, rotated onto a
+    # different account, sent the prompt twice and left the model chip on Hydrogen).
+    try:
+        from test_round21_dispatch_lane import run_round21_regression_suite
+
+        r21_rep = run_round21_regression_suite()
+    except Exception as exc:  # the suite is optional - never break the self-test over it
+        r21_rep = {"ok": True, "skipped": f"{type(exc).__name__}: {exc}", "elapsed_ms": 0}
+    if not r21_rep.get("ok"):
+        print(f"[ERROR] Round 21 dispatch-lane self-test failed: {r21_rep}", file=sys.stderr)
+        return EXIT_PREFLIGHT_FAILED
+    if r21_rep.get("skipped"):
+        print(f"  Round 21 dispatch    : SKIPPED ({r21_rep.get('skipped')})")
+    else:
+        print(
+            f"  Round 21 dispatch    : OK (5/5 regression cases passed in {r21_rep.get('elapsed_ms')} ms: "
+            "endpoint file persisted, busy slot not rotatable, non-Argon model refused, "
+            "duplicate prompt detected, second lane waited for the starting host)"
         )
 
     # Run browser self-test (Playwright when available, or Selenium Chromium fallback)
@@ -10889,15 +11034,26 @@ def dispatch_to_argon(
             print(f"[!] Could not prepare the browser profile: {exc}", file=sys.stderr)
             profile_dir = slot_profile
 
-        # Section 2.3.C & Round 18 Section 1.1: Verify the account index in the Argon browser's
-        # Default/Preferences (`account_info`) so the tab targets the exact `/u/<index>/` account.
+        # Section 2.3.C, Round 18 & Round 20: Verify the account index in the Argon browser's
+        # live Default/Preferences (`account_info`) and refuse stale account_index fallbacks.
         if not _profile_is_isolated_slot(profile_dir):
-            expected_acct_idx = pool_cfg.get_account_index(active_slot)
+            try:
+                expected_acct_idx = pool_cfg.get_account_index(active_slot)
+            except RuntimeError as exc_idx:
+                print(f"[!] {exc_idx}", file=sys.stderr)
+                return EXIT_NOT_SIGNED_IN
             ok_idx, found_idx, all_pref_emails = verify_account_index_in_preferences(
                 profile_dir,
                 target_email or "",
                 expected_index=expected_acct_idx,
             )
+            if found_idx is None and all_pref_emails:
+                print(
+                    f"[!] Slot {active_slot} ({target_email or 'account'}) is not present in live Default/Preferences "
+                    f"(registered_accounts={len(all_pref_emails)}); refusing stale index /u/{expected_acct_idx}/.",
+                    file=sys.stderr,
+                )
+                return EXIT_NOT_SIGNED_IN
             eff_idx = found_idx if found_idx is not None else expected_acct_idx
             if found_idx is not None:
                 pool_cfg.set_account_index(active_slot, found_idx)
@@ -10911,6 +11067,28 @@ def dispatch_to_argon(
                 target_url,
                 flags=re.IGNORECASE,
             )
+
+            # Round 21 (FIX 5): the recorded account must be the account this lane
+            # ACTUALLY opened. The pool entry's email can disagree with the browser's
+            # live account list (the pool slot and the `/u/<N>/` path are two different
+            # things), so the email is read back from the browser's own
+            # `Default/Preferences` account list for the index that was opened here.
+            live_email = _live_account_email_for_index(profile_dir, eff_idx)
+            if not live_email:
+                print(
+                    f"[!] Slot {active_slot}: the Argon browser has NO account at /u/{eff_idx}/ - "
+                    f"refusing to record an account that this lane did not open.",
+                    file=sys.stderr,
+                )
+                return EXIT_NOT_SIGNED_IN
+            if live_email.lower() != str(target_email or "").strip().lower():
+                print(
+                    f"[!] Slot {active_slot}: the pool says {target_email or '(no email)'} but the "
+                    f"browser's account at /u/{eff_idx}/ is {live_email} - recording the LIVE account.",
+                    file=sys.stderr,
+                )
+            target_email = live_email
+            print(f"[+] Account actually used by this lane: {live_email} (/u/{eff_idx}/)")
 
         slot_lock.update_profile_dir(profile_dir)
         chrome_exe = find_chrome_executable()
@@ -11460,6 +11638,9 @@ def dispatch_to_argon(
                             recorded_ws_mode=recorded_ws_mode,
                             on_progress=_track_send_progress,
                             preflight_log=preflight,
+                            task_text=task,
+                            prev_state=prev_state,
+                            new_session=new_session,
                         )
                         just_sent_prompt = bool(mode_ok and model_ok and attached)
                     except Exception as send_exc:
@@ -11489,6 +11670,9 @@ def dispatch_to_argon(
                                         recorded_ws_mode=recorded_ws_mode,
                                         on_progress=_track_send_progress,
                                         preflight_log=preflight,
+                                        task_text=task,
+                                        prev_state=prev_state,
+                                        new_session=new_session,
                                     )
                                     just_sent_prompt = bool(mode_ok and model_ok and attached)
                         else:
@@ -11527,6 +11711,9 @@ def dispatch_to_argon(
                                     recorded_ws_mode=recorded_ws_mode,
                                     on_progress=_track_send_progress,
                                     preflight_log=preflight,
+                                    task_text=task,
+                                    prev_state=prev_state,
+                                    new_session=new_session,
                                 )
                                 just_sent_prompt = bool(mode_ok and model_ok and attached)
                             except Exception as manual_exc:
@@ -12850,6 +13037,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Configure accounts_pool.json to use the Argon browser profile and record verified /u/<index>/ account indices.",
     )
     parser.add_argument(
+        "--resync-accounts",
+        action="store_true",
+        help="Re-sync the account pool with the Argon browser's LIVE signed-in account list "
+             "(Default/Preferences): write every pool slot's live /u/<index>/ back, mark the "
+             "slots whose account is not signed in, and report what changed.",
+    )
+    parser.add_argument(
         "--reclaim-slot-profiles",
         "--migrate-slot-profiles",
         dest="reclaim_slot_profiles",
@@ -12915,6 +13109,117 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=argparse.SUPPRESS,
     )
     return parser
+
+
+def resync_accounts_cli() -> int:
+    """Re-sync the account pool with the Argon browser's LIVE signed-in account list.
+
+    The pool's `account_index` is the `/u/<N>/` path the dispatcher opens in the Argon
+    browser, so it has to match the browser's own `Default/Preferences` (`account_info`)
+    list. When it drifts, a lane runs under a DIFFERENT Google account than the one that
+    was asked for. This rewrites the index of every pool slot whose account IS signed in,
+    marks the slots whose account is NOT signed in (`needs_signin`, stale index cleared)
+    and reports everything it found.
+    """
+    from safe_browser import get_preferences_accounts
+
+    pool_cfg = PoolConfig()
+    profile_dir = pool_cfg.profile_dir
+    live_accounts = get_preferences_accounts(profile_dir)
+
+    live_by_email: Dict[str, Dict[str, Any]] = {}
+    for live_acc in live_accounts:
+        live_email = str(live_acc.get("email") or "").strip()
+        if live_email:
+            live_by_email[live_email.lower()] = live_acc
+
+    print("=" * 78)
+    print("  ARGON ACCOUNT POOL RE-SYNC (browser live accounts -> pool)")
+    print("=" * 78)
+    print(f"  Pool config    : {pool_cfg.path}")
+    print(f"  Browser profile: {profile_dir}")
+    print(f"  Live accounts  : {len(live_accounts)} (from Default/Preferences)")
+    print("")
+
+    changed: List[str] = []
+    unchanged: List[str] = []
+    need_signin: List[str] = []
+    unknown: List[str] = []
+    collisions: List[str] = []
+    pool_emails = set()
+    index_owner: Dict[int, str] = {}
+
+    for acc in pool_cfg.accounts:
+        if not isinstance(acc, dict):
+            continue
+        slot = normalize_slot(acc.get("slot", f"/u/{acc.get('index', 0)}/"))
+        email = str(acc.get("email") or "").strip()
+        if email:
+            pool_emails.add(email.lower())
+        live_acc = live_by_email.get(email.lower()) if email else None
+        if live_acc is None:
+            stale_index = acc.pop("account_index", None)
+            acc["needs_signin"] = True
+            if stale_index is None:
+                need_signin.append(f"{slot}  {email or '(no email)'}  (no account_index in the pool; needs_signin set)")
+            else:
+                need_signin.append(
+                    f"{slot}  {email or '(no email)'}  (stale account_index={stale_index} cleared)"
+                )
+            continue
+        live_index = int(live_acc.get("index"))
+        old_index = acc.get("account_index")
+        acc.pop("needs_signin", None)
+        if old_index != live_index:
+            pool_cfg.set_account_index(slot, live_index)
+            changed.append(f"{slot}  {email}  /u/{old_index}/ -> /u/{live_index}/")
+        else:
+            unchanged.append(f"{slot}  {email}  /u/{live_index}/")
+        owner = index_owner.get(live_index)
+        if owner is None:
+            index_owner[live_index] = slot
+        else:
+            collisions.append(f"/u/{live_index}/ is claimed by both {owner} and {slot}")
+
+    for live_acc in live_accounts:
+        live_email = str(live_acc.get("email") or "").strip()
+        if live_email.lower() not in pool_emails:
+            unknown.append(f"/u/{int(live_acc.get('index'))}/  {live_email}")
+
+    pool_cfg.save()
+
+    print(f"  Slots re-synced ({len(changed)}):")
+    for line in changed:
+        print(f"    - {line}")
+    if not changed:
+        print("    (none)")
+    print("")
+    print(f"  Slots already correct ({len(unchanged)}):")
+    for line in unchanged:
+        print(f"    - {line}")
+    if not unchanged:
+        print("    (none)")
+    print("")
+    print(f"  Slots needing a sign-in ({len(need_signin)}):")
+    for line in need_signin:
+        print(f"    - {line}")
+    if not need_signin:
+        print("    (none)")
+    print("")
+    print(f"  Browser accounts the pool does not know about ({len(unknown)}):")
+    for line in unknown:
+        print(f"    - {line}")
+    if not unknown:
+        print("    (none)")
+    print("")
+    print(f"  Index collisions ({len(collisions)}):")
+    for line in collisions:
+        print(f"    - {line}")
+    if not collisions:
+        print("    (none)")
+    print("=" * 78)
+    return EXIT_SUCCESS
+
 
 def append_followup_to_running_task(
     append_arg: str,
@@ -13359,6 +13664,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("=" * 78)
         return EXIT_SUCCESS
 
+    if getattr(args, "resync_accounts", False):
+        return resync_accounts_cli()
+
     if getattr(args, "reclaim_slot_profiles", False):
         from safe_browser import reclaim_slot_profiles_cli
 
@@ -13660,16 +13968,19 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
 
     last = EXIT_FAILURE
-    saw_busy = False
     skipped_accounts: List[tuple[str, str]] = []
+    # Round 21 (FIX 2): EXIT_SLOT_BUSY is NOT rotatable. A busy slot means another
+    # lane is using that pool account right now; rotating would run this task under a
+    # DIFFERENT Google account than the one that was asked for. The lane stops and
+    # reports instead. The other three codes are genuine "this account is broken, try
+    # the next one" cases and stay rotatable.
     rotatable_codes = {
-        EXIT_SLOT_BUSY,
         EXIT_PREFLIGHT_FAILED,
         EXIT_NOT_SIGNED_IN,
         EXIT_BROWSER_LAUNCH_FAILED,
     }
     code_labels = {
-        EXIT_SLOT_BUSY: "slot busy or at 2-task registry limit",
+        EXIT_SLOT_BUSY: "slot busy (browser profile in use by another lane, or 2-task registry limit reached)",
         EXIT_PREFLIGHT_FAILED: "pre-flight check failed",
         EXIT_NOT_SIGNED_IN: "profile not signed in",
         EXIT_BROWSER_LAUNCH_FAILED: "browser launch failed",
@@ -13678,6 +13989,24 @@ def main(argv: Optional[List[str]] = None) -> int:
     for index, slot in enumerate(slots):
         if index:
             print(f"\n[+] Rotating to next pool account ({index + 1}/{len(slots)}): {slot}")
+            # Round 21 (FIX 2): the account of a rotated-to slot is re-resolved through
+            # the LIVE browser account list. `PoolConfig.get_account_index()` refuses a
+            # stale index, so a slot whose account is not signed in is skipped with a
+            # named reason instead of being dispatched to.
+            rot_pool = pool_cfg
+            if pool_cfg is not None:
+                try:
+                    rot_pool = PoolConfig()
+                except Exception:
+                    rot_pool = pool_cfg
+            if rot_pool is not None:
+                try:
+                    rotated_index = rot_pool.get_account_index(slot)
+                except RuntimeError as exc_idx:
+                    skipped_accounts.append((slot, str(exc_idx)))
+                    print(f"[!] Skipping account {slot}: {exc_idx}", file=sys.stderr)
+                    continue
+                print(f"[+] Account {slot} resolves to /u/{rotated_index}/ in the Argon browser.")
         last = dispatch_to_argon(
             task=args.task,
             project_path=args.project_path,
@@ -13708,13 +14037,22 @@ def main(argv: Optional[List[str]] = None) -> int:
                 for sk_slot, sk_reason in skipped_accounts:
                     print(f"    - skipped {sk_slot}: {sk_reason}")
             return last
+        if last == EXIT_SLOT_BUSY:
+            busy_reason = code_labels.get(EXIT_SLOT_BUSY, "slot is busy")
+            skipped_accounts.append((slot, busy_reason))
+            print(
+                f"[!] Account {slot} is busy ({busy_reason}). Refusing to rotate to another pool "
+                f"account: this task must run under the Google account of {slot}, not under a "
+                f"different one. Free the slot or re-run the task later.",
+                file=sys.stderr,
+            )
+            return EXIT_SLOT_BUSY
         if not is_followup_bound and last in rotatable_codes and len(slots) > 1:
             reason_label = code_labels.get(last, f"exit code {last}")
             skipped_accounts.append((slot, reason_label))
-            if last == EXIT_SLOT_BUSY:
-                saw_busy = True
             print(
-                f"[+] Account {slot} failed ({reason_label}) - continuing rotation across remaining pool accounts."
+                f"[+] Account {slot} failed ({reason_label}) - skipping this slot and continuing "
+                f"rotation across the remaining pool accounts."
             )
             continue
         return last
@@ -13723,9 +14061,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"\n[!] Pool rotation exhausted after trying {len(skipped_accounts)} account(s):", file=sys.stderr)
         for sk_slot, sk_reason in skipped_accounts:
             print(f"    - {sk_slot}: {sk_reason}", file=sys.stderr)
-    if saw_busy:
-        print("\n[!] Every account slot in the pool is currently busy.", file=sys.stderr)
-        return EXIT_SLOT_BUSY
     return last
 
 

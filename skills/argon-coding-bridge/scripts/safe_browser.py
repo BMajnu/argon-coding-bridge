@@ -31,6 +31,7 @@ import socket
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -40,6 +41,14 @@ ENDPOINT_FILENAME = ".argon_browser_endpoint"
 COOKIE_SNAPSHOT_DIRNAME = ".argon_cookie_snapshot"
 QUARANTINE_DIRNAME = ".argon_quarantine"
 COMPANION_EXTENSION_DIR = Path(__file__).resolve().parent.parent / "extension"
+
+# How long `ensure_browser_host` waits for a Chrome that is already running on the profile
+# to PUBLISH its CDP endpoint before it gives up on that profile. Measured on the owner's
+# machine (round 20): the second dispatch lane arrived while the first lane was still
+# LAUNCHING Chrome, saw the profile PIDs but no endpoint, and refused to attach - which
+# rotated the lane to a different Google account and sent the prompt twice.
+HOST_START_WAIT_SECONDS = 90.0
+HOST_START_POLL_SECONDS = 0.5
 
 DEFAULT_HOST_ARGS = [
     "--disable-blink-features=AutomationControlled",
@@ -548,11 +557,46 @@ def write_host_state(profile_dir: Union[str, Path], state: Dict[str, Any]) -> No
     lock_path = prof / f"{ENDPOINT_FILENAME}.lock"
     fd = _acquire_file_lock(lock_path)
     try:
-        tmp = ep_file.with_name(f".{ENDPOINT_FILENAME}.{os.getpid()}.tmp")
+        tmp = ep_file.with_name(f".{ENDPOINT_FILENAME}.{os.getpid()}.{threading.get_ident()}.tmp")
         tmp.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
         os.replace(str(tmp), str(ep_file))
     except Exception:
         pass
+    finally:
+        _release_file_lock(fd, lock_path)
+
+
+def update_host_state_locked(
+    profile_dir: Union[str, Path],
+    mutator: Any,
+    default_state: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Atomically read, mutate, and write `.argon_browser_endpoint` while holding `.argon_browser_endpoint.lock`."""
+    import threading as _th
+
+    prof = Path(profile_dir).expanduser().resolve()
+    prof.mkdir(parents=True, exist_ok=True)
+    ep_file = endpoint_file_for_profile(prof)
+    lock_path = prof / f"{ENDPOINT_FILENAME}.lock"
+    fd = _acquire_file_lock(lock_path)
+    try:
+        state: Dict[str, Any] = {}
+        if ep_file.is_file():
+            try:
+                loaded = json.loads(ep_file.read_text(encoding="utf-8", errors="replace"))
+                if isinstance(loaded, dict):
+                    state = loaded
+            except Exception:
+                state = {}
+        if not state and isinstance(default_state, dict):
+            state = dict(default_state)
+        state.setdefault("tabs", {})
+        state.setdefault("persistent", True)
+        mutator(state)
+        tmp = ep_file.with_name(f".{ENDPOINT_FILENAME}.{os.getpid()}.{_th.get_ident()}.tmp")
+        tmp.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        os.replace(str(tmp), str(ep_file))
+        return state
     finally:
         _release_file_lock(fd, lock_path)
 
@@ -603,6 +647,38 @@ def has_live_browser_host(profile_dir: Union[str, Path]) -> bool:
     return probe_cdp_endpoint(http_ep) is not None
 
 
+def _cmdline_uses_profile(cmdline: str, prof: Path) -> bool:
+    """True when `cmdline` points Chrome at `prof`, matched on the RESOLVED path.
+
+    A raw substring match is not enough. Windows hands Chrome the SHORT 8.3 form of a
+    path (`C:\\Users\\TECHZO~1\\...`) while the caller may pass the long form
+    (`C:\\Users\\TechZone IT\\...`), and the two never match as strings. When that
+    happens the running host becomes INVISIBLE to `find_chrome_pids_for_profile`, so
+    the caller believes the profile is free, launches a second Chrome on it, that one
+    cannot win the profile lock, and the task is refused ("profile is busy") and then
+    rotated onto a different account. Measured on the owner's machine (round 21).
+
+    The comparison is therefore: the `--user-data-dir=` value of the command line,
+    resolved and compared case-insensitively against the resolved profile dir.
+    """
+    low = str(cmdline or "").replace("\\", "/")
+    for token in low.split(" "):
+        token = token.strip().strip('"')
+        if not token.startswith("--user-data-dir="):
+            continue
+        raw = token.split("=", 1)[1]
+        if not raw:
+            continue
+        try:
+            if Path(raw).resolve() == prof:
+                return True
+        except Exception:
+            # An unresolvable path still gets the raw comparison.
+            if raw.rstrip("/").lower() == str(prof).replace("\\", "/").rstrip("/").lower():
+                return True
+    return False
+
+
 def find_chrome_pids_for_profile(profile_dir: Union[str, Path]) -> List[int]:
     """Return PIDs of Chrome/Chromium processes holding `profile_dir`."""
     prof = Path(profile_dir).expanduser().resolve()
@@ -644,6 +720,13 @@ def find_chrome_pids_for_profile(profile_dir: Union[str, Path]) -> List[int]:
                     p_id = int(proc.info["pid"])
                     if p_id > 0 and p_id not in pids:
                         pids.append(p_id)
+                elif "--type=" not in cmdline:
+                    # The command line may carry the SHORT 8.3 form of the profile path.
+                    raw_cmdline = " ".join(proc.info.get("cmdline") or [])
+                    if _cmdline_uses_profile(raw_cmdline, prof):
+                        p_id = int(proc.info["pid"])
+                        if p_id > 0 and p_id not in pids:
+                            pids.append(p_id)
             except Exception:
                 continue
         return pids
@@ -658,7 +741,7 @@ def find_chrome_pids_for_profile(profile_dir: Union[str, Path]) -> List[int]:
                 "($_.Name -match 'chrome|chromium') -and "
                 f"($_.CommandLine -like '*{escaped_prof}*') -and "
                 "($_.CommandLine -notlike '*--type=*') "
-                "} | Select-Object -ExpandProperty ProcessId"
+                "} | Select-Object ProcessId,CommandLine"
             )
             out = subprocess.run(
                 ["powershell", "-NoProfile", "-Command", ps_cmd],
@@ -668,10 +751,24 @@ def find_chrome_pids_for_profile(profile_dir: Union[str, Path]) -> List[int]:
             )
             for ln in (out.stdout or "").splitlines():
                 ln_s = ln.strip()
-                if ln_s.isdigit():
-                    val = int(ln_s)
-                    if val > 0 and val not in pids:
-                        pids.append(val)
+                if not ln_s:
+                    continue
+                # The first field is the PID, the rest is the command line. The
+                # command line is re-checked with the resolved-path comparison so a
+                # short 8.3 path in the command line still matches.
+                parts = ln_s.split(None, 1)
+                pid_text = parts[0]
+                cmd_text = parts[1] if len(parts) > 1 else ""
+                if not pid_text.isdigit():
+                    continue
+                val = int(pid_text)
+                if val <= 0 or val in pids:
+                    continue
+                if cmd_text and not _cmdline_uses_profile(cmd_text, prof):
+                    # The -like filter matched a path fragment that is not the
+                    # profile we are asking about (e.g. a parent directory).
+                    continue
+                pids.append(val)
         except Exception:
             pass
     else:
@@ -771,6 +868,36 @@ def _discover_running_cdp_endpoint(
     return None
 
 
+def _build_recovered_host_state(
+    prof: Path,
+    http_ep: str,
+    probed_info: Dict[str, Any],
+    existing: Optional[Dict[str, Any]],
+    existing_pids: List[int],
+) -> Dict[str, Any]:
+    """Build the `.argon_browser_endpoint` state dict for a Chrome already running on `prof`.
+
+    Owns the SINGLE definition of "what a recovered Argon browser host looks like" so the
+    attach-immediately path and the wait-for-the-other-lane-to-finish-starting path can
+    never drift apart (a drifted dict is how a lane ended up attaching to a host with a
+    different port or a stale tab map).
+    """
+    m_p = re.search(r":(\d+)$", http_ep)
+    port_val = int(m_p.group(1)) if m_p else int((existing or {}).get("port") or 0)
+    ext_dir_existing = get_companion_extension_dir()
+    return {
+        "profile_dir": str(prof),
+        "pid": int(existing_pids[0]) if existing_pids else 0,
+        "pids": [int(p) for p in existing_pids],
+        "port": port_val,
+        "http_endpoint": http_ep,
+        "ws_endpoint": str(probed_info.get("ws_endpoint") or (existing or {}).get("ws_endpoint") or ""),
+        "companion_extension": str((existing or {}).get("companion_extension") or (ext_dir_existing or "")),
+        "started_at": str((existing or {}).get("started_at") or time.strftime("%Y-%m-%d %H:%M:%S")),
+        "tabs": dict((existing or {}).get("tabs") or {}),
+    }
+
+
 def ensure_browser_host(
     profile_dir: Union[str, Path],
     chrome_exe: Optional[str] = None,
@@ -782,7 +909,10 @@ def ensure_browser_host(
     In shared mode the Argon Bridge browser is supposed to stay running across accounts and tasks,
     so when Chrome is already running on `profile_dir` and publishes a CDP endpoint (in `.argon_browser_endpoint`,
     `DevToolsActivePort`, or `--remote-debugging-port`), this function attaches to it and returns its host state.
-    Only refuses (`return None`) when a running Chrome on `profile_dir` publishes no CDP endpoint at all.
+    When Chrome runs on `profile_dir` but has NOT published an endpoint yet (the other lane is still
+    LAUNCHING it), this function WAITS up to `HOST_START_WAIT_SECONDS` (90 s) for the endpoint to appear
+    and attaches to it, instead of declaring the profile unusable. Only refuses (`return None`) when
+    that wait times out without any reachable endpoint.
     """
     prof = Path(profile_dir).expanduser().resolve()
     prof.mkdir(parents=True, exist_ok=True)
@@ -797,27 +927,67 @@ def ensure_browser_host(
     existing_pids = find_chrome_pids_for_profile(prof)
     if existing_pids:
         discovered = _discover_running_cdp_endpoint(prof, existing_state=existing, existing_pids=existing_pids)
-        if discovered is not None:
-            http_ep, probed_info = discovered
-            m_p = re.search(r":(\d+)$", http_ep)
-            port_val = int(m_p.group(1)) if m_p else int((existing or {}).get("port") or 0)
-            ext_dir_existing = get_companion_extension_dir()
-            recovered_state: Dict[str, Any] = {
-                "profile_dir": str(prof),
-                "pid": int(existing_pids[0]),
-                "pids": [int(p) for p in existing_pids],
-                "port": port_val,
-                "http_endpoint": http_ep,
-                "ws_endpoint": str(probed_info.get("ws_endpoint") or (existing or {}).get("ws_endpoint") or ""),
-                "companion_extension": str((existing or {}).get("companion_extension") or (ext_dir_existing or "")),
-                "started_at": str((existing or {}).get("started_at") or time.strftime("%Y-%m-%d %H:%M:%S")),
-                "tabs": dict((existing or {}).get("tabs") or {}),
-            }
-            write_host_state(prof, recovered_state)
-            return recovered_state
-        if existing is not None:
-            remove_host_state(prof)
-        return None
+        # `existing_now` tracks the FRESHEST host state seen (the other lane may publish
+        # `.argon_browser_endpoint` while we wait); `existing` keeps the state that was
+        # there when we arrived, which is what decides whether a stale state file is removed.
+        existing_now = existing
+        if discovered is None:
+            # The other lane may still be LAUNCHING this very Chrome: the profile PIDs
+            # already exist, but the CDP endpoint is published a moment later. Measured on
+            # the owner's machine (round 20): giving up right here made the second lane
+            # refuse to attach ("Profile ... is busy"), fall back to a direct launch that
+            # cannot win the profile lock, and then rotate to a DIFFERENT pool account and
+            # send the prompt twice. So WAIT for the endpoint instead of declaring the
+            # host unusable - the host IS coming, it just has not published itself yet.
+            print(
+                f"[i] The Argon browser host on {prof} is still starting "
+                f"(Chrome is running but no CDP endpoint yet) - "
+                f"waiting up to {HOST_START_WAIT_SECONDS:.0f} s for it..."
+            )
+            wait_started = time.monotonic()
+            deadline = wait_started + HOST_START_WAIT_SECONDS
+            while time.monotonic() < deadline:
+                time.sleep(HOST_START_POLL_SECONDS)
+                # Re-read the state every attempt: the other lane publishes
+                # `.argon_browser_endpoint` while we are waiting.
+                state_now = read_host_state(prof)
+                if isinstance(state_now, dict) and state_now:
+                    existing_now = state_now
+                http_ep_now = str((existing_now or {}).get("http_endpoint") or "")
+                probed_now: Optional[Dict[str, Any]] = None
+                if http_ep_now:
+                    probed_now = probe_cdp_endpoint(http_ep_now, timeout=1.5)
+                if probed_now is not None:
+                    discovered = (http_ep_now, probed_now)
+                    break
+                # The endpoint may also show up without a state file (DevToolsActivePort
+                # or `--remote-debugging-port` on the running Chrome), so re-probe those too.
+                discovered = _discover_running_cdp_endpoint(
+                    prof, existing_state=existing_now, existing_pids=existing_pids
+                )
+                if discovered is not None:
+                    break
+            if discovered is not None:
+                print(
+                    f"[+] Attached to the Argon browser host that was still starting: "
+                    f"{discovered[0]}"
+                )
+            else:
+                waited_s = time.monotonic() - wait_started
+                print(
+                    f"[!] The Argon browser host on {prof} published no CDP endpoint after "
+                    f"{waited_s:.1f} s (budget {HOST_START_WAIT_SECONDS:.0f} s; Chrome is running "
+                    f"but unreachable); giving up on this profile."
+                )
+                if existing is not None:
+                    remove_host_state(prof)
+                return None
+        http_ep, probed_info = discovered
+        recovered_state = _build_recovered_host_state(
+            prof, http_ep, probed_info, existing_now, existing_pids
+        )
+        write_host_state(prof, recovered_state)
+        return recovered_state
 
     if existing is not None:
         remove_host_state(prof)
@@ -891,6 +1061,7 @@ def ensure_browser_host(
         "http_endpoint": http_endpoint,
         "ws_endpoint": str(probed_info.get("ws_endpoint") or ""),
         "companion_extension": str(ext_dir) if ext_dir is not None else "",
+        "persistent": True,
         "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "tabs": {},
     }
@@ -905,36 +1076,37 @@ def ensure_browser_host(
 def reap_dead_tabs(context: Any, profile_dir: Union[str, Path]) -> List[str]:
     """Close any tab in `context` whose owning task PID is no longer alive (Section 2.3.B)."""
     prof = Path(profile_dir).expanduser().resolve()
-    state = read_host_state(prof)
-    if not state or not isinstance(state.get("tabs"), dict):
-        return []
-
-    tabs: Dict[str, Any] = dict(state.get("tabs") or {})
     reaped: List[str] = []
-    for tab_id, info in list(tabs.items()):
-        if not isinstance(info, dict):
-            tabs.pop(tab_id, None)
-            continue
-        owner_pid = int(info.get("pid") or 0)
-        if owner_pid and owner_pid != os.getpid() and not pid_is_alive(owner_pid):
-            target_url = str(info.get("page_url") or info.get("chat_url") or "")
-            if context is not None and hasattr(context, "pages"):
-                for pg in list(context.pages):
-                    try:
-                        pg_tid = getattr(pg, "_argon_tab_id", None)
-                        pg_url = str(getattr(pg, "url", "") or "")
-                        if pg_tid == tab_id or (target_url and pg_url and pg_url == target_url):
-                            if len(context.pages) > 1:
-                                pg.close()
-                            break
-                    except Exception:
-                        continue
-            tabs.pop(tab_id, None)
-            reaped.append(f"{tab_id} (dead pid {owner_pid})")
 
-    if reaped:
+    def _mutate_reap(state: Dict[str, Any]) -> None:
+        tabs: Dict[str, Any] = dict(state.get("tabs") or {})
+        for tab_id, info in list(tabs.items()):
+            if not isinstance(info, dict):
+                tabs.pop(tab_id, None)
+                continue
+            owner_pid = int(info.get("pid") or 0)
+            if owner_pid and owner_pid != os.getpid() and not pid_is_alive(owner_pid):
+                target_url = str(info.get("page_url") or info.get("chat_url") or "")
+                if context is not None and hasattr(context, "pages"):
+                    for pg in list(context.pages):
+                        try:
+                            if getattr(pg, "_argon_manual_tab", False):
+                                continue
+                            pg_tid = getattr(pg, "_argon_tab_id", None)
+                            pg_url = str(getattr(pg, "url", "") or "")
+                            if pg_tid == tab_id or (target_url and pg_url and pg_url == target_url):
+                                if len(context.pages) > 1:
+                                    pg.close()
+                                break
+                        except Exception:
+                            continue
+                tabs.pop(tab_id, None)
+                reaped.append(f"{tab_id} (dead pid {owner_pid})")
         state["tabs"] = tabs
-        write_host_state(prof, state)
+
+    if endpoint_file_for_profile(prof).is_file():
+        update_host_state_locked(prof, _mutate_reap)
+    if reaped:
         print(f"[+] Reaped {len(reaped)} orphaned tab(s) from dead process(es): {', '.join(reaped)}")
     return reaped
 
@@ -955,6 +1127,8 @@ def acquire_host_tab(
     When no host can be started or attached, returns `(None, None, None, False)` so
     the caller falls back cleanly to standard `launch_persistent_context`.
     """
+    import threading as _th
+
     prof = Path(profile_dir).expanduser().resolve()
     host = ensure_browser_host(prof, chrome_exe=chrome_exe, headless=headless)
     if not host:
@@ -969,54 +1143,62 @@ def acquire_host_tab(
         context = browser.contexts[0] if browser.contexts else browser.new_context(no_viewport=True)
         reap_dead_tabs(context, prof)
 
-        state = read_host_state(prof) or host
-        tabs = dict(state.get("tabs") or {})
-
-        reuse_blank = False
-        if not tabs and len(context.pages) == 1:
-            try:
-                first_url = str(context.pages[0].url or "").strip()
-                if first_url in (
-                    "",
-                    "about:blank",
-                    "chrome://newtab/",
-                    "chrome://new-tab-page/",
-                ):
-                    reuse_blank = True
-            except Exception:
-                reuse_blank = False
-
-        page = context.pages[0] if reuse_blank else context.new_page()
         slot_clean = re.sub(r"[^A-Za-z0-9]+", "", str(slot or "u0")) or "u0"
-        tab_id = f"tab-{slot_clean}-{os.getpid()}-{int(time.time() * 1000) % 100000}"
-        target_id = ""
-        try:
-            cdp_sess = context.new_cdp_session(page)
-            t_info = cdp_sess.send("Target.getTargetInfo") or {}
-            target_id = str((t_info.get("targetInfo") or {}).get("targetId") or "")
-            cdp_sess.detach()
-        except Exception:
-            target_id = ""
-        try:
-            page.evaluate("(tid) => { try { window.name = tid; } catch (e) {} }", tab_id)
-        except Exception:
-            pass
+        tab_id = f"tab-{slot_clean}-{os.getpid()}-{_th.get_ident() % 10000}-{int(time.time() * 1000) % 100000}"
 
-        tabs[tab_id] = {
-            "tab_id": tab_id,
-            "target_id": target_id,
-            "pid": os.getpid(),
-            "slot": str(slot or "/u/0/"),
-            "account": str(account_email or ""),
-            "project": str(Path(project_path).resolve()),
-            "lane": str(lane or "single"),
-            "chat_url": "",
-            "chat_id": "",
-            "page_url": str(getattr(page, "url", "") or "about:blank"),
-            "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        }
-        state["tabs"] = tabs
-        write_host_state(prof, state)
+        page_box: List[Any] = [None]
+
+        def _register_tab_locked(state: Dict[str, Any]) -> None:
+            tabs = dict(state.get("tabs") or {})
+            reuse_blank = False
+            if not tabs and not state.get("manual_open") and len(context.pages) == 1:
+                try:
+                    cand_pg = context.pages[0]
+                    first_url = str(cand_pg.url or "").strip()
+                    if not getattr(cand_pg, "_argon_manual_tab", False) and first_url in (
+                        "",
+                        "about:blank",
+                        "chrome://newtab/",
+                        "chrome://new-tab-page/",
+                    ):
+                        reuse_blank = True
+                except Exception:
+                    reuse_blank = False
+
+            pg = context.pages[0] if reuse_blank else context.new_page()
+            page_box[0] = pg
+            target_id = ""
+            try:
+                cdp_sess = context.new_cdp_session(pg)
+                t_info = cdp_sess.send("Target.getTargetInfo") or {}
+                target_id = str((t_info.get("targetInfo") or {}).get("targetId") or "")
+                cdp_sess.detach()
+            except Exception:
+                target_id = ""
+            try:
+                pg.evaluate("(tid) => { try { window.name = tid; } catch (e) {} }", tab_id)
+            except Exception:
+                pass
+
+            tabs[tab_id] = {
+                "tab_id": tab_id,
+                "target_id": target_id,
+                "pid": os.getpid(),
+                "slot": str(slot or "/u/0/"),
+                "account": str(account_email or ""),
+                "project": str(Path(project_path).resolve()),
+                "lane": str(lane or "single"),
+                "chat_url": "",
+                "chat_id": "",
+                "page_url": str(getattr(pg, "url", "") or "about:blank"),
+                "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            state["tabs"] = tabs
+            state["persistent"] = True
+
+        updated_state = update_host_state_locked(prof, _register_tab_locked, default_state=host)
+        page = page_box[0]
+        tabs = dict(updated_state.get("tabs") or {})
 
         setattr(page, "_argon_tab_id", tab_id)
         setattr(context, "_argon_is_cdp_host", True)
@@ -1040,24 +1222,26 @@ def update_host_tab(
     tab_id: Optional[str],
     **fields: Any,
 ) -> None:
-    """Update metadata (`chat_url`, `chat_id`, `page_url`, `account`) for `tab_id` in host state."""
+    """Update metadata (`chat_url`, `chat_id`, `page_url`, `account`) for `tab_id` in host state under file lock."""
     if not tab_id:
         return
     prof = Path(profile_dir).expanduser().resolve()
-    state = read_host_state(prof)
-    if not state or not isinstance(state.get("tabs"), dict):
+    if not endpoint_file_for_profile(prof).is_file():
         return
-    tabs = dict(state["tabs"])
-    entry = dict(tabs.get(tab_id) or {})
-    if not entry:
-        return
-    for k, v in fields.items():
-        if v is not None:
-            entry[k] = v
-    entry["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-    tabs[tab_id] = entry
-    state["tabs"] = tabs
-    write_host_state(prof, state)
+
+    def _mutate_tab(state: Dict[str, Any]) -> None:
+        tabs = dict(state.get("tabs") or {})
+        entry = dict(tabs.get(tab_id) or {})
+        if not entry:
+            return
+        for k, v in fields.items():
+            if v is not None:
+                entry[k] = v
+        entry["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        tabs[tab_id] = entry
+        state["tabs"] = tabs
+
+    update_host_state_locked(prof, _mutate_tab)
 
 
 def _send_cdp_browser_close(context: Any = None, page: Any = None) -> bool:
@@ -1083,8 +1267,10 @@ def release_host_tab(
     profile_dir: Union[str, Path],
     tab_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Close ONLY this task's tab when other tasks are active; close the browser host
-    gracefully when the last task finishes (Section 2.3.B & 2.3.E).
+    """Close ONLY this task's tab and keep the shared Argon browser host alive (Round 20).
+
+    Never kills the whole browser host when task-tab count reaches 0, so manually opened
+    tabs ('Open in Gemini Web') and the shared Argon browser survive across tasks.
     """
     prof = Path(profile_dir).expanduser().resolve()
     is_host = bool(getattr(context, "_argon_is_cdp_host", False))
@@ -1096,46 +1282,52 @@ def release_host_tab(
     snapshot_profile_session(prof)
     reap_dead_tabs(context, prof)
 
-    state = read_host_state(prof) or {}
-    tabs: Dict[str, Any] = dict(state.get("tabs") or {})
-    tabs.pop(eff_tab_id, None)
-
-    for tid, tinfo in list(tabs.items()):
-        tpid = int((tinfo or {}).get("pid") or 0)
-        if tpid and tpid != os.getpid() and not pid_is_alive(tpid):
-            tabs.pop(tid, None)
-
-    remaining_count = len(tabs)
-    if remaining_count > 0:
+    def _remove_tab_locked(state: Dict[str, Any]) -> None:
+        tabs: Dict[str, Any] = dict(state.get("tabs") or {})
+        tabs.pop(eff_tab_id, None)
+        for tid, tinfo in list(tabs.items()):
+            tpid = int((tinfo or {}).get("pid") or 0)
+            if tpid and tpid != os.getpid() and not pid_is_alive(tpid):
+                tabs.pop(tid, None)
         state["tabs"] = tabs
-        write_host_state(prof, state)
-        try:
-            if page is not None and not (hasattr(page, "is_closed") and page.is_closed()):
-                page.close()
-        except Exception:
-            pass
-        owners_str = _format_tab_owners(tabs)
-        print(
-            f"[+] Closed task tab {eff_tab_id}; browser host on {prof} stays open "
-            f"(active_tabs={remaining_count}, owning_tasks={owners_str})."
-        )
-        return {
-            "profile_dir": str(prof),
-            "was_running": True,
-            "mode": "tab_closed_browser_kept",
-            "tab_closed": eff_tab_id,
-            "remaining_tabs": remaining_count,
-            "snapshot_taken": True,
-            "snapshot_restored": False,
-            "session_intact": True,
-        }
+        state["persistent"] = True
 
+    updated_state = update_host_state_locked(prof, _remove_tab_locked)
+    tabs = dict(updated_state.get("tabs") or {})
+    remaining_count = len(tabs)
+
+    try:
+        if page is not None and not (hasattr(page, "is_closed") and page.is_closed()):
+            if context is not None and hasattr(context, "pages") and len(context.pages) <= 1:
+                try:
+                    context.new_page()
+                except Exception:
+                    pass
+            if context is None or not hasattr(context, "pages") or len(context.pages) > 1:
+                page.close()
+            else:
+                try:
+                    page.goto("about:blank")
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    owners_str = _format_tab_owners(tabs)
     print(
-        f"[+] Last task tab ({eff_tab_id}) finished on {prof} (active_tabs=0) - "
-        "closing browser host gracefully so cookies are flushed."
+        f"[+] Closed task tab {eff_tab_id}; browser host on {prof} stays open "
+        f"(active_tabs={remaining_count}, owning_tasks={owners_str})."
     )
-    remove_host_state(prof)
-    return close_browser_safely(context=context, profile_dir=prof, page=page)
+    return {
+        "profile_dir": str(prof),
+        "was_running": True,
+        "mode": "tab_closed_browser_kept",
+        "tab_closed": eff_tab_id,
+        "remaining_tabs": remaining_count,
+        "snapshot_taken": True,
+        "snapshot_restored": False,
+        "session_intact": True,
+    }
 
 
 def _terminate_pids(pids: List[int]) -> None:
@@ -1777,6 +1969,19 @@ def open_browser_cli(
         print(f"[!] The browser host started but the tab could not be opened ({exc}).", file=sys.stderr)
         return 1
 
+    update_host_state_locked(
+        prof,
+        lambda st: st.update(
+            {
+                "persistent": True,
+                "manual_open": True,
+                "manual_slot": eff_slot,
+                "manual_url": page_url,
+                "manual_opened_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+        ),
+        default_state=host,
+    )
     ext_dir_now = get_companion_extension_dir()
     print(f"  Opened URL      : {page_url}")
     print(f"  Page title      : {title}")

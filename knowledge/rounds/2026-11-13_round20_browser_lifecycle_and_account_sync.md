@@ -472,3 +472,53 @@ describes.
 - [ ] `--self-test` and `--browser-loop-selftest` still pass.
 - [ ] The 6 existing roots' behaviour is unchanged; no existing CLI flag changed.
 - [ ] `config/accounts_pool.json` appears nowhere in the patch and no credential leaks into it.
+
+---
+
+# APPENDIX A - ARGON'S OWN ROUND-20 WRITE-UP (the implementation notes)
+
+> The sections above are the brief that was sent to Argon, including **root cause 5**
+> (the second lane refusing to attach to the ONE Argon browser, rotating to a stale
+> slot, sending the prompt twice and answering with the wrong model) which was
+> measured live during the round-20 dual dispatch. The text below is Argon's own
+> account of what it implemented, kept verbatim so both records survive.
+
+---
+
+# Round 20 — Persistent Argon Browser Host Lifecycle, Locked Host-State RMW & Live `/u/<N>/` Account Sync
+
+**Date:** 2026-11-13  
+**Round:** 20  
+**Scope:** Prevent the shared Argon browser from dying when task tabs finish or race, preserve manual `"Open in Gemini Web"` sessions, and keep `PoolConfig` `/u/<N>/` indices strictly synchronized with the browser's live `Default/Preferences` (`account_info`) order.
+
+---
+
+## 1. The Four Root Causes & Measured Codebase Evidence
+
+1. **`release_host_tab` (`skills/argon-coding-bridge/scripts/safe_browser.py:1080-1138`) closes the whole browser host when the registered task-tab count reaches 0**:
+   - **Evidence**: At `safe_browser.py:1132-1138`, as soon as `remaining_count == 0`, `release_host_tab()` calls `remove_host_state(prof)` and `close_browser_safely(context=context, profile_dir=prof, page=page)`. Every finished task therefore kills the entire Argon browser process (`~/.gemini/argon_browser_profile`), taking down the owner's manually opened tabs along with it.
+   - **Fix**: `release_host_tab()` now closes ONLY the finished task's own tab (opening an `about:blank` keeper tab first if `len(context.pages) <= 1` so Chrome does not exit when its last tab closes), updates `.argon_browser_endpoint` under the host-state lock, and keeps the Argon browser host alive (`mode="tab_closed_browser_kept"`). Only an explicit `--close-browser` shuts down the browser host.
+
+2. **`acquire_host_tab` (`skills/argon-coding-bridge/scripts/safe_browser.py:942-1035`), `update_host_tab` (`1038-1059`), `release_host_tab` (`1080-1138`), and `reap_dead_tabs` (`905-939`) perform unlocked read-modify-writes of `.argon_browser_endpoint`**:
+   - **Evidence**: `write_host_state()` (`safe_browser.py:544-558`) locks `.argon_browser_endpoint.lock` only during the final atomic write. When two concurrent lanes (`followup` and `new`) call `acquire_host_tab()` on `~/.gemini/argon_browser_profile`, both read `state = read_host_state(prof)` before either writes, so the second writer overwrites `state["tabs"]` and erases the first lane's tab entry. When the second lane finishes, `len(tabs)` hits 0 while the first lane is still working.
+   - **Fix**: Added `update_host_state_locked(profile_dir, mutator_fn)` which holds `.argon_browser_endpoint.lock` across the entire `read -> mutate -> atomic write` cycle, and wired `acquire_host_tab`, `update_host_tab`, `release_host_tab`, `reap_dead_tabs`, and `open_browser_cli` through it.
+
+3. **Manual browser sessions (`open_browser_cli` at `safe_browser.py:1647-1790`, `login_pool_accounts.py:779-849`, `argon_pool_login.py:1932-1959`) are never marked persistent**:
+   - **Evidence**: Opening Gemini Web via `"Open in Gemini Web"` in the Pool Login Assistant (`login_pool_accounts.py:838-849`) or `--open-browser` leaves `tabs: {}` in `.argon_browser_endpoint` with no `"persistent": True` / `"manual_open": True` marker, so the next task's `release_host_tab()` sees 0 task tabs and kills the browser.
+   - **Fix**: `ensure_browser_host()` and `open_browser_cli()` set `"persistent": True` (and `"manual_open": True` on manual open) in `.argon_browser_endpoint` and tag manual pages so `acquire_host_tab` never hijacks them and `release_host_tab` never closes the browser host.
+
+4. **Stale `account_index` fallback in `PoolConfig.get_account_index()` (`skills/argon-coding-bridge/scripts/argon_pool_login.py:624-663`) and `dispatch_argon.py:10894-10912`**:
+   - **Evidence**: When slot `/u/7/` has a stale `"account_index": 9` in `accounts_pool.json` pointing at `/u/9/` (an account that does not exist in Chrome's live `Default/Preferences` `account_info`), `verify_account_index_in_preferences(self.profile_dir, email)` returns `found_idx = None`, and `get_account_index()` (`argon_pool_login.py:658-659`) silently falls back to `if isinstance(acc.get("account_index"), int): return int(acc["account_index"])` (`9`).
+   - **Fix**: Added `PoolConfig.sync_account_indices()` and updated `PoolConfig.get_account_index()` so that whenever `Default/Preferences` has registered accounts, every slot's index is resolved strictly from live `Default/Preferences` (`account_info`). If a slot's email is absent from `Default/Preferences` (or its stored `account_index` is out of bounds / mismatched), the stale `account_index` is stripped, `acc["needs_signin"] = True` is set, and a `RuntimeError` is raised so the dispatcher rotates to a verified signed-in account instead of navigating to a non-existent `/u/9/`.
+
+---
+
+## 2. Verification & 5-Case Regression Suite
+
+Run `python skills/argon-coding-bridge/scripts/test_round20_lifecycle_and_sync.py` (also executed automatically inside `python skills/argon-coding-bridge/scripts/dispatch_argon.py --self-test`):
+
+1. **Case 1 — Task tab release keeps Argon browser host alive**: Acquiring and releasing the last task tab closes only the task tab (`mode="tab_closed_browser_kept"`) and leaves the browser host running.
+2. **Case 2 — Concurrent two-lane locked RMW on `.argon_browser_endpoint`**: Concurrent threads calling `acquire_host_tab` + `update_host_tab` on the same shared profile preserve both tab entries (`len(tabs) == 2`) with zero lost updates.
+3. **Case 3 — Manual `"Open in Gemini Web"` persistence**: A manually opened tab (`open_browser_cli` / `"persistent": True`, `"manual_open": True`) survives subsequent task tab acquisitions and releases.
+4. **Case 4 — Live `/u/<N>/` sync & stale `/u/7/ -> /u/9/` refusal**: Live `Default/Preferences` order updates shifted account indices automatically and refuses stale `/u/7/ -> /u/9/` mappings with `RuntimeError`.
+5. **Case 5 — Per-slot `--close-browser --slot` vs full `--close-browser`**: Closing a single slot closes only that slot's tabs while preserving the host; explicit `--close-browser` shuts down the host cleanly.

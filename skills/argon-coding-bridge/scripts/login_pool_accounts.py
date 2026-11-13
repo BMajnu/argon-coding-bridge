@@ -717,10 +717,16 @@ class PoolLoginAssistantApp:
         allowed_badge_statuses = {"active", "signed_in", "configured", "not_signed_in", "failed", "needs_human"}
         status = raw_status if raw_status.lower() in allowed_badge_statuses else "signed_in"
 
+        try:
+            eff_idx: Optional[int] = self.pool_config.get_account_index(slot)
+        except RuntimeError:
+            eff_idx = None
         rec_idx = acc.get("account_index")
-        eff_idx = self.pool_config.get_account_index(slot)
-        rec_idx = acc.get("account_index")
-        idx_badge = f"/u/{rec_idx}/ (verified)" if isinstance(rec_idx, int) else f"/u/{eff_idx}/ (unverified)"
+        idx_badge = (
+            f"/u/{rec_idx}/ (verified)"
+            if isinstance(rec_idx, int) and eff_idx is not None
+            else ("needs sign-in (not in browser)" if eff_idx is None else f"/u/{eff_idx}/ (unverified)")
+        )
         self.slot_label.configure(text=f"Slot {slot}  •  Browser Index {idx_badge}")
         self.tier_label.configure(text=tier)
         self.role_label.configure(text=f"{role}  •  {status}")
@@ -839,11 +845,15 @@ class PoolLoginAssistantApp:
         acc = self._current_account()
         slot = self.pool_config.set_active_slot(acc.get("slot", "/u/0/")) if acc else self.pool_config.active_slot()
         profile_dir = self.pool_config.profile_dir_for_slot(slot)
-        url_slot = (
-            "/u/0/"
-            if is_isolated_slot_profile(profile_dir)
-            else f"/u/{self.pool_config.get_account_index(slot)}/"
-        )
+        if is_isolated_slot_profile(profile_dir):
+            url_slot = "/u/0/"
+        else:
+            try:
+                url_slot = f"/u/{self.pool_config.get_account_index(slot)}/"
+            except RuntimeError as exc:
+                self.set_status(str(exc), "#fbbf24")
+                self.open_add_account_page()
+                return
         url = GEMINI_WEB_URL.format(slot=url_slot)
         self._launch_chrome_url(url, f"Gemini Web ({slot} -> {url})", slot=slot)
 

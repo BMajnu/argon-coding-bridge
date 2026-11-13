@@ -622,7 +622,12 @@ class PoolConfig:
         return True
 
     def get_account_index(self, slot: Optional[Union[str, int]] = None) -> int:
-        """Return the verified Gemini `/u/<index>/` account index owned by `slot` in the Argon browser."""
+        """Return the verified Gemini `/u/<index>/` account index owned by `slot` in the Argon browser.
+
+        Round 20: Always synchronizes against live `Default/Preferences` (`account_info`) when
+        present on disk and NEVER falls back to a stale `account_index` (such as `/u/7/ -> /u/9/`)
+        when the account email is absent from the browser's registered accounts.
+        """
         target_slot = normalize_slot(slot) if slot is not None and str(slot).strip() else self.active_slot()
         if not self.is_shared_profile_slot(target_slot):
             return 0
@@ -633,25 +638,32 @@ class PoolConfig:
                 try:
                     from safe_browser import verify_account_index_in_preferences
 
-                    _, found_idx, _ = verify_account_index_in_preferences(self.profile_dir, email)
+                    _, found_idx, all_pref_emails = verify_account_index_in_preferences(self.profile_dir, email)
                     if found_idx is not None:
-                        if acc.get("account_index") != int(found_idx):
-                            acc["account_index"] = int(found_idx)
-                            if self.path.exists():
-                                try:
-                                    self.save()
-                                except Exception:
-                                    pass
+                        changed = (acc.get("account_index") != int(found_idx)) or bool(acc.get("needs_signin"))
+                        acc["account_index"] = int(found_idx)
+                        acc.pop("needs_signin", None)
+                        if changed and self.path.exists():
+                            try:
+                                self.save()
+                            except Exception:
+                                pass
                         return int(found_idx)
-                    # The account is NOT registered in the Argon browser. Falling back
-                    # to the slot number would silently run the task under a DIFFERENT
-                    # Google account, so a slot that still needs a sign-in must fail
-                    # loudly instead (Round 18 - never the wrong account).
-                    if acc.get("needs_signin"):
+                    # When Default/Preferences has registered accounts (or needs_signin is set)
+                    # and this email is NOT among them, any stored account_index (e.g. /u/9/)
+                    # is a stale snapshot for an account that is not signed in. Refuse loudly.
+                    if all_pref_emails or acc.get("needs_signin") or (self.profile_dir / "Default" / "Preferences").is_file():
+                        stale_val = acc.pop("account_index", None)
+                        acc["needs_signin"] = True
+                        if stale_val is not None and self.path.exists():
+                            try:
+                                self.save()
+                            except Exception:
+                                pass
                         raise RuntimeError(
-                            "slot %s (%s) is not signed into the Argon browser yet - sign "
-                            "this account in once (Open_Argon_Login.bat -> Auto Login All) "
-                            "before dispatching to it" % (target_slot, email)
+                            "slot %s (%s) is not signed into the Argon browser yet (stale account_index=%s cleared; "
+                            "live browser accounts=%d) - sign this account in once (Open_Argon_Login.bat -> Auto Login All) "
+                            "before dispatching to it" % (target_slot, email, stale_val, len(all_pref_emails))
                         )
                 except RuntimeError:
                     raise
@@ -669,6 +681,7 @@ class PoolConfig:
         acc = self.get_by_slot(slot)
         if isinstance(acc, dict):
             acc["account_index"] = int(account_index)
+            acc.pop("needs_signin", None)
             self.save()
 
     def enable_shared_profile_mode(self) -> Dict[str, Any]:
@@ -698,8 +711,11 @@ class PoolConfig:
                     found_idx = None
             if found_idx is not None:
                 acc["account_index"] = int(found_idx)
+                acc.pop("needs_signin", None)
                 verified_map[s_norm] = int(found_idx)
             else:
+                acc.pop("account_index", None)
+                acc["needs_signin"] = True
                 unverified_slots.append(s_norm)
         if self.path.exists():
             self.save()
