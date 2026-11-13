@@ -6325,7 +6325,11 @@ def _task_toggle_present(page) -> bool:
     try:
         task_btn = page.get_by_text(RE_TASK)
         for i in range(min(task_btn.count(), 6)):
-            if _safe_visible(task_btn.nth(i)):
+            el = task_btn.nth(i)
+            # Round 23 (R3/F3): the word "Task" also appears in the chat transcript,
+            # in code blocks and in the sidebar. Only a real segmented toggle control
+            # counts, otherwise the dispatcher reads "chat" where it should read "task".
+            if _safe_visible(el) and _is_toggle_control(el):
                 return True
     except Exception:
         pass
