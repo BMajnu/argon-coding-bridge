@@ -122,9 +122,10 @@ a workspace's `.argon_backup` is a fix that does not exist. Land these four fixe
 
 Round 22, measured: both lanes started at the same instant, neither found a running Chrome, so
 both tried to LAUNCH one on the same profile. One won the profile lock; the other died with
-`Profile ... is busy. Refusing to hijack the running browser.` and exit code 7. The other lane's
-tab was then navigated away by a PARALLEL session using the same browser, so the lane declared
-itself "superseded" and gave up while Argon was still writing the answer.
+`Profile ... is busy. Refusing to hijack the running browser.` and exit code 7 - the exact log line
+is "profile is busy". The other lane's tab was then navigated away by a PARALLEL session using the
+same browser, so the lane declared itself "superseded" and gave up while Argon was still writing
+the answer.
 
 **R4 (hard rule): the two lanes must never run concurrently against the same Argon browser.**
 The dispatcher must run the follow-up lane to completion, and only then the new lane - or the two
