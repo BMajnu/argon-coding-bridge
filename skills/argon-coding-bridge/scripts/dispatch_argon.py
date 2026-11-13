@@ -7582,6 +7582,7 @@ def _execute_composer_send_sequence(
     task_text: str = "",
     prev_state: Optional[Dict[str, Any]] = None,
     new_session: bool = False,
+    attach_images: Optional[List[str]] = None,
 ) -> tuple[bool, bool, bool]:
     """Execute the owner's unified send order in one place (Rule 5, Rule 6, Rule 7):
 
@@ -7799,6 +7800,24 @@ def _execute_composer_send_sequence(
                 on_progress("zip_attached")
             except Exception:
                 pass
+
+    # Step 3b: attach the screenshots as REAL IMAGES (the archive cannot carry binary
+    # files). They must travel WITH the prompt, so this happens after the archive
+    # attach - whose upload can clear the composer - and BEFORE the send click.
+    # A failure here is never fatal: the brief carries the specification.
+    if attach_images:
+        try:
+            img_ok, img_list, img_err = attach_images_to_composer(
+                page, attach_images, open_upload_menu_fn=_open_upload_menu
+            )
+        except Exception as img_exc:
+            img_ok, img_list, img_err = False, [], f"{type(img_exc).__name__}: {img_exc}"
+        if img_ok:
+            p_log.append(f"screenshots : OK ({len(img_list)} file(s) attached before the send)")
+            print(f"[+] Attached {len(img_list)} image(s) to the composer before the send.")
+        else:
+            p_log.append(f"screenshots : FAILED ({img_err})")
+            print(f"[!] --attach-images failed (the prompt is still sent): {img_err}", file=sys.stderr)
 
     # Re-verify that the prompt is still in the composer after attaching the archive (re-paste if cleared).
     composer = _find_composer(page) or composer
@@ -8247,6 +8266,7 @@ def run_preflight_selftest_on_page(
                 is_continuation=False,
                 recorded_ws_mode="unknown",
                 preflight_log=preflight_log,
+                attach_images=None,
             )
             st = {}
             try:
@@ -10122,6 +10142,7 @@ def _carry_over_to_new_session(
             prompt_text=new_prompt,
             manual_setup=manual_setup,
             is_continuation=False,
+            attach_images=attach_images,
         )
         if not (co_mode_ok and co_model_ok and co_sent_ok):
             print("[!] Carry-over send sequence failed (Task mode, 4 Argon guard, or upload/send).", file=sys.stderr)
@@ -10647,6 +10668,37 @@ def _verify_project_locally(
         notes_path, proj_root, cmd, 1, 1, False, err_count, verify_out
     )
     return EXIT_BUILD_FAILED
+
+
+# --- Phase 7: the screenshots travel WITH the prompt (--attach-images) ---
+# The context archive cannot carry binary files, so the UI screenshots are uploaded
+# into the composer as real images. Upstream parsed the flag but never forwarded it
+# and attached only AFTER the send; both are fixed here.
+def _expand_attach_images(spec) -> List[Path]:
+    """Turn a directory, a glob or a comma-separated list into a file list."""
+    if not spec:
+        return []
+    out: List[Path] = []
+    for part in str(spec).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        p = Path(part).expanduser()
+        if p.is_dir():
+            for pat in ("*.png", "*.jpg", "*.jpeg", "*.webp", "*.svg"):
+                out.extend(sorted(p.glob(pat)))
+        elif p.is_file():
+            out.append(p)
+        else:
+            parent = p.parent if str(p.parent) else Path(".")
+            out.extend(sorted(g for g in parent.glob(p.name) if g.is_file()))
+    seen, uniq = set(), []
+    for f in out:
+        key = str(f).lower()
+        if key not in seen:
+            seen.add(key)
+            uniq.append(f)
+    return uniq
 
 
 def dispatch_to_argon(
@@ -11812,6 +11864,7 @@ def dispatch_to_argon(
                             task_text=task,
                             prev_state=prev_state,
                             new_session=new_session,
+                            attach_images=attach_images,
                         )
                         just_sent_prompt = bool(mode_ok and model_ok and attached)
                     except Exception as send_exc:
@@ -11844,6 +11897,7 @@ def dispatch_to_argon(
                                         task_text=task,
                                         prev_state=prev_state,
                                         new_session=new_session,
+                                        attach_images=attach_images,
                                     )
                                     just_sent_prompt = bool(mode_ok and model_ok and attached)
                         else:
@@ -11885,6 +11939,7 @@ def dispatch_to_argon(
                                     task_text=task,
                                     prev_state=prev_state,
                                     new_session=new_session,
+                                    attach_images=attach_images,
                                 )
                                 just_sent_prompt = bool(mode_ok and model_ok and attached)
                             except Exception as manual_exc:
@@ -12074,12 +12129,6 @@ def dispatch_to_argon(
                     "[!] No conversation id in the URL - the next task on this project "
                     "will start a fresh chat."
                 )
-
-            if just_sent_prompt and attach_images:
-                img_ok, img_list, img_err = attach_images_to_composer(page, attach_images, open_upload_menu_fn=_open_upload_menu)
-                if not img_ok:
-                    print(f"[ERROR] --attach-images failed: {img_err}", file=sys.stderr)
-                    return EXIT_PREFLIGHT_FAILED
 
             if just_sent_prompt:
                 _print_prompt_sent_banner(sent_hms, chat_title, effective_chat_url)
@@ -13499,6 +13548,7 @@ def append_followup_to_running_task(
             skip_verify=skip_verify,
             lane=eff_lane,
             deadline_seconds=deadline_seconds,
+            attach_images=attach_images,
         )
 
     eff_lane = str(lane or ts_entry.get("lane") or reg_entry.get("lane") or "followup")
@@ -14049,6 +14099,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
         return EXIT_SUCCESS
 
+    attach_images = _expand_attach_images(getattr(args, "attach_images", None))
+    if attach_images:
+        print(f"[+] {len(attach_images)} screenshot file(s) will be attached as images.")
+
     if getattr(args, "brief_text", None):
         bt_path = Path(args.brief_text).resolve()
         if not bt_path.is_file():
@@ -14108,6 +14162,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             lane=args.lane,
             force=args.force,
             deadline_seconds=args.deadline_seconds,
+            attach_images=attach_images,
         )
 
     # Rule 2: --lane new is always a NEW task and must rotate across pool slots when needed,
@@ -14163,6 +14218,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             force=args.force,
             deadline_seconds=args.deadline_seconds,
             brief_summary=args.brief_summary,
+            attach_images=attach_images,
         )
 
     last = EXIT_FAILURE
@@ -14228,6 +14284,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             force=args.force,
             deadline_seconds=args.deadline_seconds,
             brief_summary=args.brief_summary,
+            attach_images=attach_images,
         )
         if last == EXIT_SUCCESS or last == EXIT_ALREADY_RUNNING:
             if skipped_accounts:
