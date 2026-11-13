@@ -246,6 +246,79 @@ wrong account, and it labels the number "(verified)" even when it is not.
 
 ---
 
+## SECTION 4B — ROOT CAUSE 5: the second lane refuses to attach to the ONE browser, rotates to a stale slot, and sends the prompt twice
+
+This is the trigger behind the owner's "sent two times" and "the wrong account" symptoms, and it was
+**measured live on the owner's machine during round 20** (both lanes dispatched together, exactly as
+`dual_dispatch.py` does).
+
+### 4B.1 What the dispatcher's own log said
+
+```
+[+] Lane FOLLOW-UP : slot=/u/0/ | chat_id=90f2dd2cf2aae6e8 | url=https://gemini.google.com/u/0/app/90f2dd2cf2aae6e8
+[+] Lane NEW       : slot=/u/6/  | chat_id=(new-session-on-u/6)  | url=https://gemini.google.com/u/6/app
+...
+[NEW /u/6/] [!] Profile C:\Users\TechZone IT\.gemini\argon_browser_profile for slot /u/6/ is busy. Refusing to hijack the running browser.
+```
+
+The NEW lane was supposed to run on **slot `/u/6/`** (account `badiuzzaman.majnu1@gmail.com`). It
+ended up on **slot `/u/7/`** — an account whose pool email (`badiuzzamanmajnu786@gmail.com`) is
+**not signed in at all** and whose stored `account_index` is the stale `9`. The chat it opened was
+`https://gemini.google.com/u/7/app/c868b3475d444d30` and the prompt was sent **TWICE**.
+
+### 4B.2 The causal chain
+
+1. The two lanes start **concurrently**. The NEW lane calls `acquire_host_tab` while the FOLLOWUP
+   lane is still **launching** the browser, so the Argon host has not published its CDP endpoint
+   yet → `ensure_browser_host` returns nothing.
+2. The NEW lane then falls back to a **direct launch** (`_launch_with_fallback`,
+   `dispatch_argon.py:10968`) on the same profile. Chrome refuses with *"profile is already in
+   use"*.
+3. `dispatch_argon.py:10973-10984` catches that and returns `EXIT_SLOT_BUSY`
+   ("Refusing to hijack the running browser"). **In the single-browser model this refusal is
+   wrong** — the whole point of the Argon browser is that N tasks share ONE Chrome in separate
+   tabs (`acquire_host_tab` exists for exactly that).
+4. The **account policy then rotates the lane to a different slot** instead of failing loudly.
+   It picked `/u/7/` — whose pool entry points at an account that is not signed in.
+5. That slot's URL is resolved through the stale `account_index` → the lane opens the WRONG
+   account, the recorded `account_email` (`badiuzzamanmajnu786@gmail.com`) disagrees with the
+   account actually used (`bmajnu786@gmail.com`, index 7), and **the owner's third complaint —
+   "the pool's /u/N order does not match the browser's /u/N order" — reproduces itself live.**
+6. The lane re-attempts the send. The retry ladder does not detect that the prompt is already in
+   the conversation, so the prompt goes in a **second time**, and the model chip is left on
+   **Hydrogen** instead of Argon.
+
+### FIX 5 — one browser, many lanes, one prompt, one model
+
+1. **Never refuse to attach to the Argon host because it is busy.** When
+   `profile_dir` is the Argon browser's own profile and a Chrome is already running there:
+   - if a live CDP endpoint is published → **attach to it** (`acquire_host_tab`),
+   - if it is not published **yet** (the other lane is still starting it) → **WAIT and retry**
+     `ensure_browser_host` for up to **90 seconds** before deciding anything,
+   - only if it is still not reachable → fail with a clear message.
+   A direct `launch_persistent_context` on that profile must **never** be attempted: it cannot
+   succeed while the host holds the profile lock, and it is what produced the wrong account.
+2. **`EXIT_SLOT_BUSY` must be FATAL for the requested slot.** The account policy must **not**
+   rotate to a different slot when the failure is "the profile is busy" — silently running on
+   another account is how a round ends up patching the wrong Google account. If a fallback slot
+   is genuinely wanted, it must be an **explicit** decision, printed loudly, and it must
+   re-resolve the account index through FIX 4 (never through a stale `account_index`).
+3. **One prompt per lane.** Before the retry ladder sends again it MUST run the existing
+   duplicate check (`_check_duplicate_prompt` in `dispatch_argon.py`) against the live chat; if
+   the prompt is already there, the lane must **not** send it again and must go straight to
+   waiting for the delivery.
+4. **The model must be verified, not assumed.** After `ensure_mode_and_model` runs, the lane must
+   read the model chip back (its `aria-label` is `Open mode picker, currently <model>`) and
+   **refuse to send unless the model is Argon** (`Gemini Argon` / `আর্গন`). A chip that says
+   **Hydrogen** (or anything else) is a hard failure with a clear message — never a silent
+   downgrade to a different model.
+5. **The recorded account must match the account actually used.** When the lane records
+   `account_email`, it must be the email that the browser's live `account_info` has at the
+   `/u/<index>/` it opened — not the pool entry's email for a slot number that was never
+   verified. If they differ, that is a **loud failure**, not a note in the log.
+
+---
+
 ## SECTION 5 — The idle closer (opt-in, OFF by default)
 
 The owner does not want the browser to die by itself. But a browser left running forever is also
@@ -382,6 +455,15 @@ describes.
 - [ ] Two concurrent task-tab acquisitions on one profile keep BOTH tabs (no lost update).
 - [ ] The pool's `/u/N` order is resolved from the browser's live `account_info` every time.
 - [ ] Slot `/u/7/` (not signed in) does NOT open `/u/9/`; it reports "NOT SIGNED IN" loudly.
+- [ ] A second lane WAITS for the Argon host's CDP endpoint (up to 90 s) and then ATTACHES to it
+      instead of refusing with "Profile ... is busy".
+- [ ] A direct `launch_persistent_context` on the Argon browser's own profile is never attempted.
+- [ ] `EXIT_SLOT_BUSY` does NOT rotate the lane to a different slot/account.
+- [ ] The retry ladder checks the live chat for the prompt and does NOT send it twice.
+- [ ] The model chip is read back after `ensure_mode_and_model`; the lane REFUSES to send unless
+      the model is Argon (`Gemini Argon` / `আর্গন`) - a `Hydrogen` chip is a hard failure.
+- [ ] The recorded `account_email` is the email the browser's live `account_info` has at the
+      `/u/<index>/` that was actually opened, or the lane fails loudly.
 - [ ] `--resync-accounts` prints a real report and fixes the stored indexes.
 - [ ] The GUI card shows the live index and says "NOT SIGNED IN" instead of a stale number.
 - [ ] The idle closer is OFF by default and refuses to close a persistent host or a host with a
