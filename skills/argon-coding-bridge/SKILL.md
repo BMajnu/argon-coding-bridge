@@ -157,6 +157,40 @@ to run out.
 - **Preflight Self-Test in Seconds (`--self-test`)**:
   Run `python ./skills/argon-coding-bridge/scripts/dispatch_argon.py --self-test` to verify all four operations (attach without OS dialog, synthetic paste into the lowest composer skipping the floating bar, `3.8 Flash` -> `4 Argon` switch, semantic send after upload clears the composer, and paged Drive `viewer/text` stitching) plus fault-injection checks (`no_file_input`) in seconds.
 
+### 12. The Live Browser Control Loop, and the Lifecycle Guarantees (Rounds 19-21)
+
+- **The Argon browser is now a GENERAL browser (`skills/argon-coding-bridge/live_loop/`)**: it can
+  drive ANY website, not only `gemini.google.com`. The browser pushes a live interactive-element
+  map to the agent, the agent sends back an action, the browser executes it and pushes the next
+  map. One round trip, no human in the loop.
+- **The push is a true push, not a poll**: Playwright's `expose_binding` over the Chrome DevTools
+  Protocol (`Runtime.addBinding`) plus the shared map builder
+  (`skills/argon-coding-bridge/live_loop/live_map.js`) that a `MutationObserver` re-runs on every DOM
+  change. Measured live on wikipedia.org: 3-18 ms median push latency, and a 1,199-node page
+  compressed to 36 interactive elements.
+- **Two lanes, one protocol, one map builder**: Lane A is the CDP lane on the Argon browser itself
+  (zero install). Lane B is a SEPARATE minimal MV3 extension under `live_loop/extension/` for the
+  owner's everyday Chrome. The Gemini-only companion extension in `extension/` was NOT widened to
+  `<all_urls>`.
+- **The stale-element guard**: the map is rebuilt at action time and an action whose fingerprint no
+  longer matches is REFUSED, returning the fresh map instead. Element ids are positional, so this
+  is what keeps an unattended loop from clicking the wrong thing.
+- **Safety**: the daemon binds `127.0.0.1` only, authenticates every request with a 64-hex token,
+  accepts only `http(s)` navigations, and keeps `eval` disabled unless `--browser-allow-eval` is
+  passed.
+- **Commands**:
+  ```powershell
+  python "./skills/argon-coding-bridge/scripts/dispatch_argon.py" --browser-loop-start      # the control daemon
+  python "./skills/argon-coding-bridge/scripts/dispatch_argon.py" --browser-loop-status     # the live map of every tab
+  python "./skills/argon-coding-bridge/scripts/dispatch_argon.py" --browser-loop-stop
+  python "./skills/argon-coding-bridge/scripts/dispatch_argon.py" --browser-act '{"op":"map"}'
+  python "./skills/argon-coding-bridge/scripts/dispatch_argon.py" --browser-act '{"op":"click","id":12,"expect":{"tag":"button","name":"Sign in"}}'
+  python "./skills/argon-coding-bridge/scripts/dispatch_argon.py" --browser-loop-selftest   # end-to-end proof
+  python "./skills/argon-coding-bridge/scripts/dispatch_argon.py" --resync-accounts          # the live pool mapping
+  ```
+- **Always send `expect` with an element action.** Without it the action runs on whatever sits at
+  that id; with it, a stale map is caught instead of clicking the wrong thing.
+
 ---
 
 ## The production workflow
@@ -837,9 +871,27 @@ python "./skills/argon-coding-bridge/scripts/dispatch_argon.py" --task "..." --p
   lock file at `~/.gemini/argon_locks/slot-uN.lock` containing JSON with `pid`, `slot`,
   `started_at`, and `profile_dir`. If the recorded `pid` is no longer alive (`_pid_alive`), the
   stale lock is reclaimed automatically. If the PID is alive, the dispatcher announces
-  `[!] Slot /u/N/ is already in use by pid <PID> ...`, refuses to touch the other run's tab, and
-  either rotates to the next pool slot or exits with code `7` (`EXIT_SLOT_BUSY`) when no slot is
-  free. Locks are always released in a `finally` block.
+  `[!] Slot /u/N/ is already in use by pid <PID> ...` and refuses to touch the other run's tab.
+  **A busy slot is FATAL for the requested slot (exit code `7`, `EXIT_SLOT_BUSY`) and is never
+  rotated** (Round 21) — rotating would run the task under a *different* Google account than the
+  one that was asked for. Locks are always released in a `finally` block.
+- **Two lanes on the ONE browser (Rounds 20/21)**: The browser host state
+  (`.argon_browser_endpoint`) is read-modify-written **under a file lock**
+  (`update_host_state_locked`), so two lanes can never erase each other's tab entry. A lane that
+  arrives while the host is still starting **waits up to 90 s** for the CDP endpoint and then
+  attaches to it — it never falls back to a direct launch, which could never win the profile lock.
+- **The browser never closes on its own (Round 20)**: releasing a task's tab closes **only that
+  tab**. The host is closed by exactly one thing: the explicit `--close-browser`. A browser opened
+  for manual use (`--open-browser`, or the Login Assistant's *Open in Gemini Web*) is marked
+  `persistent` in the host state and is never reaped. The on-disk session stays fresh through
+  `snapshot_profile_session()` instead of through closing the browser.
+- **The pool's `/u/N` order is always the browser's `/u/N` order (Rounds 20/21)**: The browser's
+  `Default/Preferences` -> `account_info` is the only authority. `PoolConfig.resync_account_indexes()`
+  rewrites every slot from the live list, clears the stale index of an account that is not signed in
+  (marking it `needs_signin`), and reports collisions and unknown browser accounts. A slot whose
+  account is not signed in is refused loudly (`AccountNotSignedInError`, exit code `2`) — the pool
+  slot number is NOT the browser account index, so there is no safe fallback. Run
+  `python ./skills/argon-coding-bridge/scripts/dispatch_argon.py --resync-accounts` to see it.
 - **How the Argon browser and `/u/<index>/` switching work**: There is ONE browser — the Argon
   browser (`~/.gemini/argon_browser_profile`) — and no separate shared profile or per-slot profile
   directory in the normal flow (`PoolConfig.profile_dir_for_slot(slot)` always resolves to

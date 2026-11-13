@@ -58,10 +58,10 @@ Open the repository root (where `skills/argon-coding-bridge/SKILL.md` lives) or 
    - `Apply-ArgonPatch.ps1` snapshots modified files to `.argon_backup/` before editing.
    - Rollback instantly with `.\skills\argon-coding-bridge\scripts\Apply-ArgonPatch.ps1 -Rollback`.
 
-5. **Multi-Account Pool Automatic Sign-In, Per-Slot Isolation & Rotation:**
-   - `argon_pool_login.py` and `login_pool_accounts.py` sign each Google Pro account in `skills/argon-coding-bridge/config/accounts_pool.json` into its own dedicated slot profile (`~/.gemini/argon_profiles/slot-uN/`), using `~/.gemini/argon_browser_profile` as the master seed profile.
+5. **Multi-Account Pool Automatic Sign-In, One Shared Browser & Safe Slot Use:**
+   - `argon_pool_login.py` and `login_pool_accounts.py` sign each Google Pro account in `skills/argon-coding-bridge/config/accounts_pool.json` into the ONE Argon browser (`~/.gemini/argon_browser_profile`), which holds every account and is switched with Google's own `/u/<index>/` paths.
    - Automatically fills credentials via Google's `ServiceLogin` flow, completes account registration and Gemini consent, prefers Chrome's saved password autofill when present, and pauses with a Windows tray notification, audible alert, and in-app modal dialog whenever human 2FA/OTP approval is required.
-   - Prevents parallel runs from colliding via per-slot lock files (`~/.gemini/argon_locks/slot-uN.lock`) with stale-PID reclamation, SQLite online cookie backup seeding, and automatic rotation to the next free pool account.
+   - Prevents parallel runs from colliding via per-slot lock files (`~/.gemini/argon_locks/slot-uN.lock`) with stale-PID reclamation, and keeps the pool's `/u/N` order in step with the browser's live account list on every run (`--resync-accounts`).
 
 ---
 
@@ -170,11 +170,13 @@ re-briefing.
 
 ---
 
-## 🔒 Parallel Isolation, Per-Slot Profiles & Lock Files
+## 🔒 One Argon Browser, Lock Files & Slot Safety (Rounds 18-21)
 
-When two coding agents (or you and an agent) use the bridge at the same time on different projects,
-sharing a single Chrome `--user-data-dir` would cause the second launch to either fail with
-`Opening in existing browser session` or hijack and kill the first run's browser mid-flight.
+There is **ONE** Chrome for the whole bridge: `~/.gemini/argon_browser_profile`. Every pooled Google
+account lives inside it and is selected with Google's own `/u/<index>/` paths. The old per-slot
+profile directories (`~/.gemini/argon_profiles/slot-uN/`) were **deleted** in Round 18 — they cost
+68.23 GB and they were the reason two lanes could fight over a browser. Do not expect them to
+exist, and do not restore them.
 
 ### 1. Where the Lock Files Live & How a Busy Slot Is Detected and Announced
 - Every account slot `/u/N/` has a lock file at `~/.gemini/argon_locks/slot-uN.lock` (for example,
@@ -190,22 +192,82 @@ sharing a single Chrome `--user-data-dir` would cause the second launch to eithe
 - It **never** kills or touches the other run's browser and **never** launches Chrome on a busy
   profile directory. The lock is always released in a `finally` block when the run finishes.
 
-### 2. How the Per-Slot Profiles Work & SQLite Cookie Seeding
-- Every slot gets its own isolated Chrome profile directory at `~/.gemini/argon_profiles/slot-uN/`
-  (`slot-u0`, `slot-u1`, `slot-u2`, …). Two runs on two different slots never share a browser
-  process or fight over `--user-data-dir`.
-- The base profile (`~/.gemini/argon_browser_profile`) remains the master profile from which new
-  slot profiles are seeded.
-- Because Chrome holds `Default/Network/Cookies` open exclusively while running, a plain file copy of
-  a live profile loses the signed-in Google session. `_seed_profile()` only seeds when the master
-  profile is **not** busy (if the master is busy, it prints a clear warning instead of producing a
-  signed-out copy) and copies `Default/Network/Cookies` with SQLite's online backup API
-  (`sqlite3.connect(...).backup(...)`).
-- `argon_pool_login.py` and `login_pool_accounts.py` sign each account directly into that account's
-  own `~/.gemini/argon_profiles/slot-uN/` profile so `slot-u1` holds account 1's authenticated
-  Google session.
-- If a slot profile cannot be prepared, the dispatcher announces it and falls back to the shared
-  master profile **only** when the master profile is actually free.
+### 2. Two lanes on the ONE browser (Round 20/21)
+- The browser host state (`.argon_browser_endpoint`) is read-modify-written **under a file lock**
+  (`update_host_state_locked`), so two lanes can never erase each other's tab entry.
+- A lane that arrives while the host is still starting **waits up to 90 s** for the CDP endpoint and
+  then attaches to it. It never falls back to a direct launch, which could never win the profile lock.
+- A **busy slot is fatal for the requested slot** (exit code `7`, no rotation). Rotating would run
+  the task under a *different* Google account than the one that was asked for.
+- The prompt is checked against the live conversation before every re-send, and the model chip is
+  read back before the send — a chip that is not Argon aborts the task instead of silently
+  downgrading the model.
+
+### 3. The browser never closes on its own
+- Releasing a task's tab closes **only that tab**. The browser host is closed by exactly one thing:
+  the explicit `--close-browser`.
+- A browser opened for manual use (`--open-browser`, or the Login Assistant's **Open in Gemini Web**)
+  is marked `persistent` in the host state and is never reaped by an idle closer.
+- The on-disk session stays fresh through `snapshot_profile_session()` instead of through closing
+  the browser, so nothing is lost by keeping it open.
+
+### 4. The pool's `/u/N` order is always the browser's `/u/N` order
+- The browser's `Default/Preferences` → `account_info` is the **only** authority for the account
+  order. The pool file used to keep a static snapshot of those indexes, so it silently went stale —
+  the pool pointed `/u/7/` at `/u/9/`, an account that did not exist in the browser at all.
+- `PoolConfig.resync_account_indexes()` rewrites **every** slot from the live list, clears the stale
+  index of any account that is not signed in (marking it `needs_signin`), and reports collisions and
+  browser accounts the pool does not know about. `get_account_index()` calls it before every
+  resolution, and the Login Assistant calls it before it draws the card or opens Gemini Web.
+- A slot whose account is **not signed in** is refused loudly (`AccountNotSignedInError`, exit code
+  `2`). The pool slot number is *not* the browser account index, so there is no safe fallback.
+- See it at any time:
+  ```powershell
+  python skills\argon-coding-bridge\scripts\dispatch_argon.py --resync-accounts
+  ```
+
+---
+
+## 🖐️ Live Browser Control: Drive ANY Website from Your Agent (Round 19)
+
+The bridge can now drive **any** website, not only `gemini.google.com`. The browser pushes a live
+interactive-element map to the agent, the agent sends back an action, and the browser pushes the next
+map — one round trip, no human in the loop.
+
+```
+agent ──▶ browser : open / navigate / click element 12 / type / scroll
+agent ◀── browser : the LIVE element map (the "HTML mapping")
+```
+
+- The push is a **true push**, not a poll: Playwright's `expose_binding` over the Chrome DevTools
+  Protocol (`Runtime.addBinding`) plus one shared map builder
+  (`skills/argon-coding-bridge/live_loop/live_map.js`) that a `MutationObserver` re-runs on every
+  DOM change. Measured live on wikipedia.org: **3-18 ms median push latency**, and a 1,199-node page
+  compressed to **36 interactive elements**.
+- **Two lanes, one protocol, one map builder.** Lane A is the CDP lane on the Argon browser itself
+  (zero install). Lane B is a separate, minimal MV3 extension under `live_loop/extension/` for your
+  everyday Chrome. The Gemini-only companion extension is untouched and was **not** widened to
+  `<all_urls>`.
+- **The stale-element guard** rebuilds the map at action time and refuses an action whose
+  fingerprint no longer matches, returning the fresh map instead. Element ids are positional, so this
+  is what keeps an unattended loop from clicking the wrong thing.
+- Safety: the daemon binds `127.0.0.1` only, authenticates every request with a 64-hex token,
+  accepts only `http(s)` navigations, and keeps `eval` disabled unless `--browser-allow-eval` is
+  passed.
+
+```powershell
+# start the control daemon (it prints the endpoint and the token)
+python skills\argon-coding-bridge\scripts\dispatch_argon.py --browser-loop-start
+
+# ask the live browser what is on the page
+python skills\argon-coding-bridge\scripts\dispatch_argon.py --browser-act '{"op":"map"}'
+
+# click element 12 - and say what you expect it to be, so a stale map cannot misfire
+python skills\argon-coding-bridge\scripts\dispatch_argon.py --browser-act '{"op":"click","id":12,"expect":{"tag":"button","name":"Sign in"}}'
+
+# prove the whole loop end to end on a disposable Chrome
+python skills\argon-coding-bridge\scripts\dispatch_argon.py --browser-loop-selftest
+```
 
 ---
 
@@ -215,7 +277,8 @@ The pool distributes concurrent tasks across configured Google Pro accounts whil
 
 - **Follow-up tasks:** Always use the account slot that owns the existing conversation in `~/.gemini/argon_sessions.json`, even when that slot already has multiple tasks running.
 - **New tasks:** `_pool_slots_in_order()` orders the pool in slot order (`/u/0/`, `/u/1/`, …) starting from `--slot` (or `active_slot`) and wrapping around. A new task skips a slot **only** when that slot is already running the maximum number of tasks (`MAX_TASKS_PER_SLOT = 2`).
-- **Rotation on busy slot (exit code `7`):** When a slot is busy on a new task, the dispatcher advances to the next available slot in the pool.
+- **Rotation on a broken slot (exit codes `2`, `3`, `6`):** When the requested account is not signed in, the pre-flight fails, or the browser cannot be launched, the dispatcher advances to the next available slot in the pool — and re-resolves that slot's account index against the browser's LIVE account list.
+- **A busy slot is NOT rotated (exit code `7`):** a busy slot means another lane is using that account right now. The dispatcher stops and reports it, because rotating would run the task under a *different* Google account than the one that was asked for.
 - **`--max-accounts N`:** Caps how many pool accounts are tried in a single invocation (`0` = all).
 
 ```powershell
