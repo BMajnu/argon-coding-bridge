@@ -148,12 +148,13 @@ def detect_source_repo(explicit: Optional[str], start: Optional[Path] = None) ->
     return None
 
 
-def detect_targets(explicit: List[str], source: Optional[Path]) -> List[Path]:
+def detect_targets(explicit: List[str], source: Optional[Path],
+                   allow_new: bool = False) -> List[Path]:
     if explicit:
         out = []
         for t in explicit:
             p = Path(t).expanduser().resolve()
-            if looks_like_plugin_root(p):
+            if looks_like_plugin_root(p) or (allow_new and not p.exists()):
                 out.append(p)
         return out
 
@@ -352,7 +353,7 @@ def main(argv: Optional[List[str]] = None) -> int:
               file=sys.stderr)
         return 2
 
-    targets = detect_targets(args.target, source)
+    targets = detect_targets(args.target, source, allow_new=args.install)
     files = package_files(source)
     say(f"source repo : {source}")
     say(f"package     : {len(files)} files")
@@ -373,6 +374,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         rep: Dict[str, List[str]] = {}
         say("")
         say(f"=== {target}")
+        if not target.is_dir():
+            try:
+                target.mkdir(parents=True, exist_ok=True)
+                say(f"    created the root folder: {target}")
+            except OSError as exc:
+                say(f"    [ERROR] the root folder could not be created: {exc}")
+                exit_code = 1
+                continue
         copy_package(source, target, files, dry, rep)
         if not args.no_git_align:
             align_git(target, dry, rep)

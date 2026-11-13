@@ -191,7 +191,19 @@ def main() -> int:
           (clone / "skills" / "argon-coding-bridge" / "SKILL.md").is_file(), {})
 
     print()
-    print("=== 8. the source repo is found automatically ===")
+    print("=== 8. --install creates a root that does not exist yet ===")
+    import time as _t
+    fresh = base / f"fresh-{int(_t.time() * 1000)}"
+    proc = subprocess.run([sys.executable, str(SYNC), "--repo", str(repo),
+                           "--target", str(fresh), "--install", "--quiet"],
+                          capture_output=True, text=True, encoding="utf-8", errors="replace")
+    check("the install finished cleanly", proc.returncode == 0, {"exit": proc.returncode})
+    check("the new root was created", fresh.is_dir(), {})
+    check("the package landed in it",
+          (fresh / "skills" / "argon-coding-bridge" / "SKILL.md").is_file(), {})
+
+    print()
+    print("=== 9. the source repo is found automatically ===")
     found = sp.detect_source_repo(None, start=repo)
     check("the repo was detected", found is not None and Path(found).resolve() == repo.resolve(), {"found": str(found)})
 
