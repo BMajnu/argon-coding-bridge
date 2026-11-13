@@ -514,6 +514,40 @@ def seed_slot_profile(base_profile: Union[str, Path], target_profile: Union[str,
         return False
 
 
+class AccountNotSignedInError(RuntimeError):
+    """Raised when a pool slot's Google account is not present in the Argon browser.
+
+    The Argon browser's `Default/Preferences` (`account_info`) is the ONLY authority for
+    the `/u/<index>/` order. A pool slot whose email is not registered there is NOT
+    signed in, and its stored `account_index` is a stale snapshot (the owner measured
+    `/u/7/ -> /u/9/` pointing at an account that does not exist).
+
+    It subclasses `RuntimeError` on purpose: every existing `except RuntimeError` in the
+    bridge keeps working, while a caller that wants to distinguish "this account needs a
+    sign-in" from any other failure can now catch this type specifically.
+    """
+
+    def __init__(
+        self,
+        slot: str,
+        email: str,
+        stale_index: Optional[int] = None,
+        live_account_count: int = 0,
+        message: Optional[str] = None,
+    ) -> None:
+        self.slot = slot
+        self.email = email
+        self.stale_index = stale_index
+        self.live_account_count = live_account_count
+        if message is None:
+            message = (
+                "slot %s (%s) is not signed into the Argon browser yet (stale account_index=%s cleared; "
+                "live browser accounts=%d) - sign this account in once (Open_Argon_Login.bat -> Auto Login All) "
+                "before dispatching to it" % (slot, email, stale_index, live_account_count)
+            )
+        super().__init__(message)
+
+
 class PoolConfig:
     """Loads and saves skills/argon-coding-bridge/config/accounts_pool.json (UTF-8, 2-space indent, no BOM)."""
 
@@ -621,6 +655,121 @@ class PoolConfig:
             return False
         return True
 
+    def resync_account_indexes(self) -> Dict[str, Any]:
+        """Resync EVERY pool account's `account_index` from the browser's live account list.
+
+        The browser's `Default/Preferences` (`account_info`) is the only authority for the
+        `/u/<index>/` order, and it changes whenever an account is added, removed or
+        re-ordered in the Argon browser. The pool file used to keep a STATIC snapshot of
+        those indexes, so it silently went stale - the owner measured `/u/7/ -> /u/9/`
+        pointing at an account that does not exist in the browser at all.
+
+        This method is the answer to "how is the pool kept in sync with the browser?": it
+        rewrites EVERY slot from the live list, clears the stale index of any account that
+        is not signed in (marking it `needs_signin`), and reports the collisions and the
+        browser accounts the pool does not know about.
+
+        - Builds an `email -> live_index` map from `safe_browser.get_preferences_accounts`.
+        - Updates `account_index` for every signed-in pool slot.
+        - Clears the stale `account_index` and sets `status = "needs_signin"` for a pool
+          slot whose email is not in `account_info`.
+        - Detects two or more pool slots resolving to the same live index (`collisions`).
+        - Reports browser accounts that are not in the pool (`unknown_in_browser`).
+        """
+        try:
+            from safe_browser import get_preferences_accounts
+
+            live_list = get_preferences_accounts(self.profile_dir)
+        except Exception:
+            live_list = []
+
+        email_to_live_idx: Dict[str, int] = {}
+        for item in live_list:
+            if not isinstance(item, dict):
+                continue
+            em = str(item.get("email") or "").strip().lower()
+            if em and em not in email_to_live_idx:
+                email_to_live_idx[em] = int(item.get("index", 0))
+
+        updated: List[Dict[str, Any]] = []
+        needs_signin: List[Dict[str, Any]] = []
+        idx_to_slots: Dict[int, List[str]] = {}
+        pool_emails_lower: set = set()
+        changed_any = False
+
+        for acc in self.accounts:
+            if not isinstance(acc, dict):
+                continue
+            s_norm = normalize_slot(acc.get("slot", f"/u/{acc.get('index', 0)}/"))
+            email = str(acc.get("email") or "").strip()
+            em_low = email.lower()
+            if em_low:
+                pool_emails_lower.add(em_low)
+            old_idx = acc.get("account_index") if isinstance(acc.get("account_index"), int) else None
+
+            if em_low and em_low in email_to_live_idx:
+                live_idx = int(email_to_live_idx[em_low])
+                acc["account_index"] = live_idx
+                acc.pop("needs_signin", None)
+                if str(acc.get("status") or "").strip().lower() in ("needs_signin", "not_signed_in", "configured", ""):
+                    acc["status"] = "signed_in"
+                idx_to_slots.setdefault(live_idx, []).append(s_norm)
+                if old_idx != live_idx:
+                    changed_any = True
+                updated.append(
+                    {
+                        "slot": s_norm,
+                        "email": email,
+                        "account_index": live_idx,
+                        "previous_index": old_idx,
+                        "changed": old_idx != live_idx,
+                    }
+                )
+            else:
+                acc.pop("account_index", None)
+                acc["status"] = "needs_signin"
+                acc["needs_signin"] = True
+                if old_idx is not None:
+                    changed_any = True
+                needs_signin.append(
+                    {
+                        "slot": s_norm,
+                        "email": email,
+                        "cleared_stale_index": old_idx,
+                        "status": "needs_signin",
+                    }
+                )
+
+        collisions: Dict[str, List[str]] = {
+            f"/u/{idx_val}/": slots_for_idx
+            for idx_val, slots_for_idx in idx_to_slots.items()
+            if len(slots_for_idx) > 1
+        }
+        unknown_in_browser: List[Dict[str, Any]] = [
+            {
+                "index": int(item.get("index", 0)),
+                "email": str(item.get("email") or "").strip(),
+            }
+            for item in live_list
+            if isinstance(item, dict)
+            and str(item.get("email") or "").strip()
+            and str(item.get("email") or "").strip().lower() not in pool_emails_lower
+        ]
+
+        if changed_any and self.path.exists():
+            try:
+                self.save()
+            except Exception:
+                pass
+
+        return {
+            "profile_dir": str(self.profile_dir),
+            "updated": updated,
+            "needs_signin": needs_signin,
+            "collisions": collisions,
+            "unknown_in_browser": unknown_in_browser,
+        }
+
     def get_account_index(self, slot: Optional[Union[str, int]] = None) -> int:
         """Return the verified Gemini `/u/<index>/` account index owned by `slot` in the Argon browser.
 
@@ -631,6 +780,12 @@ class PoolConfig:
         target_slot = normalize_slot(slot) if slot is not None and str(slot).strip() else self.active_slot()
         if not self.is_shared_profile_slot(target_slot):
             return 0
+        # Keep the WHOLE pool in step with the browser before resolving this slot, so a
+        # stale snapshot can never be used and the pool file itself is corrected.
+        try:
+            self.resync_account_indexes()
+        except Exception:
+            pass
         acc = self.get_by_slot(target_slot)
         if isinstance(acc, dict):
             email = str(acc.get("email") or "").strip()
@@ -660,10 +815,11 @@ class PoolConfig:
                                 self.save()
                             except Exception:
                                 pass
-                        raise RuntimeError(
-                            "slot %s (%s) is not signed into the Argon browser yet (stale account_index=%s cleared; "
-                            "live browser accounts=%d) - sign this account in once (Open_Argon_Login.bat -> Auto Login All) "
-                            "before dispatching to it" % (target_slot, email, stale_val, len(all_pref_emails))
+                        raise AccountNotSignedInError(
+                            target_slot,
+                            email,
+                            stale_index=stale_val,
+                            live_account_count=len(all_pref_emails),
                         )
                 except RuntimeError:
                     raise

@@ -3817,6 +3817,7 @@ def get_target_url(
     mode: str,
     slot: Optional[str] = None,
     isolated_profile: bool = True,
+    strict: bool = True,
 ) -> str:
     """
     Return the canonical workspace URL for the given mode.
@@ -3844,21 +3845,53 @@ def get_target_url(
             "supported - it consistently fails on agentic work. Use "
             "--mode gemini (Gemini Web)."
         )
-    slot_part = _url_slot_for_account(slot, isolated_profile=isolated_profile)
+    slot_part = _url_slot_for_account(slot, isolated_profile=isolated_profile, strict=strict)
     return GEMINI_WEB_URL.format(slot=slot_part)
 
 
 _build_app_url = get_target_url
 
 
-def _url_slot_for_account(slot: Optional[str], isolated_profile: bool = False) -> str:
-    """Return `/u/0/` for an isolated slot profile, or `/u/<account_index>/` from `PoolConfig.get_account_index(slot)` in shared mode."""
+def _url_slot_for_account(
+    slot: Optional[str],
+    isolated_profile: bool = False,
+    strict: bool = True,
+) -> str:
+    """Return `/u/0/` for an isolated slot profile, or `/u/<account_index>/` from `PoolConfig.get_account_index(slot)` in shared mode.
+
+    Always resyncs against `Default/Preferences` (`account_info`) first and raises
+    `AccountNotSignedInError` when a configured pool slot is not signed in to the Argon
+    browser (Round 20 FIX 4.3).
+
+    There is NO correct fallback in shared mode: the pool slot number is NOT the browser
+    account index. Falling back to it silently opened a DIFFERENT Google account - the
+    owner measured a lane that was supposed to run on `/u/6/` opening `/u/7/` and
+    working under the wrong identity. The only tolerated fallback is when the pool has
+    no accounts configured at all.
+
+    `strict=False` is for the paths that RE-OPEN a conversation whose own URL already
+    carries the right `/u/<index>/`; they must keep working even while the pool file is
+    out of step with the browser.
+    """
     if isolated_profile:
         return "/u/0/"
+    from argon_pool_login import AccountNotSignedInError
+
+    cfg = PoolConfig()
     try:
-        acct_idx = PoolConfig().get_account_index(slot)
-        return f"/u/{acct_idx}/"
+        cfg.resync_account_indexes()
     except Exception:
+        pass
+    try:
+        acct_idx = cfg.get_account_index(slot)
+        return f"/u/{acct_idx}/"
+    except AccountNotSignedInError:
+        if strict:
+            raise
+        return normalize_slot(slot) if slot else "/u/0/"
+    except Exception:
+        if strict and cfg.accounts:
+            raise
         return normalize_slot(slot) if slot else "/u/0/"
 
 
@@ -3890,7 +3923,9 @@ def _normalize_gemini_chat_url(
     if isolated_profile:
         return re.sub(r"(gemini\.google\.com)/u/\d+/", r"\1/u/0/", raw, flags=re.IGNORECASE)
     if slot is not None:
-        url_slot = _url_slot_for_account(slot, isolated_profile=False)
+        # The recorded chat URL already carries its own /u/<index>/, so this rewrite is
+        # a convenience - it must never raise when the pool is momentarily out of step.
+        url_slot = _url_slot_for_account(slot, isolated_profile=False, strict=False)
         if re.search(r"gemini\.google\.com/u/\d+/", raw, flags=re.IGNORECASE):
             return re.sub(r"(gemini\.google\.com)/u/\d+/", f"\\1{url_slot}", raw, flags=re.IGNORECASE)
         return re.sub(r"(gemini\.google\.com)/(?=app\b)", f"\\1{url_slot}", raw, flags=re.IGNORECASE)
@@ -5256,7 +5291,11 @@ class SessionStore:
         if clean_ws_mode not in ("task", "chat"):
             clean_ws_mode = ""
         slot_part = normalize_slot(slot) if slot else "/u/0/"
-        url_slot = _url_slot_for_account(slot_part, isolated_profile=_profile_is_isolated_slot(profile_dir))
+        url_slot = _url_slot_for_account(
+            slot_part,
+            isolated_profile=_profile_is_isolated_slot(profile_dir),
+            strict=False,
+        )
         chat_url = f"https://gemini.google.com{url_slot}app/{chat_id}"
         now_str = time.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -5458,7 +5497,11 @@ class SessionStore:
         win_slot = normalize_slot(winning_lane.get("slot") or entry.get("slot") or "/u/0/")
         win_cid = str(winning_lane["chat_id"])
         win_prof = str(winning_lane.get("profile_dir") or entry.get("profile_dir") or "")
-        url_slot = _url_slot_for_account(win_slot, isolated_profile=_profile_is_isolated_slot(win_prof))
+        url_slot = _url_slot_for_account(
+            win_slot,
+            isolated_profile=_profile_is_isolated_slot(win_prof),
+            strict=False,
+        )
         win_url = _normalize_gemini_chat_url(
             str(winning_lane.get("chat_url") or f"https://gemini.google.com{url_slot}app/{win_cid}"),
             isolated_profile=_profile_is_isolated_slot(win_prof),
@@ -5518,7 +5561,11 @@ class SessionStore:
             return None
         slot_val = normalize_slot(lane_data.get("slot") or entry.get("slot") or "/u/0/")
         prof_val = str(lane_data.get("profile_dir") or entry.get("profile_dir") or "")
-        url_slot = _url_slot_for_account(slot_val, isolated_profile=_profile_is_isolated_slot(prof_val))
+        url_slot = _url_slot_for_account(
+            slot_val,
+            isolated_profile=_profile_is_isolated_slot(prof_val),
+            strict=False,
+        )
         chat_url = _normalize_gemini_chat_url(
             str(lane_data.get("chat_url") or entry.get("chat_url") or f"https://gemini.google.com{url_slot}app/{chat_id}"),
             isolated_profile=_profile_is_isolated_slot(prof_val),
@@ -8685,7 +8732,7 @@ def _resolve_reopen_url(
     Prioritizes the recorded `chat_id` from `TaskState` (lane-aware) so `--resume`
     always reopens the exact recorded conversation.
     """
-    slot_part = _url_slot_for_account(active_slot, isolated_profile=isolated_profile)
+    slot_part = _url_slot_for_account(active_slot, isolated_profile=isolated_profile, strict=False)
 
     def _url_for_chat_id(cid: str) -> str:
         return f"https://gemini.google.com{slot_part}app/{cid}"
@@ -10939,7 +10986,9 @@ def dispatch_to_argon(
             mode=mode,
             active_slot=active_slot,
             current_url=str(resume_entry.get("chat_url") or ""),
-            fallback_url=get_target_url(mode, active_slot, isolated_profile=isolated_slot),
+            fallback_url=get_target_url(
+                mode, active_slot, isolated_profile=isolated_slot, strict=False
+            ),
             task_state=task_state_store,
             session_store=session_store,
             isolated_profile=isolated_slot,
@@ -10959,7 +11008,19 @@ def dispatch_to_argon(
         active_account = pool_cfg.get_by_slot(active_slot)
         target_email = active_account.get("email") if active_account else None
         isolated_slot = _profile_is_isolated_slot(slot_profile)
-        target_url = get_target_url(mode, active_slot, isolated_profile=isolated_slot)
+        try:
+            target_url = get_target_url(mode, active_slot, isolated_profile=isolated_slot)
+        except RuntimeError as exc_url:
+            # Round 21: the slot's account is not signed in to the Argon browser. Refusing
+            # here is the whole point - the old silent fallback opened `/u/<slot number>/`,
+            # which is a DIFFERENT Google account, and the task ran under the wrong identity.
+            print(f"[!] {exc_url}", file=sys.stderr)
+            print(
+                "[!] Refusing to open a URL for an account that is not signed in - the pool slot "
+                "number is NOT the browser account index.",
+                file=sys.stderr,
+            )
+            return EXIT_NOT_SIGNED_IN
 
     prior_task_entry = task_state_store.get(proj_root) or {}
     prior_diag_evidence: Optional[Dict[str, Any]] = None

@@ -699,6 +699,13 @@ class PoolLoginAssistantApp:
         return accounts[self.current_index]
 
     def _refresh_account_card(self) -> None:
+        # Keep the pool file in step with the browser BEFORE the card is drawn, so the
+        # card can never show a stale `/u/<index>/` (the owner measured `/u/7/ -> /u/9/`
+        # pointing at an account that does not exist).
+        try:
+            self.pool_config.resync_account_indexes()
+        except Exception:
+            pass
         acc = self._current_account()
         total = len(self.pool_config.accounts)
         if not acc:
@@ -845,6 +852,12 @@ class PoolLoginAssistantApp:
         acc = self._current_account()
         slot = self.pool_config.set_active_slot(acc.get("slot", "/u/0/")) if acc else self.pool_config.active_slot()
         profile_dir = self.pool_config.profile_dir_for_slot(slot)
+        # Resync the whole pool with the browser first, then read the LIVE index of this
+        # slot. Never open a `/u/<index>/` that the browser does not have.
+        try:
+            self.pool_config.resync_account_indexes()
+        except Exception:
+            pass
         if is_isolated_slot_profile(profile_dir):
             url_slot = "/u/0/"
         else:
