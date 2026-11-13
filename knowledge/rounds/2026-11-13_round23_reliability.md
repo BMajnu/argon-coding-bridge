@@ -90,6 +90,21 @@ The fix is measured and works: the DevTools Protocol's `Extensions.loadUnpacked`
 unpacked extension into the RUNNING browser in **0.03 s**, it then appears in `chrome://extensions`
 as "Argon Coding Bridge Companion", and its content script really runs (marker `1.16.0`).
 
+**And this is the step that breaks every dispatch.** Measured in round 23, twice, on the owner's
+machine, with the extension missing:
+
+```
+prompt paste   (python_datatransfer) : OK (48469 chars in composer)
+attachment argon_context.zip (2031048 bytes, 59 entries) (python_fallback) : FAILED
+                                            (the upload menu rendered no file input)
+```
+
+The paste works. **The ATTACH is what fails** - and the attach is the one operation the companion
+extension exists for: the extension injects the file into the composer's hidden `input[type=file]`
+without ever opening the OS file dialog. Without it, the pure-Python path has to open Gemini's
+upload menu and find a file input, and the current Gemini UI renders none. So the missing
+extension is not a cosmetic problem - **it is why not a single session gets through.**
+
 ### F3 — The bridge's own fixes live in a WORKSPACE BACKUP, not in the repo
 
 This is why the same bugs keep coming back. Four bridge fixes exist ONLY as scripts under
