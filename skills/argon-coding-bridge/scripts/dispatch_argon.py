@@ -7655,6 +7655,58 @@ def _paste_into_composer(page, composer, prompt_text: str) -> str:
     return landed
 
 
+def _clear_leftover_prompt_after_send(
+    page,
+    composer,
+    probe_snippet: str = "",
+    expected_min_len: int = 1,
+) -> bool:
+    """Empty the composer after a VERIFIED send when the prompt is STILL sitting in it.
+
+    MEASURED 2026-11-14 (the Phase-7 round-24 lane): Gemini's Task mode keeps the
+    submitted prompt in the composer, so the send arrow stays ARMED. Any later click or
+    Enter then fires the SAME prompt again: it lands as a queued steering turn, the chat
+    shows the prompt twice, and a second Argon turn is billed for nothing.
+
+    Only OUR OWN leftover is cleared - if the composer holds anything else (a human typed
+    something new) it is left alone, and an empty composer is left alone.
+    """
+    try:
+        remaining = _composer_text(composer)
+    except Exception:
+        return False
+    floor = max(int(expected_min_len or 1), 20)
+    if len(remaining) < floor:
+        return False
+    probe = str(probe_snippet or "").strip()
+    if not probe:
+        return False
+    head = probe[: max(40, min(len(probe), 200))]
+    if head not in remaining:
+        print("[i] The composer still holds text that is not this prompt - left it alone.")
+        return False
+    try:
+        _focus_composer_dom(composer)
+        page.keyboard.press("Control+A")
+        page.wait_for_timeout(150)
+        page.keyboard.press("Delete")
+        page.wait_for_timeout(500)
+        if len(_composer_text(composer)) < floor:
+            print("[+] Cleared the leftover prompt from the composer after the verified send.")
+            return True
+        try:
+            page.keyboard.press("Backspace")
+            page.wait_for_timeout(400)
+        except Exception:
+            pass
+        if len(_composer_text(composer)) < floor:
+            print("[+] Cleared the leftover prompt from the composer after the verified send.")
+            return True
+    except Exception as exc:
+        print(f"[i] Could not clear the composer after the send: {exc}", file=sys.stderr)
+    return False
+
+
 def _click_send_immediately(page, composer, expected_min_len: int = 1, probe_snippet: str = "", body_len_before: int = 0, snippet_count_before: int = 0, on_progress: Optional[Any] = None) -> bool:
     """Click the send button (or press Control+Enter) immediately once upload completes (Rule 5 & Rule 6).
 
@@ -7694,6 +7746,10 @@ def _click_send_immediately(page, composer, expected_min_len: int = 1, probe_sni
                 except Exception:
                     pass
             print("[+] Send triggered and verified via companion extension semantic matcher.")
+            # Round 24: Gemini's Task mode keeps the submitted prompt in the composer, so
+            # the send arrow stays armed and the leftover can be fired again as a queued
+            # steering turn. The extension's matcher already proved the send went out.
+            _clear_leftover_prompt_after_send(page, composer, probe_snippet, expected_min_len)
             return True
 
     button = _composer_send_button(page, composer)
@@ -7732,6 +7788,17 @@ def _click_send_immediately(page, composer, expected_min_len: int = 1, probe_sni
             or (bool(probe_snippet) and snippet_count_after > snippet_count_before)
         )
         if composer_emptied or conversation_grew:
+            # Round 24: the composer keeps the submitted prompt in Gemini's Task mode, so
+            # the send arrow stays armed and the leftover can be fired again as a queued
+            # steering turn. Clear it - but ONLY when the snippet count proves the prompt
+            # really landed in the transcript (the body always contains the composer's
+            # own copy, so a plain "is the snippet in the body" test proves nothing).
+            if (
+                not composer_emptied
+                and probe_snippet
+                and snippet_count_after > snippet_count_before
+            ):
+                _clear_leftover_prompt_after_send(page, composer, probe_snippet, expected_min_len)
             setattr(page, "_argon_last_send_path", "python_fallback")
             setattr(page, "_argon_last_operation_error", None)
             if on_progress:

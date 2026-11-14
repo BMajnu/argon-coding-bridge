@@ -285,12 +285,104 @@ def case_5_the_image_input_is_chosen_by_mime() -> Dict[str, Any]:
     return out
 
 
+def case_6_the_leftover_prompt_is_cleared_after_a_verified_send() -> Dict[str, Any]:
+    """Gemini's Task mode keeps the submitted prompt in the composer.
+
+    That leftover leaves the send arrow armed, so any later click fires the SAME prompt
+    again as a queued steering turn (measured 2026-11-14 on the Phase-7 lane). After a
+    VERIFIED send the composer must be emptied - and only our own leftover may be
+    removed.
+    """
+    import dispatch_argon as D
+
+    prompt = ("I have uploaded the relevant codebase context as a zip archive "
+              "(`argon_context.zip`). Inside the archive you will find TASK_BRIEF.md.")
+    probe = prompt[:60]
+
+    html = """<!doctype html><html><body>
+<div id="log"></div>
+<div class="input-area-container">
+  <div id="composer" contenteditable="true" role="textbox"></div>
+  <button id="send" aria-label="Send message">Send</button>
+</div>
+<script>
+  const c = document.getElementById('composer');
+  const log = document.getElementById('log');
+  // Gemini's Task mode: the prompt lands in the transcript AND STAYS in the composer.
+  const submit = () => { log.textContent += c.textContent + '\\n'; };
+  document.getElementById('send').addEventListener('click', submit);
+  c.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); submit(); }
+  });
+</script></body></html>"""
+
+    work = Path(tempfile.mkdtemp(prefix="argon_r24_composer_"))
+    out: Dict[str, Any] = {}
+    orig_flash = D.enforce_no_flash_before_send
+    orig_ext = D._extension_is_available
+    try:
+        page_file = work / "page.html"
+        page_file.write_text(html, encoding="utf-8")
+        D.enforce_no_flash_before_send = lambda page: True   # the chip check is tested elsewhere
+        D._extension_is_available = lambda page: False       # force the pure-Python send path
+        with _chrome() as pw:
+            browser = _launch(pw)
+            try:
+                page = browser.new_page()
+                page.goto(page_file.as_uri())
+                composer = D._find_composer(page)
+                assert composer is not None, "the synthetic page has no composer"
+                D._focus_composer_dom(composer)
+                page.keyboard.insert_text(prompt)
+                page.wait_for_timeout(200)
+
+                body_before = D._page_body_snapshot(page)
+                sent = D._click_send_immediately(
+                    page,
+                    composer,
+                    expected_min_len=10,
+                    probe_snippet=probe,
+                    body_len_before=len(body_before),
+                    snippet_count_before=body_before.count(probe),
+                )
+                page.wait_for_timeout(400)
+                transcript = page.locator("#log").inner_text()
+                composer_after = D._composer_text(composer)
+
+                # foreign text must survive
+                D._focus_composer_dom(composer)
+                page.keyboard.insert_text("a human typed this")
+                page.wait_for_timeout(150)
+                D._clear_leftover_prompt_after_send(page, composer, probe, 10)
+                foreign_after = D._composer_text(composer)
+
+                out = {
+                    "ok": bool(sent)
+                    and prompt in transcript
+                    and len(composer_after) < 10
+                    and "a human typed this" in foreign_after,
+                    "send_verified": bool(sent),
+                    "prompt_landed_in_transcript": prompt in transcript,
+                    "composer_after_send": composer_after[:60],
+                    "composer_cleared": len(composer_after) < 10,
+                    "foreign_text_preserved": "a human typed this" in foreign_after,
+                }
+            finally:
+                browser.close()
+    finally:
+        D.enforce_no_flash_before_send = orig_flash
+        D._extension_is_available = orig_ext
+        shutil.rmtree(work, ignore_errors=True)
+    return out
+
+
 CASES = [
     ("case_1_patchers_cannot_kill_the_bridge", case_1_patchers_cannot_kill_the_bridge),
     ("case_2_duplicate_option_is_repaired_not_repeated", case_2_duplicate_option_is_repaired_not_repeated),
     ("case_3_images_go_in_one_call_and_all_survive", case_3_images_go_in_one_call_and_all_survive),
     ("case_4_one_call_replaces_the_list", case_4_one_call_replaces_the_list),
     ("case_5_the_image_input_is_chosen_by_mime", case_5_the_image_input_is_chosen_by_mime),
+    ("case_6_the_leftover_prompt_is_cleared_after_a_verified_send", case_6_the_leftover_prompt_is_cleared_after_a_verified_send),
 ]
 
 

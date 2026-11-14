@@ -179,13 +179,17 @@ delivery (140,865 bytes, sha256 `688317e5…`, pre-flighted 31/31 hunks, 0 glued
 terminators) was applied with the bridge's own `Run-ArgonPatch.ps1`. It landed the three
 work units (commit `ebc5627`) and four extra fixes Argon found while reading the project.
 
-**NEW FINDING A — the composer is NOT cleared after a verified send.**
+**NEW FINDING A — the composer is NOT cleared after a verified send.  → FIXED in this round.**
 The 35,724-character prompt stayed in the composer after the send (the bridge's own log:
 `prompt paste (extension) : OK (35724 chars in composer)` -> `sent` -> the composer still
-held the text). It LOOKS like a pending turn, and the send arrow stayed armed - so any
-later click or Enter fires the SAME prompt again. **Fix for round 25:** clear the composer
-and disarm the send button after a verified send, and treat "the composer still holds the
-prompt" as a failure of the send, not as a pending turn.
+held the text). It LOOKED like a pending turn, and the send arrow stayed armed - so any
+later click or Enter fired the SAME prompt again. **Fixed:** the new helper
+`_clear_leftover_prompt_after_send()` empties the composer after a VERIFIED send in BOTH
+send paths (the companion extension's semantic matcher and the pure-Python fallback). It
+only removes OUR OWN leftover (foreign text is left alone), and on the Python path it only
+runs when the probe-snippet count grew, i.e. when the prompt is proven to have landed in
+the transcript. Covered by `test_round24_bugfixes.py` case_6 (a synthetic Gemini page
+whose composer keeps the text after the send - exactly Gemini's Task mode).
 
 **NEW FINDING B — a second turn can appear as a `queued-steering-turn`.**
 The live DOM of the chat (`gemini.google.com/u/2/app/c4d7ab7a723d592b`) held TWO
