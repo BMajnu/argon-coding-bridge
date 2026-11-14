@@ -31,7 +31,18 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-DEFAULT_TARGET = Path(__file__).resolve().parent.parent / "dispatch_argon.py"
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _safe_patch import (  # noqa: E402
+    DISPATCH_MODULE,
+    RELIABILITY_MODULE,
+    apply_to_target,
+    module_has,
+    read_source,
+    report,
+    result,
+)
+
+DEFAULT_TARGET = DISPATCH_MODULE
 
 # The ONLY place the toggle filter belongs: the mode detection.
 OLD_TOGGLE_BODY = """        task_btn = page.get_by_text(RE_TASK)
@@ -95,29 +106,45 @@ HELPER_SNIPPET = '''def _is_toggle_control(el) -> bool:
 def apply_patch(target_path: Optional[Path] = None, dry_run: bool = False) -> Dict[str, Any]:
     target = Path(target_path or DEFAULT_TARGET).resolve()
     if not target.is_file():
-        return {"ok": False, "status": "missing_target", "target": str(target)}
-    raw = target.read_text(encoding="utf-8")
+        return result(False, "missing_target", target)
+    _, raw, _ = read_source(target)
 
     already = (OLD_TOGGLE_BODY not in raw) and (NEW_TOGGLE_BODY in raw)
-    helper_present = ("def _is_toggle_control(" in raw) or ("_is_toggle_control," in raw)
+    helper_in_module = module_has(RELIABILITY_MODULE, "def _is_toggle_control(")
+    helper_present = (
+        ("def _is_toggle_control(" in raw)
+        or ("_is_toggle_control," in raw)
+        or helper_in_module
+    )
     if already and helper_present:
-        return {"ok": True, "status": "already_applied", "target": str(target)}
+        return result(
+            True,
+            "already_applied",
+            target,
+            f"_task_toggle_present() already uses the toggle filter; "
+            f"helper in {RELIABILITY_MODULE.name}: {helper_in_module}",
+        )
+    if OLD_TOGGLE_BODY not in raw and NEW_TOGGLE_BODY not in raw:
+        return result(False, "anchor_not_found", target,
+                      "neither the old nor the new _task_toggle_present() body was found")
 
-    updated = raw
-    if OLD_TOGGLE_BODY in updated:
-        updated = updated.replace(OLD_TOGGLE_BODY, NEW_TOGGLE_BODY, 1)
-    elif NEW_TOGGLE_BODY not in updated:
-        return {"ok": False, "status": "anchor_not_found", "target": str(target)}
+    def transform(text: str) -> str:
+        updated = text
+        if OLD_TOGGLE_BODY in updated:
+            updated = updated.replace(OLD_TOGGLE_BODY, NEW_TOGGLE_BODY, 1)
+        if not helper_present:
+            anchor = "def _mode_is_task(page) -> bool:"
+            if anchor in updated:
+                updated = updated.replace(anchor, HELPER_SNIPPET + anchor, 1)
+        return updated
 
-    if not helper_present:
-        anchor = "def _mode_is_task(page) -> bool:"
-        if anchor not in updated:
-            return {"ok": False, "status": "helper_anchor_not_found", "target": str(target)}
-        updated = updated.replace(anchor, HELPER_SNIPPET + anchor, 1)
+    if dry_run:
+        return result(False, "would_change", target, "the toggle filter is not applied yet")
 
-    if not dry_run:
-        target.write_text(updated, encoding="utf-8")
-    return {"ok": True, "status": "applied", "target": str(target)}
+    status, detail = apply_to_target(target, transform)
+    if status == "failed":
+        return result(False, status, target, detail)
+    return result(True, status, target, detail)
 
 
 def main() -> int:

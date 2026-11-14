@@ -8721,6 +8721,24 @@ def run_preflight_selftest_cli(headless: bool = True, require_extension: bool = 
         f"model={e2e.get('model_verified')!r}, ext_id={e2e.get('extension_id')}, "
         f"overflow_viewer=clamped, wedge_recovery={e2e.get('wedge_recovery_method')})"
     )
+    # Round 24: the re-apply patch scripts must never kill the bridge, and the
+    # image attach must put EVERY file into the composer.
+    try:
+        from test_round24_bugfixes import run_round24_suite
+
+        r24_rep = run_round24_suite()
+    except Exception as r24_exc:
+        print(f"[ERROR] Round 24 bug-fix self-test could not run: {r24_exc}", file=sys.stderr)
+        return EXIT_PREFLIGHT_FAILED
+    if not r24_rep.get("ok"):
+        print(f"[ERROR] Round 24 bug-fix self-test failed: {r24_rep}", file=sys.stderr)
+        return EXIT_PREFLIGHT_FAILED
+    print(
+        f"  Round 24 bug fixes    : OK ({r24_rep.get('passed')}/{r24_rep.get('total')} cases in "
+        f"{r24_rep.get('elapsed_ms')} ms: the re-apply patchers cannot kill the bridge, "
+        f"the duplicate --attach-images option is repaired, "
+        f"{r24_rep.get('images_reported')} images reach the composer)"
+    )
     return EXIT_SUCCESS
 
 

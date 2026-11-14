@@ -244,36 +244,251 @@ def _attach_zip_via_cdp_dom_file_input(page: Any, file_path: Union[str, Path]) -
         return False, "cdp_dom_file_input", f"DOM.setFileInputFiles failed: {pw_exc}"
 
 
+_FILE_INPUT_MIME = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+    ".svg": "image/svg+xml",
+    ".bmp": "image/bmp",
+    ".zip": "application/zip",
+}
+
+
+def _accept_allows(accept: str, suffix: str, mime: str) -> bool:
+    """True when a file input's `accept` attribute allows this file.
+
+    The old code compared the file SUFFIX (".png") against the accept attribute
+    ("image/*,video/*"). Those never match, so the image input was NEVER selected
+    and the first input on the page won by accident.
+    """
+    acc = (accept or "").strip().lower()
+    if not acc:
+        return True
+    for part in [p.strip() for p in acc.split(",") if p.strip()]:
+        if part.startswith("."):
+            if suffix == part or suffix.startswith(part + "."):
+                return True
+        elif part.endswith("/*"):
+            if mime.split("/")[0] == part.split("/")[0]:
+                return True
+        elif part == mime:
+            return True
+    return False
+
+
+def _file_input_attributes(cdp: Any, node_id: int) -> Dict[str, str]:
+    try:
+        res = cdp.send("DOM.getAttributes", {"nodeId": int(node_id)}) or {}
+    except Exception:
+        return {}
+    lst = list(res.get("attributes") or [])
+    out: Dict[str, str] = {}
+    for i in range(0, len(lst) - 1, 2):
+        out[str(lst[i]).lower()] = str(lst[i + 1])
+    return out
+
+
+def _pick_file_input_node(cdp: Any, node_ids: List[int], paths: List[Path]) -> int:
+    """Pick the file input that accepts ALL of `paths` (preferring a `multiple` one)."""
+    best_node = int(node_ids[0])
+    best_score = -1
+    for nid in node_ids:
+        attrs = _file_input_attributes(cdp, nid)
+        accept = attrs.get("accept", "")
+        multiple = "multiple" in attrs
+        allows = [
+            _accept_allows(
+                accept,
+                p.suffix.lower(),
+                _FILE_INPUT_MIME.get(p.suffix.lower(), "application/octet-stream"),
+            )
+            for p in paths
+        ]
+        score = 0
+        if allows and all(allows):
+            score += 4
+        elif any(allows):
+            score += 1
+        if multiple and len(paths) > 1:
+            score += 2
+        if not accept:
+            score += 1
+        if score > best_score:
+            best_score = score
+            best_node = int(nid)
+    return best_node
+
+
+def _count_files_in_inputs(page: Any) -> int:
+    """How many files the browser ACTUALLY holds in its file inputs (shadow roots included).
+
+    -1 means "could not be measured".
+    """
+    try:
+        res = page.evaluate(
+            """() => {
+                const found = [];
+                const walk = (root) => {
+                    for (const el of root.querySelectorAll('*')) {
+                        if (el.tagName === 'INPUT' && el.type === 'file') found.push(el);
+                        if (el.shadowRoot) walk(el.shadowRoot);
+                    }
+                };
+                walk(document);
+                let max = 0;
+                for (const el of found) {
+                    const n = (el.files && el.files.length) ? el.files.length : 0;
+                    if (n > max) max = n;
+                }
+                return max;
+            }"""
+        )
+        return int(res or 0)
+    except Exception:
+        return -1
+
+
+def _attach_files_via_cdp_dom_file_input(
+    page: Any, file_paths: List[Union[str, Path]]
+) -> Tuple[bool, str, str, int]:
+    """Attach ALL `file_paths` to ONE file input with a SINGLE CDP call.
+
+    `DOM.setFileInputFiles` REPLACES the file list of the input it is given. Calling
+    it once per file therefore keeps only the LAST file. One call with the whole list
+    is the only way to get more than one attachment into the composer.
+
+    Returns `(ok, path_used, reason, files_sent)`.
+    """
+    paths = [Path(p).expanduser().resolve() for p in file_paths]
+    for p in paths:
+        if not p.is_file():
+            return False, "cdp_dom_file_input", f"file does not exist on disk: {p}", 0
+
+    ctx = getattr(page, "context", None)
+    if ctx is None or not hasattr(ctx, "new_cdp_session"):
+        return False, "cdp_dom_file_input", "page context does not support new_cdp_session", 0
+
+    cdp = None
+    try:
+        cdp = ctx.new_cdp_session(page)
+        doc = cdp.send("DOM.getDocument", {"depth": 1, "pierce": True}) or {}
+        root_node_id = int((doc.get("root") or {}).get("nodeId") or 0)
+        if root_node_id <= 0:
+            return False, "cdp_dom_file_input", "the page has no document node", 0
+        q_res = cdp.send(
+            "DOM.querySelectorAll",
+            {"nodeId": root_node_id, "selector": "input[type='file']"},
+        ) or {}
+        node_ids = list(q_res.get("nodeIds") or [])
+        if not node_ids:
+            return False, "cdp_dom_file_input", "the upload menu rendered no file input", 0
+
+        chosen = _pick_file_input_node(cdp, node_ids, paths)
+        cdp.send("DOM.setFileInputFiles", {"files": [str(p) for p in paths], "nodeId": chosen})
+
+        try:
+            page.evaluate(
+                """() => {
+                    const found = [];
+                    const walk = (root) => {
+                        for (const el of root.querySelectorAll('*')) {
+                            if (el.tagName === 'INPUT' && el.type === 'file') found.push(el);
+                            if (el.shadowRoot) walk(el.shadowRoot);
+                        }
+                    };
+                    walk(document);
+                    for (const inp of found) {
+                        if (inp.files && inp.files.length > 0) {
+                            inp.dispatchEvent(new Event("input", { bubbles: true }));
+                            inp.dispatchEvent(new Event("change", { bubbles: true }));
+                        }
+                    }
+                }"""
+            )
+        except Exception as ev_exc:
+            print(f"[i] Post-DOM.setFileInputFiles event dispatch note: {ev_exc}", file=sys.stderr)
+        return True, "cdp_dom_file_input_multi", "", len(paths)
+    except Exception as cdp_exc:
+        # Fallback: Playwright's locator.set_input_files (accepts a LIST of paths).
+        try:
+            inputs = page.locator("input[type='file']")
+            if inputs.count():
+                inputs.first.set_input_files([str(p) for p in paths])
+                return True, "playwright_set_input_files", "", len(paths)
+        except Exception as pw_exc:
+            return False, "cdp_dom_file_input", (
+                f"DOM.setFileInputFiles failed: {cdp_exc}; Playwright fallback failed: {pw_exc}"
+            ), 0
+        return False, "cdp_dom_file_input", f"DOM.setFileInputFiles failed: {cdp_exc}", 0
+    finally:
+        if cdp is not None:
+            try:
+                cdp.detach()
+            except Exception:
+                pass
+
+
 def attach_images_to_composer(
     page: Any,
     image_paths: Optional[List[Union[str, Path]]],
     open_upload_menu_fn: Optional[Callable[[Any], bool]] = None,
 ) -> Tuple[bool, List[str], str]:
-    """Attach one or more image files (`--attach-images`) to the Gemini composer (Rule R3 Fix 1)."""
+    """Attach image files (`--attach-images`) to the Gemini composer (Rule R3 Fix 1).
+
+    ROUND 24 (measured 2026-11-14 on the owner's Phase 7 lane): the old version
+    called CDP `DOM.setFileInputFiles` ONCE PER IMAGE. That call REPLACES the file
+    input's file list, so with eight screenshots only the LAST one survived - the
+    bridge printed "8 images attached" while Gemini received ONE. All files now go
+    in a SINGLE call, and the count the browser really holds is read back, so the
+    bridge can never report a lie.
+    """
     if not image_paths:
         return True, [], ""
-    attached_names: List[str] = []
+
+    paths: List[Path] = []
     for raw_p in image_paths:
         if not raw_p or not str(raw_p).strip():
             continue
         img_p = Path(str(raw_p)).expanduser().resolve()
         if not img_p.is_file():
-            return False, attached_names, f"--attach-images file does not exist: {img_p}"
-        if open_upload_menu_fn is not None:
-            try:
-                open_upload_menu_fn(page)
-            except Exception as menu_exc:
-                print(f"[i] Upload menu open before image attach reported: {menu_exc}", file=sys.stderr)
-        ok, path_used, reason = _attach_zip_via_cdp_dom_file_input(page, img_p)
-        if not ok:
-            return False, attached_names, f"failed to attach image {img_p.name} ({reason})"
-        attached_names.append(img_p.name)
-        print(f"[+] Attached image {img_p.name} ({img_p.stat().st_size} bytes) via {path_used}.")
+            return False, [], f"--attach-images file does not exist: {img_p}"
+        paths.append(img_p)
+    if not paths:
+        return True, [], ""
+
+    if open_upload_menu_fn is not None:
         try:
-            page.wait_for_timeout(600)
-        except Exception:
-            time.sleep(0.6)
-    return True, attached_names, ""
+            open_upload_menu_fn(page)
+        except Exception as menu_exc:
+            print(f"[i] Upload menu open before image attach reported: {menu_exc}", file=sys.stderr)
+
+    ok, path_used, reason, _sent = _attach_files_via_cdp_dom_file_input(page, paths)
+    if not ok:
+        return False, [], f"failed to attach {len(paths)} image(s) ({reason})"
+
+    real = _count_files_in_inputs(page)
+    if real < 0:
+        real = len(paths)
+    held = min(real, len(paths))
+    names = [p.name for p in paths[:held]]
+
+    if held < len(paths):
+        missing = ", ".join(p.name for p in paths[held:])
+        return (
+            False,
+            names,
+            f"the composer holds only {held} of {len(paths)} image(s) after the attach; "
+            f"missing: {missing}",
+        )
+
+    print(f"[+] Attached {held} image(s) to the composer via {path_used}.")
+    try:
+        page.wait_for_timeout(600)
+    except Exception:
+        time.sleep(0.6)
+    return True, names, ""
 
 
 def _normalize_viewer_geometry(page: Any) -> Dict[str, Any]:
