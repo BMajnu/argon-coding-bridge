@@ -7661,49 +7661,85 @@ def _clear_leftover_prompt_after_send(
     probe_snippet: str = "",
     expected_min_len: int = 1,
 ) -> bool:
-    """Empty the composer after a VERIFIED send when the prompt is STILL sitting in it.
+    """Empty the composer after a VERIFIED send when OUR prompt is STILL sitting in it.
 
-    MEASURED 2026-11-14 (the Phase-7 round-24 lane): Gemini's Task mode keeps the
-    submitted prompt in the composer, so the send arrow stays ARMED. Any later click or
-    Enter then fires the SAME prompt again: it lands as a queued steering turn, the chat
-    shows the prompt twice, and a second Argon turn is billed for nothing.
+    MEASURED 2026-11-14 (the Phase-7 lane): Gemini's composer is a Quill rich-text
+    editor (`rich-textarea > .ql-editor`), so `Control+A` + `Delete` only SELECTS the
+    text - it never removes it (the owner's screenshot shows the leftover selected).
+    The DOM route is therefore the PRIMARY one: empty the editor element and dispatch
+    the `input` / `change` events a rich-text editor listens for. The keyboard route
+    stays as a fallback.
 
-    Only OUR OWN leftover is cleared - if the composer holds anything else (a human typed
-    something new) it is left alone, and an empty composer is left alone.
+    Only OUR OWN leftover is removed: if the composer holds anything else (a human
+    typed something new) it is left alone.
+
+    It ALWAYS logs its outcome - a silent failure is a bug (Round 26, R1.4):
+      `composer cleared (N chars removed)` / `composer left as is: <reason>`
     """
-    try:
-        remaining = _composer_text(composer)
-    except Exception:
-        return False
     floor = max(int(expected_min_len or 1), 20)
-    if len(remaining) < floor:
+    try:
+        before = _composer_text(composer)
+    except Exception:
+        before = ""
+    if len(before) < floor:
+        print("[i] composer left as is: already empty")
         return False
+
     probe = str(probe_snippet or "").strip()
     if not probe:
+        print("[i] composer left as is: no prompt probe available")
         return False
     head = probe[: max(40, min(len(probe), 200))]
-    if head not in remaining:
-        print("[i] The composer still holds text that is not this prompt - left it alone.")
+    if head not in before:
+        print("[i] composer left as is: it does not hold this prompt")
         return False
+
+    # Primary route: empty the editor through the DOM and tell the editor about it.
     try:
-        _focus_composer_dom(composer)
-        page.keyboard.press("Control+A")
-        page.wait_for_timeout(150)
-        page.keyboard.press("Delete")
-        page.wait_for_timeout(500)
-        if len(_composer_text(composer)) < floor:
-            print("[+] Cleared the leftover prompt from the composer after the verified send.")
-            return True
+        composer.evaluate(
+            """(el) => {
+                const target = (el && el.querySelector) ? (el.querySelector('.ql-editor') || el) : el;
+                target.textContent = '';
+                try {
+                    target.dispatchEvent(new InputEvent('input', {
+                        bubbles: true, cancelable: false, inputType: 'deleteContentBackward'
+                    }));
+                } catch (e) {
+                    target.dispatchEvent(new Event('input', { bubbles: true }));
+                }
+                target.dispatchEvent(new Event('change', { bubbles: true }));
+            }"""
+        )
+    except Exception as exc:
+        print(f"[i] composer left as is: the DOM clear failed ({exc})")
+        return False
+
+    try:
+        after = _composer_text(composer)
+    except Exception:
+        after = ""
+
+    # Fallback route: the keyboard (some editors ignore a DOM write).
+    if len(after) >= floor:
         try:
-            page.keyboard.press("Backspace")
-            page.wait_for_timeout(400)
+            _focus_composer_dom(composer)
+            page.keyboard.press("Control+A")
+            page.wait_for_timeout(150)
+            page.keyboard.press("Delete")
+            page.wait_for_timeout(500)
+            after = _composer_text(composer)
+            if len(after) >= floor:
+                page.keyboard.press("Backspace")
+                page.wait_for_timeout(400)
+                after = _composer_text(composer)
         except Exception:
             pass
-        if len(_composer_text(composer)) < floor:
-            print("[+] Cleared the leftover prompt from the composer after the verified send.")
-            return True
-    except Exception as exc:
-        print(f"[i] Could not clear the composer after the send: {exc}", file=sys.stderr)
+
+    removed = len(before) - len(after)
+    if len(after) < floor:
+        print(f"[+] composer cleared ({removed} chars removed)")
+        return True
+    print(f"[i] composer left as is: {len(after)} chars are still in the composer")
     return False
 
 
@@ -7987,7 +8023,10 @@ def _execute_composer_send_sequence(
         )
     if dup_reason is not None:
         print("[i] The prompt is already in this conversation - not sending it again.")
-        p_log.append("prompt duplicate guard : SKIPPED (the prompt is already in this conversation)")
+        print(f"    reason: {dup_reason}")
+        p_log.append(
+            f"prompt duplicate guard : SKIPPED (the prompt is already in this conversation) - {dup_reason}"
+        )
         return mode_ok, model_ok, True
 
     # Step 2: Paste the prompt into the composer BEFORE attaching the archive.
@@ -8166,6 +8205,18 @@ def _execute_composer_send_sequence(
         print(f"[ERROR] Operation 'send' failed ({send_path_used}): {send_reason}", file=sys.stderr)
     else:
         p_log.append(f"send ({send_path_used}) : OK")
+        # Round 26 (R1.5): report the composer state after the send. A leftover prompt
+        # in an armed composer can be fired again, so it must be visible in the log.
+        try:
+            leftover_text = _composer_text(composer)
+        except Exception:
+            leftover_text = ""
+        if leftover_text:
+            p_log.append(f"composer after send : NOT EMPTY ({len(leftover_text)} chars)")
+            print(
+                f"[!] composer after send : NOT EMPTY ({len(leftover_text)} chars) - "
+                "the leftover can still be fired."
+            )
     return mode_ok, model_ok, sent_ok
 
 
@@ -9864,6 +9915,104 @@ def _prompt_hash(text: str) -> str:
     return _hash_text((text or "").strip())
 
 
+def _extract_user_turns(page) -> List[Dict[str, Any]]:
+    """Return the user turns of the conversation, oldest FIRST.
+
+    Each entry is `{"text": str, "queuedSteering": bool}`.
+
+    `queuedSteering` is True when the turn's container carries the class
+    `queued-steering-turn` - Gemini's marker for a message that was submitted WHILE
+    the model was already working. Such a message is ALREADY in the conversation, so
+    the prompt must never be pasted and sent again (Round 26, W2).
+    """
+    try:
+        raw = page.evaluate(
+            r"""() => {
+                const clean = (t) => (t || '').replace(/\s+/g, ' ').trim()
+                    .replace(/^(You said|আপনি বলেছেন)[\s:\n]*/i, '').trim();
+                const out = [];
+                for (const el of document.querySelectorAll('user-query')) {
+                    if (el.closest('rich-textarea, .input-area, .chat-input, footer, form, [data-test-id="chat-input"]')) {
+                        continue;
+                    }
+                    const r = el.getBoundingClientRect();
+                    if (!(r.width > 0 && r.height > 0)) continue;
+                    const p = el.parentElement;
+                    const cls = String((p && p.className) || '');
+                    const queuedSteering = /(^|\s)queued-steering-turn(\s|$)/.test(cls);
+                    let text = '';
+                    for (const sel of ['.user-query-text', '.query-text',
+                                       '[data-test-id="user-query-text"]', '.query-content']) {
+                        const t = el.querySelector(sel);
+                        if (t) {
+                            const v = clean(t.innerText || '');
+                            if (v) { text = v; break; }
+                        }
+                    }
+                    if (!text) {
+                        const clone = el.cloneNode(true);
+                        const kill = ['attachment-chip', '.attachment-chip',
+                                      '[data-test-id*="attachment"]', 'attachment-card',
+                                      '.file-card', 'mat-chip', '.file-preview',
+                                      '[class*="attachment"]', '[class*="chip"]',
+                                      '.user-query-header', 'h2', 'button'];
+                        for (const sel of kill) {
+                            clone.querySelectorAll(sel).forEach(node => node.remove());
+                        }
+                        text = clean(clone.innerText || clone.textContent || '');
+                    }
+                    out.push({ text: text, queuedSteering: queuedSteering });
+                }
+                return out;
+            }"""
+        )
+        turns: List[Dict[str, Any]] = []
+        for item in (raw or []):
+            if not isinstance(item, dict):
+                continue
+            turns.append({
+                "text": str(item.get("text") or ""),
+                "queuedSteering": bool(item.get("queuedSteering")),
+            })
+        return turns
+    except Exception:
+        return []
+
+
+def _texts_refer_to_same_prompt(turn_text: str, prompt_text: str, task_text: str = "") -> bool:
+    """True when a rendered conversation message IS the prompt we are about to send.
+
+    Gemini strips the backticks from the rendered message (measured 2026-11-14:
+    30,848 chars in the transcript vs 30,835 in the composer), so BOTH sides are
+    compared without backticks.
+    """
+    def _norm(t: str) -> str:
+        return _normalize_ws(str(t or "").replace("`", ""))
+
+    a = _norm(turn_text)
+    if not a:
+        return False
+    for cand in (prompt_text, task_text):
+        b = _norm(cand)
+        if not b:
+            continue
+        if a == b:
+            return True
+        if len(b) > 100 and (b in a or a in b):
+            return True
+    return False
+
+
+def _queued_steering_reason(page, prompt_text: str, task_text: str = "") -> str:
+    """Return a reason when a queued steering turn already carries our prompt."""
+    for turn in _extract_user_turns(page):
+        if not turn.get("queuedSteering"):
+            continue
+        if _texts_refer_to_same_prompt(str(turn.get("text") or ""), prompt_text, task_text):
+            return "a queued steering turn with this prompt already exists"
+    return ""
+
+
 def _last_user_message_text(page) -> str:
     """Return the visible text of the last user message in the conversation, if any.
 
@@ -9902,7 +10051,10 @@ def _last_user_message_text(page) -> str:
                 for (const sel of textSelectors) {
                     const textEl = lastTurn.querySelector(sel);
                     if (textEl) {
-                        const t = (textEl.innerText || "").trim();
+                        let t = (textEl.innerText || "").trim();
+                        // Round 26: the rendered message can start with the "You said"
+                        // header - strip it so the duplicate check compares PROMPTS.
+                        t = t.replace(/^(You said|আপনি বলেছেন)[\s:\n]*/i, "").trim();
                         if (t) return t;
                     }
                 }
@@ -10023,6 +10175,14 @@ def _check_duplicate_prompt(
             if not already_completed:
                 return prev_sent_hms
 
+    # 1b. Round 26 (W2): a queued steering turn that carries our prompt means the
+    # prompt is ALREADY in this conversation - Gemini is processing it right now.
+    # Never paste and send it a second time.
+    steer_reason = _queued_steering_reason(page, trimmed_prompt, trimmed_task)
+    if steer_reason:
+        print(f"[!] {steer_reason} - not sending it again.")
+        return steer_reason
+
     # 2. Check the stored hash in ~/.gemini/argon_task_state.json for an
     #    in-progress run on the same conversation.
     if prev_status in ("sent", "waiting"):
@@ -10044,10 +10204,19 @@ def _check_duplicate_prompt(
 
 
 def _print_duplicate_prompt_notice(sent_hms: str) -> None:
-    print(
-        f"[!] This prompt is already the last message in the conversation (sent at {sent_hms}).\n"
-        "    Not sending it again - waiting for the answer."
-    )
+    notice = str(sent_hms or "").strip()
+    if not notice:
+        return
+    if re.fullmatch(r"\d{2}:\d{2}:\d{2}", notice):
+        print(
+            f"[!] This prompt is already the last message in the conversation (sent at {notice}).\n"
+            "    Not sending it again - waiting for the answer."
+        )
+    else:
+        print(
+            f"[!] {notice}.\n"
+            "    Not sending it again - waiting for the answer."
+        )
 
 
 def _print_prompt_sent_banner(sent_hms: str, conv_title: str, conv_link: str) -> None:

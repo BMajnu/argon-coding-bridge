@@ -22,12 +22,40 @@
     version: EXTENSION_VERSION,
     cachedPromptText: "",
     keepPromptAlive: false,
+    sendPerformed: false,
+    turnsAtPaste: 0,
+    disarmReason: "",
     lastModelSeen: "",
     flashRevertDetected: false,
     composerClearedCount: 0,
     driveFileIds: [],
     observerInstalled: false
   };
+
+  function countConversationTurns() {
+    const selectors = [
+      "user-query",
+      "[data-test-id='user-query']",
+      "message-turn.user-query",
+      "message-turn:has(user-query)",
+      ".user-query-container",
+      ".user-turn",
+      "model-response",
+      "[data-test-id='model-response']"
+    ];
+    try {
+      return document.querySelectorAll(selectors.join(",")).length;
+    } catch (_err) {
+      return document.querySelectorAll("user-query, .user-turn, model-response").length;
+    }
+  }
+
+  function disarmPromptAliveGuard(reason) {
+    companionRuntime.keepPromptAlive = false;
+    companionRuntime.cachedPromptText = "";
+    companionRuntime.sendPerformed = true;
+    companionRuntime.disarmReason = String(reason || "send_performed");
+  }
 
   function markDocumentReady() {
     try {
@@ -269,9 +297,11 @@
       };
     }
 
-    companionRuntime.cachedPromptText = text;
-    companionRuntime.keepPromptAlive = true;
-    installComposerMutationGuard();
+    if (!companionRuntime.sendPerformed) {
+      companionRuntime.cachedPromptText = text;
+      companionRuntime.keepPromptAlive = true;
+      installComposerMutationGuard();
+    }
     sendServiceWorkerMessage("record_operation", {
       operation: "paste",
       ok: true,
@@ -674,12 +704,16 @@
 
     await new Promise((r) => setTimeout(r, 120));
 
-    // If Gemini cleared the composer when the attachment completed, restore the prompt immediately.
+    // If Gemini cleared the composer when the attachment completed, restore the prompt immediately (ONLY before send).
     if (companionRuntime.keepPromptAlive && companionRuntime.cachedPromptText) {
-      const curText = getComposerText();
-      if (curText.length < Math.min(companionRuntime.cachedPromptText.trim().length, 8)) {
-        companionRuntime.composerClearedCount += 1;
-        pasteViaDataTransfer(companionRuntime.cachedPromptText, false);
+      if (companionRuntime.sendPerformed || countConversationTurns() > companionRuntime.turnsAtPaste) {
+        disarmPromptAliveGuard("conversation_gained_turn");
+      } else {
+        const curText = getComposerText();
+        if (curText.length < Math.min(companionRuntime.cachedPromptText.trim().length, 8)) {
+          companionRuntime.composerClearedCount += 1;
+          pasteViaDataTransfer(companionRuntime.cachedPromptText, false);
+        }
       }
     }
 
@@ -787,11 +821,16 @@
       };
     }
 
-    // 1. Re-verify prompt text in composer (re-paste if cleared by upload completion).
+    // 1. Re-verify prompt text in composer (re-paste ONLY before send if cleared by upload completion).
     const expectedPrompt = String(opts.promptText || companionRuntime.cachedPromptText || "");
     const expectedMin = Math.max(1, Number(opts.expectedMinLen || Math.min(Math.floor(expectedPrompt.trim().length / 2), 40) || 1));
     let currentText = getComposerText(composer);
-    if (currentText.length < expectedMin && expectedPrompt.trim()) {
+    if (
+      currentText.length < expectedMin &&
+      expectedPrompt.trim() &&
+      !companionRuntime.sendPerformed &&
+      countConversationTurns() <= companionRuntime.turnsAtPaste
+    ) {
       companionRuntime.composerClearedCount += 1;
       const repasted = pasteViaDataTransfer(expectedPrompt, false);
       if (!repasted.ok) {
@@ -829,9 +868,6 @@
       };
     }
 
-    // Stop auto-repopulating once we intentionally click Send.
-    companionRuntime.keepPromptAlive = false;
-
     const sendBtn = findSemanticSendButton(composer);
     if (!sendBtn) {
       return {
@@ -841,6 +877,9 @@
         reason: "semantic send button was not found inside the composer container"
       };
     }
+
+    // Turn keepPromptAlive OFF and clear cachedPromptText immediately as send is performed.
+    disarmPromptAliveGuard("click_send");
 
     try {
       sendBtn.click();
@@ -854,37 +893,26 @@
     }
 
     await new Promise((r) => setTimeout(r, 150));
-    const afterClickText = getComposerText(composer);
-    if (afterClickText.length >= expectedMin) {
-      try {
-        focusComposerDom(composer);
-        composer.dispatchEvent(new KeyboardEvent("keydown", {
-          key: "Enter",
-          code: "Enter",
-          ctrlKey: true,
-          bubbles: true,
-          cancelable: true
-        }));
-      } catch (_err) {}
-      await new Promise((r) => setTimeout(r, 100));
-    }
-
     const finalComposerText = getComposerText(composer);
     const emptied = finalComposerText.length < expectedMin;
     sendServiceWorkerMessage("record_operation", {
       operation: "send",
-      ok: emptied,
+      ok: true,
+      composerEmptied: emptied,
       composerClearedCount: companionRuntime.composerClearedCount,
       at: new Date().toISOString()
     });
 
     return {
-      ok: emptied,
+      ok: true,
       operation: "send",
       path: "extension",
+      sendPerformed: true,
+      keepPromptAlive: companionRuntime.keepPromptAlive,
+      cachedPromptText: companionRuntime.cachedPromptText,
       composerEmptied: emptied,
       composerClearedCount: companionRuntime.composerClearedCount,
-      reason: emptied ? "" : "send button was clicked but the composer did not empty"
+      reason: ""
     };
   }
 
@@ -906,11 +934,15 @@
             }
           }
         }
-        if (companionRuntime.keepPromptAlive && companionRuntime.cachedPromptText) {
-          const comp = findLowestComposer();
-          if (comp && getComposerText(comp).length === 0) {
-            companionRuntime.composerClearedCount += 1;
-            pasteViaDataTransfer(companionRuntime.cachedPromptText, false);
+        if (companionRuntime.keepPromptAlive || companionRuntime.cachedPromptText) {
+          if (companionRuntime.sendPerformed || countConversationTurns() > companionRuntime.turnsAtPaste) {
+            disarmPromptAliveGuard("conversation_gained_turn");
+          } else if (companionRuntime.keepPromptAlive && companionRuntime.cachedPromptText) {
+            const comp = findLowestComposer();
+            if (comp && getComposerText(comp).length === 0) {
+              companionRuntime.composerClearedCount += 1;
+              pasteViaDataTransfer(companionRuntime.cachedPromptText, false);
+            }
           }
         }
       } catch (_err) {}
@@ -922,6 +954,36 @@
       attributes: true,
       attributeFilter: ["aria-label", "aria-selected", "aria-checked", "class"]
     });
+
+    document.addEventListener("click", (ev) => {
+      try {
+        if (!companionRuntime.keepPromptAlive && !companionRuntime.cachedPromptText) {
+          return;
+        }
+        const target = ev && ev.target instanceof Element ? ev.target.closest("button, [role='button']") : null;
+        if (!target) {
+          return;
+        }
+        const sendBtn = findSemanticSendButton();
+        if (sendBtn && (target === sendBtn || sendBtn.contains(target))) {
+          disarmPromptAliveGuard("send_button_click");
+        }
+      } catch (_err) {}
+    }, true);
+
+    document.addEventListener("keydown", (ev) => {
+      try {
+        if (!companionRuntime.keepPromptAlive && !companionRuntime.cachedPromptText) {
+          return;
+        }
+        if (ev && ev.key === "Enter" && !ev.shiftKey) {
+          const comp = findLowestComposer();
+          if (comp && (ev.target === comp || comp.contains(ev.target))) {
+            disarmPromptAliveGuard("composer_enter_keydown");
+          }
+        }
+      } catch (_err) {}
+    }, true);
   }
 
   function recordDriveUrlIfPresent(rawUrl) {
@@ -969,7 +1031,37 @@
       };
     }
     if (act === "paste_prompt") {
+      companionRuntime.sendPerformed = false;
+      companionRuntime.turnsAtPaste = countConversationTurns();
+      companionRuntime.disarmReason = "";
       return pasteViaDataTransfer(pl.promptText || "", Boolean(pl.appendMode));
+    }
+    if (act === "disarm_prompt_guard") {
+      disarmPromptAliveGuard(pl.reason || "explicit_disarm");
+      return {
+        ok: true,
+        operation: "disarm_prompt_guard",
+        path: "extension",
+        keepPromptAlive: companionRuntime.keepPromptAlive,
+        cachedPromptText: companionRuntime.cachedPromptText,
+        sendPerformed: companionRuntime.sendPerformed,
+        disarmReason: companionRuntime.disarmReason
+      };
+    }
+    if (act === "get_runtime_state") {
+      return {
+        ok: true,
+        operation: "get_runtime_state",
+        path: "extension",
+        keepPromptAlive: companionRuntime.keepPromptAlive,
+        cachedPromptText: companionRuntime.cachedPromptText,
+        cachedPromptTextLength: (companionRuntime.cachedPromptText || "").length,
+        sendPerformed: companionRuntime.sendPerformed,
+        turnsAtPaste: companionRuntime.turnsAtPaste,
+        currentTurns: countConversationTurns(),
+        composerClearedCount: companionRuntime.composerClearedCount,
+        disarmReason: companionRuntime.disarmReason
+      };
     }
     if (act === "ensure_mode_and_model") {
       return await ensureTaskModeAndArgonSemantic(pl);
