@@ -53,6 +53,36 @@ if str(SCRIPTS_DIR) not in sys.path:
 
 DEFAULT_WAIT_DEADLINE_SECONDS = 5400  # 90 minutes (Rule R5)
 MAX_BASE64_ATTACH_BYTES = int(os.environ.get("ARGON_MAX_BASE64_ATTACH_MB", "8")) * 1024 * 1024  # 8 MB cap (Rule R3)
+MAX_ARCHIVE_BYTES = 100 * 1024 * 1024  # 100 MB hard archive cap (Rule R3.1 / F5)
+
+
+def get_effective_base64_attach_cap(fallback_bytes: Optional[int] = None) -> int:
+    """Return the effective base64 attach cap in bytes (honoring ARGON_MAX_BASE64_ATTACH_MB or MAX_BASE64_ATTACH_BYTES)."""
+    env_val = os.environ.get("ARGON_MAX_BASE64_ATTACH_MB")
+    if env_val is not None and str(env_val).strip() != "":
+        try:
+            return max(0, int(float(str(env_val).strip()) * 1024 * 1024))
+        except ValueError:
+            pass
+    if fallback_bytes is not None:
+        return int(fallback_bytes)
+    return int(MAX_BASE64_ATTACH_BYTES)
+
+
+def format_archive_attach_route_line(
+    archive_name: str,
+    size_bytes: int,
+    cap_bytes: int,
+    route: str,
+    use_base64: bool,
+) -> str:
+    """Return the single-line pre-attach route banner required by Round 24 R1.5."""
+    b64_label = "yes" if use_base64 else "no"
+    return f"archive {archive_name}: {int(size_bytes)} bytes | cap {int(cap_bytes)} | route {route} | base64 {b64_label}"
+
+
+format_archive_route_decision_line = format_archive_attach_route_line
+
 # How long `ensure_browser_host` waits for a Chrome that is already running on the profile
 # to PUBLISH its CDP endpoint before it gives up on that profile. Measured on the owner's
 # machine (round 20): the second dispatch lane arrived while the first lane was still
@@ -171,6 +201,17 @@ def _attach_zip_via_cdp_dom_file_input(page: Any, file_path: Union[str, Path]) -
     fp = Path(file_path).expanduser().resolve()
     if not fp.is_file():
         return False, "cdp_dom_file_input", f"file does not exist on disk: {fp}"
+    try:
+        fp_size = fp.stat().st_size
+    except OSError as exc:
+        return False, "cdp_dom_file_input", f"could not stat {fp}: {exc}"
+    if fp.suffix.lower() == ".zip" and fp_size > MAX_ARCHIVE_BYTES:
+        return (
+            False,
+            "archive_size_cap_exceeded",
+            f"archive_size_cap_exceeded: archive {fp.name} ({fp_size} bytes, {fp_size / (1024 * 1024):.2f} MB) "
+            f"exceeds the 100 MB hard archive cap ({MAX_ARCHIVE_BYTES} bytes)",
+        )
 
     ctx = getattr(page, "context", None)
     if ctx is not None and hasattr(ctx, "new_cdp_session"):
@@ -837,13 +878,584 @@ def _verify_tab_on_own_conversation(
     }
 
 
+def _slot_num_from_str(slot: Optional[str]) -> Optional[int]:
+    m = re.search(r"/u/(\d+)/?", str(slot or ""))
+    if m:
+        return int(m.group(1))
+    if str(slot or "").strip().isdigit():
+        return int(str(slot).strip())
+    return None
+
+
+def format_account_slot_resolution_line(
+    slot: str,
+    email: str,
+    account_index: int,
+    resolved_url: Optional[str] = None,
+) -> str:
+    """Format the unambiguous one-line account slot resolution (Round 24 R2.2)."""
+    from argon_pool_login import normalize_slot
+
+    norm_slot = normalize_slot(slot or "/u/0/")
+    clean_email = (email or "unconfigured").strip()
+    idx = int(account_index)
+    app_url = (resolved_url or f"https://gemini.google.com/u/{idx}/app").strip()
+    if re.search(r"gemini\.google\.com/u/\d+/", app_url, flags=re.IGNORECASE):
+        app_url = re.sub(r"(gemini\.google\.com)/u/\d+/", f"\\1/u/{idx}/", app_url, flags=re.IGNORECASE)
+    return f"slot {norm_slot} ({clean_email}) = browser account index /u/{idx}/ -> {app_url}"
+
+
+def resolve_account_index_to_slot(
+    account_index: int,
+    pool_cfg: Optional[Any] = None,
+    profile_dir_override: Optional[Union[str, Path]] = None,
+    explicit_slot: Optional[str] = None,
+    config_path: Optional[Union[str, Path]] = None,
+) -> Dict[str, Any]:
+    """Resolve 0-based browser `account_index` N -> the pool slot that owns it (Round 24 R2.1 & R2.5).
+
+    Refuses with a named reason when:
+      - N is not a registered browser account in `Default/Preferences` (`account_index_not_registered`),
+      - the browser account at index N is not mapped in `PoolConfig` (`account_index_not_in_pool`), or
+      - both `--account-index` and `--slot` are given and they disagree (`slot_account_index_conflict`).
+    """
+    from argon_pool_login import PoolConfig, normalize_slot
+    from safe_browser import get_preferences_accounts
+
+    try:
+        idx = int(account_index)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"account_index_not_registered: invalid browser account index {account_index!r}") from exc
+
+    cfg = pool_cfg or PoolConfig(config_path=config_path, profile_dir_override=profile_dir_override)
+    prof_dir = Path(profile_dir_override or cfg.profile_dir)
+    live_accounts = get_preferences_accounts(prof_dir)
+    matched_live: Optional[Dict[str, Any]] = None
+    for entry in live_accounts:
+        if isinstance(entry, dict) and int(entry.get("index", -1)) == idx:
+            matched_live = entry
+            break
+
+    if idx < 0 or matched_live is None:
+        valid_indices = [int(a.get("index", -1)) for a in live_accounts if isinstance(a, dict)]
+        raise RuntimeError(
+            f"account_index_not_registered: browser account index /u/{idx}/ (index={idx}) is not a "
+            f"registered browser account in {prof_dir} (registered_accounts={len(live_accounts)}, "
+            f"valid_indices={valid_indices})."
+        )
+
+    live_email = str(matched_live.get("email") or "").strip()
+    matched_slot: Optional[str] = None
+    for acc in (cfg.accounts or []):
+        if not isinstance(acc, dict):
+            continue
+        acc_email = str(acc.get("email") or "").strip()
+        if acc_email and acc_email.lower() == live_email.lower():
+            matched_slot = normalize_slot(acc.get("slot", f"/u/{acc.get('index', 0)}/"))
+            break
+
+    if matched_slot is None:
+        raise RuntimeError(
+            f"account_index_not_in_pool: browser account index /u/{idx}/ ({live_email}) is not "
+            f"mapped to any pool slot in {cfg.path}."
+        )
+
+    if explicit_slot is not None and str(explicit_slot).strip() != "":
+        norm_explicit = normalize_slot(str(explicit_slot).strip())
+        if norm_explicit != matched_slot:
+            raise RuntimeError(
+                f"slot_account_index_conflict: --slot {norm_explicit} and --account-index {idx} disagree "
+                f"(--account-index {idx} is {live_email}, which belongs to pool slot {matched_slot}, not {norm_explicit})."
+            )
+
+    app_url = f"https://gemini.google.com/u/{idx}/app"
+    slot_num = _slot_num_from_str(matched_slot)
+    differs = (slot_num is not None and slot_num != idx)
+    line = format_account_slot_resolution_line(matched_slot, live_email, idx, app_url)
+    warning = (
+        f"[WARNING] Pool slot {matched_slot} (slot number {slot_num}) resolves to a DIFFERENT "
+        f"browser account index /u/{idx}/ ({live_email}) -> {app_url} (pool slot != browser account index)."
+        if differs
+        else ""
+    )
+    return {
+        "ok": True,
+        "slot": matched_slot,
+        "email": live_email,
+        "account_index": idx,
+        "browser_slot": f"/u/{idx}/",
+        "resolved_url": app_url,
+        "slot_number": slot_num,
+        "index_differs_from_slot": differs,
+        "line": line,
+        "warning": warning,
+    }
+
+
+def resolve_slot_to_browser_account(
+    slot: Optional[str],
+    pool_cfg: Optional[Any] = None,
+    profile_dir_override: Optional[Union[str, Path]] = None,
+    config_path: Optional[Union[str, Path]] = None,
+    chat_url: str = "",
+) -> Dict[str, Any]:
+    """Resolve a pool `slot` (e.g. `/u/9/`) to its verified browser account index and URL (Round 24 R2.2-R2.4)."""
+    from argon_pool_login import PoolConfig, normalize_slot
+    from safe_browser import get_preferences_accounts, verify_account_index_in_preferences
+
+    cfg = pool_cfg or PoolConfig(config_path=config_path, profile_dir_override=profile_dir_override)
+    prof_dir = Path(profile_dir_override or cfg.profile_dir)
+    norm_slot = normalize_slot(slot) if slot else cfg.active_slot()
+    acc = cfg.get_by_slot(norm_slot) or {}
+    email = str(acc.get("email") or "").strip()
+
+    ok_idx, found_idx, all_pref_emails = verify_account_index_in_preferences(prof_dir, email)
+    if found_idx is None and all_pref_emails:
+        raise RuntimeError(
+            f"account_not_signed_in: slot {norm_slot} ({email or 'unconfigured'}) is not signed into "
+            f"the Argon browser (registered_accounts={len(all_pref_emails)}); refusing to fall back to slot number {norm_slot}."
+        )
+    if found_idx is not None:
+        eff_idx = int(found_idx)
+    else:
+        eff_idx = int(cfg.get_account_index(norm_slot))
+
+    live_accounts = get_preferences_accounts(prof_dir)
+    for entry in live_accounts:
+        if isinstance(entry, dict) and int(entry.get("index", -1)) == eff_idx:
+            live_em = str(entry.get("email") or "").strip()
+            if live_em:
+                email = live_em
+            break
+
+    app_url = f"https://gemini.google.com/u/{eff_idx}/app"
+    eff_url = app_url
+    if chat_url and "gemini.google.com" in chat_url.lower():
+        if re.search(r"gemini\.google\.com/u/\d+/", chat_url, flags=re.IGNORECASE):
+            eff_url = re.sub(r"(gemini\.google\.com)/u/\d+/", f"\\1/u/{eff_idx}/", chat_url, flags=re.IGNORECASE)
+        else:
+            eff_url = re.sub(r"(gemini\.google\.com)/(?=app\b)", f"\\1/u/{eff_idx}/", chat_url, flags=re.IGNORECASE)
+
+    slot_num = _slot_num_from_str(norm_slot)
+    differs = (slot_num is not None and slot_num != eff_idx)
+    line = format_account_slot_resolution_line(norm_slot, email or "account", eff_idx, app_url)
+    warning = (
+        f"[WARNING] Pool slot {norm_slot} (slot number {slot_num}) resolves to a DIFFERENT "
+        f"browser account index /u/{eff_idx}/ ({email}) -> {app_url} (pool slot != browser account index)."
+        if differs
+        else ""
+    )
+    return {
+        "ok": True,
+        "slot": norm_slot,
+        "email": email,
+        "account_index": eff_idx,
+        "browser_slot": f"/u/{eff_idx}/",
+        "resolved_url": eff_url,
+        "app_url": app_url,
+        "verified_in_preferences": bool(ok_idx or found_idx is not None),
+        "registered_accounts": len(all_pref_emails),
+        "slot_number": slot_num,
+        "index_differs_from_slot": differs,
+        "line": line,
+        "warning": warning,
+    }
+
+
+def update_brief_summary_with_resolved_slot(
+    summary_path: Union[str, Path],
+    slot: str,
+    email: str,
+    account_index: int,
+    resolved_url: Optional[str] = None,
+) -> Path:
+    """Ensure a brief summary file (`--brief-summary`) carries the resolved browser URL, never a raw pool-slot number (Round 24 R2.3)."""
+    sp = Path(summary_path).resolve()
+    idx = int(account_index)
+    app_url = (resolved_url or f"https://gemini.google.com/u/{idx}/app").strip()
+    if re.search(r"gemini\.google\.com/u/\d+/", app_url, flags=re.IGNORECASE):
+        app_url = re.sub(r"(gemini\.google\.com)/u/\d+/", f"\\1/u/{idx}/", app_url, flags=re.IGNORECASE)
+    res_line = format_account_slot_resolution_line(slot, email, idx, app_url)
+    if not sp.is_file():
+        return sp
+    txt = sp.read_text(encoding="utf-8")
+    # Replace raw `- **Slot:** ...` line with the resolved browser URL and one-line account mapping
+    replacement_block = (
+        f"- **Resolved Browser URL:** `{app_url}`\n"
+        f"- **Browser Account Index:** `/u/{idx}/`\n"
+        f"- **Account Resolution:** `{res_line}`"
+    )
+    if re.search(r"^- \*\*Slot:\*\*.*$", txt, flags=re.MULTILINE):
+        txt = re.sub(r"^- \*\*Slot:\*\*.*$", replacement_block, txt, flags=re.MULTILINE)
+    elif res_line not in txt:
+        txt = txt.rstrip() + f"\n\n{replacement_block}\n"
+    if email and "- **Account Email:** `(from pool config)`" in txt:
+        txt = txt.replace("- **Account Email:** `(from pool config)`", f"- **Account Email:** `{email}`")
+    sp.write_text(txt, encoding="utf-8")
+    return sp
+
+
+def update_manual_handoff_with_resolved_slot(
+    md_path: Union[str, Path],
+    json_path: Optional[Union[str, Path]],
+    slot: str,
+    email: str,
+    account_index: int,
+    resolved_url: Optional[str] = None,
+) -> None:
+    """Ensure `manual_handoff.md` and `handoff.json` (`--manual-handoff`) carry the resolved browser URL, never a raw pool-slot number (Round 24 R2.3)."""
+    idx = int(account_index)
+    app_url = f"https://gemini.google.com/u/{idx}/app"
+    eff_url = (resolved_url or app_url).strip()
+    if re.search(r"gemini\.google\.com/u/\d+/", eff_url, flags=re.IGNORECASE):
+        eff_url = re.sub(r"(gemini\.google\.com)/u/\d+/", f"\\1/u/{idx}/", eff_url, flags=re.IGNORECASE)
+    res_line = format_account_slot_resolution_line(slot, email, idx, app_url)
+
+    mp = Path(md_path)
+    if mp.is_file():
+        md_txt = mp.read_text(encoding="utf-8")
+        md_txt = re.sub(
+            r"(https://gemini\.google\.com)/u/\d+/",
+            f"\\1/u/{idx}/",
+            md_txt,
+            flags=re.IGNORECASE,
+        )
+        md_txt = re.sub(
+            r"^- \*\*Slot:\*\*.*$",
+            f"- **Browser Account Index:** `/u/{idx}/`\n- **Resolved Browser URL:** `{eff_url}`\n- **Account Resolution:** `{res_line}`",
+            md_txt,
+            flags=re.MULTILINE,
+        )
+        if email:
+            md_txt = md_txt.replace(
+                "- **Account E-mail:** `(not detected / default slot account)`",
+                f"- **Account E-mail:** `{email}`",
+            )
+        mp.write_text(md_txt, encoding="utf-8")
+
+    if json_path is not None:
+        jp = Path(json_path)
+        if jp.is_file():
+            try:
+                j_data = json.loads(jp.read_text(encoding="utf-8"))
+                if isinstance(j_data, dict):
+                    j_data["chat_url"] = eff_url
+                    j_data["resolved_browser_url"] = eff_url
+                    j_data["browser_account_index"] = f"/u/{idx}/"
+                    j_data["account_resolution_line"] = res_line
+                    if email:
+                        j_data["account_email"] = email
+                    if isinstance(j_data.get("missing_actions"), list):
+                        j_data["missing_actions"] = [
+                            re.sub(r"(https://gemini\.google\.com)/u/\d+/", f"\\1/u/{idx}/", str(act), flags=re.IGNORECASE)
+                            for act in j_data["missing_actions"]
+                        ]
+                    if isinstance(j_data.get("commands"), list):
+                        j_data["commands"] = [
+                            re.sub(r"(https://gemini\.google\.com)/u/\d+/", f"\\1/u/{idx}/", str(cmd), flags=re.IGNORECASE)
+                            for cmd in j_data["commands"]
+                        ]
+                    jp.write_text(json.dumps(j_data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+            except Exception:
+                pass
+
+
+def _conversation_holds_existing_attachment(page: Any) -> Tuple[bool, str]:
+    """Return `(True, detail)` if the target conversation already holds an attachment in its turns or composer (Round 24 R3.2)."""
+    if page is None:
+        return False, ""
+    if getattr(page, "_argon_has_existing_attachment", False):
+        custom_detail = str(getattr(page, "_argon_existing_attachment_detail", "") or "existing attachment in conversation")
+        return True, custom_detail
+    if hasattr(page, "evaluate"):
+        try:
+            dom_att = page.evaluate(
+                r"""() => {
+                    const chipSelectors = [
+                        "#attachment-chips .att-chip",
+                        ".att-chip",
+                        "[data-stem]",
+                        "[data-test-id*='attachment' i]",
+                        "[class*='attachment-chip' i]",
+                        "[class*='file-preview' i]",
+                        "[class*='upload-chip' i]",
+                        "user-query [class*='chip' i]",
+                        "user-query [class*='file' i]",
+                        "user-query [class*='attachment' i]",
+                        ".user-turn [class*='chip' i]",
+                        ".user-turn [class*='file' i]",
+                        ".user-turn [class*='attachment' i]"
+                    ];
+                    for (const sel of chipSelectors) {
+                        const els = Array.from(document.querySelectorAll(sel));
+                        for (const el of els) {
+                            const txt = String(el.textContent || el.getAttribute("data-stem") || el.getAttribute("aria-label") || sel).trim();
+                            return { hasAttachment: true, detail: "existing attachment chip (" + (txt.slice(0, 80) || sel) + ")" };
+                        }
+                    }
+                    const inputs = Array.from(document.querySelectorAll("input[type='file']"));
+                    for (const inp of inputs) {
+                        if (inp.files && inp.files.length > 0) {
+                            const f0 = inp.files[0];
+                            return { hasAttachment: true, detail: "file input already holds " + (f0 && f0.name ? f0.name : inp.files.length + " file(s)") };
+                        }
+                    }
+                    const turns = Array.from(document.querySelectorAll("user-query, .user-turn, message-turn"));
+                    for (const t of turns) {
+                        const tText = String(t.textContent || "");
+                        if (/\bargon_context\w*\.zip\b/i.test(tText)) {
+                            return { hasAttachment: true, detail: "prior conversation turn already holds an attached context archive" };
+                        }
+                    }
+                    return { hasAttachment: false, detail: "" };
+                }"""
+            )
+            if isinstance(dom_att, dict) and dom_att.get("hasAttachment"):
+                return True, str(dom_att.get("detail") or "existing attachment in conversation DOM")
+        except Exception:
+            pass
+    return False, ""
+
+
+def _install_cdp_playwright_fallback_if_missing() -> None:
+    """Install a lightweight CDP-backed `playwright.sync_api` fallback ONLY when `playwright` is not installed."""
+    try:
+        import playwright.sync_api  # noqa: F401
+        return
+    except ModuleNotFoundError:
+        pass
+
+    import tempfile as _tf
+    import types as _types
+
+    class _CdpSessionShim:
+        def __init__(self, ws: Any, sid: str) -> None:
+            self._ws = ws
+            self._sid = sid
+
+        def send(self, method: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+            return self._ws.call(method, params or {}, session_id=self._sid) or {}
+
+        def detach(self) -> None:
+            return None
+
+    class _LocatorShim:
+        def __init__(self, page: "_PageShim", selector: str, idx: int = 0) -> None:
+            self._page = page
+            self._selector = selector
+            self._idx = idx
+
+        def count(self) -> int:
+            try:
+                return int(
+                    self._page.evaluate(
+                        "(sel) => document.querySelectorAll(sel).length",
+                        self._selector,
+                    )
+                    or 0
+                )
+            except Exception:
+                return 0
+
+        @property
+        def first(self) -> "_LocatorShim":
+            return _LocatorShim(self._page, self._selector, 0)
+
+        def nth(self, index: int) -> "_LocatorShim":
+            return _LocatorShim(self._page, self._selector, int(index))
+
+        def set_input_files(self, files: Union[str, List[str]]) -> None:
+            file_list = [str(files)] if isinstance(files, (str, Path)) else [str(f) for f in files]
+            cdp = self._page.context.new_cdp_session(self._page)
+            doc = cdp.send("DOM.getDocument", {"depth": 1, "pierce": True}) or {}
+            root_id = int((doc.get("root") or {}).get("nodeId") or 0)
+            q = cdp.send("DOM.querySelectorAll", {"nodeId": root_id, "selector": self._selector}) or {}
+            nids = list(q.get("nodeIds") or [])
+            if not nids:
+                raise RuntimeError(f"No element matching {self._selector}")
+            chosen = int(nids[min(self._idx, len(nids) - 1)])
+            cdp.send("DOM.setFileInputFiles", {"files": file_list, "nodeId": chosen})
+
+    class _PageShim:
+        def __init__(self, browser: "_BrowserShim", ws: Any, target_id: str, session_id: str) -> None:
+            self._browser = browser
+            self._ws = ws
+            self._target_id = target_id
+            self._sid = session_id
+            self.url = "about:blank"
+            self.context = browser
+
+        def goto(self, url: str, **_kwargs: Any) -> None:
+            self.url = str(url)
+            if self.url.startswith("file://"):
+                parsed_p = urllib.parse.urlparse(self.url)
+                local_f = Path(urllib.request.url2pathname(parsed_p.path))
+                if local_f.is_file():
+                    html_txt = local_f.read_text(encoding="utf-8", errors="replace")
+                    self._ws.call("Page.navigate", {"url": "about:blank"}, session_id=self._sid)
+                    self.evaluate("(h) => { document.open(); document.write(h); document.close(); }", html_txt)
+                    return
+            nav_res = self._ws.call("Page.navigate", {"url": self.url}, session_id=self._sid) or {}
+            if nav_res.get("errorText"):
+                return
+            for _ in range(60):
+                try:
+                    info = self.evaluate("() => ({ href: location.href, ready: document.readyState })")
+                    if isinstance(info, dict) and info.get("ready") == "complete" and info.get("href") != "about:blank":
+                        break
+                except Exception:
+                    pass
+                time.sleep(0.05)
+
+        def evaluate(self, expression: str, arg: Any = None) -> Any:
+            expr = str(expression).strip()
+            has_arg = arg is not None
+            is_fn = (
+                expr.startswith("function")
+                or expr.startswith("async ")
+                or bool(re.match(r"^\([^)]*\)\s*=>", expr))
+                or bool(re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=>", expr))
+            )
+            if is_fn:
+                if has_arg:
+                    js = f"({expr})({json.dumps(arg)})"
+                else:
+                    js = f"({expr})()"
+            else:
+                js = expr
+            res = self._ws.call(
+                "Runtime.evaluate",
+                {"expression": js, "returnByValue": True, "awaitPromise": True},
+                session_id=self._sid,
+            )
+            if isinstance(res, dict) and isinstance(res.get("result"), dict):
+                r_obj = res["result"]
+                if "value" in r_obj:
+                    return r_obj["value"]
+            return None
+
+        def locator(self, selector: str) -> _LocatorShim:
+            return _LocatorShim(self, selector)
+
+        def wait_for_timeout(self, ms: float) -> None:
+            time.sleep(max(0.0, float(ms) / 1000.0))
+
+    class _BrowserShim:
+        def __init__(self, prof_dir: Path, ws: Any) -> None:
+            self._prof_dir = prof_dir
+            self._ws = ws
+            self.pages: List[_PageShim] = []
+
+        def new_page(self) -> _PageShim:
+            t_res = self._ws.call("Target.getTargets") or {}
+            infos = (t_res.get("result") or t_res).get("targetInfos") or []
+            page_targets = [
+                t for t in infos
+                if isinstance(t, dict)
+                and t.get("type") == "page"
+                and not str(t.get("url") or "").startswith("chrome://")
+            ]
+            if page_targets:
+                tid = str(page_targets[0]["targetId"])
+            else:
+                c_res = self._ws.call("Target.createTarget", {"url": "about:blank"}) or {}
+                tid = str((c_res.get("result") or c_res).get("targetId") or "")
+            att = self._ws.call("Target.attachToTarget", {"targetId": tid, "flatten": True}) or {}
+            sid = str((att.get("result") or att).get("sessionId") or "")
+            self._ws.call("Page.enable", {}, session_id=sid)
+            self._ws.call("Runtime.enable", {}, session_id=sid)
+            self._ws.call("DOM.enable", {}, session_id=sid)
+            pg = _PageShim(self, self._ws, tid, sid)
+            self.pages.append(pg)
+            return pg
+
+        def new_cdp_session(self, page: _PageShim) -> _CdpSessionShim:
+            return _CdpSessionShim(self._ws, page._sid)
+
+        def close(self) -> None:
+            from safe_browser import close_browser_safely
+
+            try:
+                self._ws.call("Browser.close")
+            except Exception:
+                pass
+            try:
+                self._ws.close()
+            except Exception:
+                pass
+            try:
+                close_browser_safely(context=None, profile_dir=self._prof_dir, wait_seconds=0.5)
+            except Exception:
+                pass
+            shutil.rmtree(self._prof_dir, ignore_errors=True)
+
+    class _ChromiumLauncherShim:
+        def launch(self, headless: bool = True, args: Optional[List[str]] = None, **_kwargs: Any) -> _BrowserShim:
+            from safe_browser import DEFAULT_HOST_ARGS, _CdpBrowserWs, ensure_browser_host, probe_cdp_endpoint
+
+            prof_dir = Path(_tf.mkdtemp(prefix="argon_cdp_pw_shim_"))
+            extra = list(DEFAULT_HOST_ARGS) + list(args or [])
+            if sys.platform != "win32":
+                for flg in ("--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"):
+                    if flg not in extra:
+                        extra.append(flg)
+            chrome_bin = None
+            for cand in ("google-chrome", "chromium", "chromium-browser", "chrome"):
+                w = shutil.which(cand)
+                if w:
+                    chrome_bin = w
+                    break
+            host = ensure_browser_host(prof_dir, chrome_exe=chrome_bin, headless=headless, extra_args=extra)
+            if not host or not host.get("http_endpoint"):
+                shutil.rmtree(prof_dir, ignore_errors=True)
+                raise RuntimeError("Could not start Chrome/Chromium host for CDP Playwright shim")
+            probed = probe_cdp_endpoint(str(host["http_endpoint"]), timeout=5.0)
+            if not probed or not probed.get("ws_endpoint"):
+                shutil.rmtree(prof_dir, ignore_errors=True)
+                raise RuntimeError("Could not probe ws_endpoint for CDP Playwright shim")
+            ws = _CdpBrowserWs(str(probed["ws_endpoint"]), timeout=15.0)
+            return _BrowserShim(prof_dir, ws)
+
+        def launch_persistent_context(self, *_args: Any, **_kwargs: Any) -> Any:
+            raise ImportError("playwright launch_persistent_context not available in lightweight CDP shim")
+
+    class _SyncPlaywrightContextManager:
+        def __init__(self) -> None:
+            self.chromium = _ChromiumLauncherShim()
+
+        def __enter__(self) -> "_SyncPlaywrightContextManager":
+            return self
+
+        def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+            return None
+
+    pw_pkg = _types.ModuleType("playwright")
+    pw_sync = _types.ModuleType("playwright.sync_api")
+    pw_sync.sync_playwright = _SyncPlaywrightContextManager  # type: ignore[attr-defined]
+    pw_pkg.sync_api = pw_sync  # type: ignore[attr-defined]
+    sys.modules["playwright"] = pw_pkg
+    sys.modules["playwright.sync_api"] = pw_sync
+
+
+_install_cdp_playwright_fallback_if_missing()
+
+
 def install_round23_bridge_hooks(ns: Dict[str, Any]) -> None:
-    """Install Round 23 reliability guards (R1-R16) into `dispatch_argon.py`'s module namespace."""
+    """Install Round 23 & Round 24 reliability guards into `dispatch_argon.py`'s module namespace."""
     if ns.get("_ROUND23_HOOKS_INSTALLED"):
         return
     ns["_ROUND23_HOOKS_INSTALLED"] = True
     ns["DEFAULT_WAIT_DEADLINE_SECONDS"] = DEFAULT_WAIT_DEADLINE_SECONDS
     ns["MAX_BASE64_ATTACH_BYTES"] = MAX_BASE64_ATTACH_BYTES
+    ns["MAX_ARCHIVE_BYTES"] = MAX_ARCHIVE_BYTES
+    ns["get_effective_base64_attach_cap"] = get_effective_base64_attach_cap
+    ns["format_archive_attach_route_line"] = format_archive_attach_route_line
+    ns["format_account_slot_resolution_line"] = format_account_slot_resolution_line
+    ns["resolve_account_index_to_slot"] = resolve_account_index_to_slot
+    ns["resolve_slot_to_browser_account"] = resolve_slot_to_browser_account
+    ns["update_brief_summary_with_resolved_slot"] = update_brief_summary_with_resolved_slot
+    ns["update_manual_handoff_with_resolved_slot"] = update_manual_handoff_with_resolved_slot
+    ns["_conversation_holds_existing_attachment"] = _conversation_holds_existing_attachment
     ns["RE_HYDROGEN"] = RE_HYDROGEN_STRICT
     ns["RE_FORBIDDEN_MODEL"] = RE_FORBIDDEN_NON_ARGON
     ns["_is_toggle_control"] = _is_toggle_control
@@ -963,29 +1575,33 @@ def install_round23_bridge_hooks(ns: Dict[str, Any]) -> None:
             page: Any,
             zip_path: Path,
             use_extension: bool = True,
+            allow_over_cap: bool = False,
         ) -> Tuple[bool, str, str]:
-            """Rule R3 Fixes 2 & 3: Enforce MAX_BASE64_ATTACH_BYTES (8 MB) cap and use CDP DOM.setFileInputFiles for large archives."""
+            """Round 24 R1.2: Check zp.stat().st_size FIRST before read_bytes(), return 'size_cap_exceeded' when over cap."""
             zp = Path(zip_path)
             try:
                 sz = zp.stat().st_size
             except OSError as exc:
                 return False, "validation", f"could not stat {zp}: {exc}"
 
-            if sz > MAX_BASE64_ATTACH_BYTES:
-                print(
-                    f"[+] Archive {zp.name} ({sz} bytes) exceeds {MAX_BASE64_ATTACH_BYTES} byte base64 cap "
-                    "(Rule R3); attaching directly via CDP DOM.setFileInputFiles..."
+            if sz > MAX_ARCHIVE_BYTES:
+                return (
+                    False,
+                    "archive_size_cap_exceeded",
+                    f"archive_size_cap_exceeded: archive {zp.name} ({sz} bytes, {sz / (1024 * 1024):.2f} MB) "
+                    f"exceeds the 100 MB hard archive cap ({MAX_ARCHIVE_BYTES} bytes)",
                 )
-                if callable(orig_open_upload_menu):
-                    orig_open_upload_menu(page)
-                ok_cdp, path_cdp, reason_cdp = _attach_zip_via_cdp_dom_file_input(page, zp)
-                if ok_cdp:
-                    if callable(orig_wait_for_upload) and orig_wait_for_upload(page, zp):
-                        return True, path_cdp, ""
-                    return True, path_cdp, ""
-                return False, path_cdp, reason_cdp
 
-            return orig_attach_datatransfer(page, zp, use_extension=use_extension)
+            eff_cap = get_effective_base64_attach_cap(ns.get("MAX_BASE64_ATTACH_BYTES", MAX_BASE64_ATTACH_BYTES))
+            if sz > eff_cap and not allow_over_cap:
+                return False, "size_cap_exceeded", "size_cap_exceeded"
+
+            try:
+                return orig_attach_datatransfer(
+                    page, zp, use_extension=use_extension, allow_over_cap=allow_over_cap
+                )
+            except TypeError:
+                return orig_attach_datatransfer(page, zp, use_extension=use_extension)
 
         ns["_attach_zip_via_datatransfer"] = _r23_attach_zip_via_datatransfer
 

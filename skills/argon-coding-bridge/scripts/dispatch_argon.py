@@ -6599,7 +6599,9 @@ def _inspect_zip_archive(zip_path: Path) -> tuple[bool, int, int, str]:
             False,
             sz,
             0,
-            f"archive {zp.name} ({sz} bytes) exceeds the {_MAX_ARCH_MB} MB hard limit ({max_allowed_bytes} bytes)",
+            f"archive_size_cap_exceeded: archive {zp.name} ({sz} bytes, {sz / (1024 * 1024):.2f} MB) "
+            f"exceeds the {_MAX_ARCH_MB} MB hard limit ({max_allowed_bytes} bytes; "
+            "Gemini cannot reliably index context archives above 100 MB)",
         )
     try:
         with _zf.ZipFile(zp, "r") as zf:
@@ -6849,8 +6851,11 @@ def _wait_for_upload_complete(page, zip_path: Path, timeout: float = 600.0) -> b
     still uploading - the prompt was then never pasted at all.
     """
     effective_timeout = _upload_timeout_for_archive(Path(zip_path), floor_seconds=float(timeout))
+    wait_cap = getattr(page, "_argon_upload_wait_cap_seconds", None)
+    loop_budget = float(wait_cap) if (wait_cap is not None and float(wait_cap) > 0) else max(5.0, effective_timeout)
+    poll_ms = 100 if (wait_cap is not None and float(wait_cap) < 5.0) else 900
     start_mono = time.monotonic()
-    deadline = start_mono + max(5.0, effective_timeout)
+    deadline = start_mono + loop_budget
     clear_streak = 0
     while time.monotonic() < deadline:
         present = _attachment_present(page, zip_path)
@@ -6860,6 +6865,10 @@ def _wait_for_upload_complete(page, zip_path: Path, timeout: float = 600.0) -> b
             if clear_streak >= 2:
                 waited = time.monotonic() - start_mono
                 sz = Path(zip_path).stat().st_size if Path(zip_path).is_file() else 0
+                setattr(page, "_argon_last_upload_status", "upload_complete")
+                setattr(page, "_argon_last_upload_elapsed", round(waited, 2))
+                setattr(page, "_argon_last_upload_window", round(effective_timeout, 1))
+                setattr(page, "_argon_last_upload_error", "")
                 print(
                     f"[+] Upload of {Path(zip_path).name} ({sz} bytes) finished in {waited:.1f}s "
                     f"(window={effective_timeout:.0f}s; attachment chip ready, upload spinner cleared)."
@@ -6868,14 +6877,34 @@ def _wait_for_upload_complete(page, zip_path: Path, timeout: float = 600.0) -> b
         else:
             clear_streak = 0
         try:
-            page.wait_for_timeout(900)
+            page.wait_for_timeout(poll_ms)
         except Exception:
-            time.sleep(0.9)
+            time.sleep(poll_ms / 1000.0)
 
     waited = time.monotonic() - start_mono
+    still_uploading = _composer_upload_in_progress(page)
+    still_present = _attachment_present(page, zip_path)
+    if still_uploading:
+        upload_state = "upload_still_running"
+        state_desc = "the upload is still running (upload spinner still active)"
+    elif still_present:
+        upload_state = "upload_still_running"
+        state_desc = "the upload is still running (attachment did not reach settled state before deadline)"
+    else:
+        upload_state = "upload_failed"
+        state_desc = "the upload failed (upload spinner stopped and attachment is missing or rejected)"
+    detail_msg = (
+        f"{upload_state}: {state_desc} after {waited:.1f}s "
+        f"(effective_window={effective_timeout:.0f}s; upload spinner still active or attachment missing)"
+    )
+    setattr(page, "_argon_last_upload_status", upload_state)
+    setattr(page, "_argon_last_upload_elapsed", round(waited, 2))
+    setattr(page, "_argon_last_upload_window", round(effective_timeout, 1))
+    setattr(page, "_argon_last_upload_error", detail_msg)
     print(
         f"[ERROR] Upload of {Path(zip_path).name} did not finish within {waited:.1f}s "
-        f"(window={effective_timeout:.0f}s; upload spinner still active or attachment missing) - "
+        f"(window={effective_timeout:.0f}s; {upload_state}: {state_desc}; "
+        "upload spinner still active or attachment missing) - "
         "refusing to send a half-uploaded archive.",
         file=sys.stderr,
     )
@@ -6965,16 +6994,42 @@ def _invoke_companion_extension(
         return None
 
 
-def _attach_zip_via_datatransfer(page, zip_path: Path, use_extension: bool = True) -> tuple[bool, str, str]:
+def _attach_zip_via_datatransfer(
+    page,
+    zip_path: Path,
+    use_extension: bool = True,
+    allow_over_cap: bool = False,
+) -> tuple[bool, str, str]:
     """Attach `zip_path` by injecting a `File` via `DataTransfer` into `input[type=file]` (no OS file dialog).
 
-    Returns `(attached_ok, path_used, failure_reason)`.
-    Fails in seconds with `'the upload menu rendered no file input'` if the page renders no
-    `input[type=file]` after opening the upload menu.
+    Round 24 (R1.1, R1.2, R3.1):
+      - Reads `zp.stat().st_size` FIRST before `zp.read_bytes()`.
+      - Enforces the 100 MB archive cap (`archive_size_cap_exceeded`).
+      - Reads `MAX_BASE64_ATTACH_BYTES` (and `ARGON_MAX_BASE64_ATTACH_MB`) and returns
+        `(False, "size_cap_exceeded", "size_cap_exceeded")` without base64-encoding when
+        `sz > eff_b64_cap` and `not allow_over_cap`.
     """
     import base64 as _b64
 
     zp = Path(zip_path)
+    try:
+        sz = zp.stat().st_size
+    except OSError as exc:
+        return False, "python_fallback", f"could not stat archive {zp.name}: {exc}"
+
+    hard_cap_bytes = 100 * 1024 * 1024
+    if sz > hard_cap_bytes:
+        return (
+            False,
+            "archive_size_cap_exceeded",
+            f"archive_size_cap_exceeded: archive {zp.name} ({sz} bytes, {sz / (1024 * 1024):.2f} MB) "
+            f"exceeds the 100 MB hard limit ({hard_cap_bytes} bytes)",
+        )
+
+    eff_b64_cap = get_effective_base64_attach_cap(MAX_BASE64_ATTACH_BYTES)
+    if sz > eff_b64_cap and not allow_over_cap:
+        return False, "size_cap_exceeded", "size_cap_exceeded"
+
     try:
         raw_bytes = zp.read_bytes()
     except OSError as exc:
@@ -6997,10 +7052,11 @@ def _attach_zip_via_datatransfer(page, zip_path: Path, use_extension: bool = Tru
             if ext_res.get("ok"):
                 if _wait_for_upload_complete(page, zp):
                     return True, "extension", ""
+                up_err = str(getattr(page, "_argon_last_upload_error", "") or "")
                 return (
                     False,
                     "extension",
-                    f"upload of {zp.name} did not finish within the upload window after extension DataTransfer attach",
+                    up_err or f"upload of {zp.name} did not finish within the upload window after extension DataTransfer attach",
                 )
             ext_reason = str(ext_res.get("reason") or "extension attach failed")
             if "rendered no file input" in ext_reason:
@@ -7049,6 +7105,12 @@ def _attach_zip_via_datatransfer(page, zip_path: Path, use_extension: bool = Tru
                     time.sleep(0.8)
                 if _wait_for_upload_complete(page, zp):
                     return True, "python_datatransfer", ""
+                up_err = str(getattr(page, "_argon_last_upload_error", "") or "")
+                return (
+                    False,
+                    "python_datatransfer",
+                    up_err or f"upload of {zp.name} did not finish within the upload window after DataTransfer attach",
+                )
             elif "rendered no file input" in str(dt_res.get("reason") or ""):
                 return False, "python_fallback", "the upload menu rendered no file input"
     except Exception:
@@ -7058,23 +7120,21 @@ def _attach_zip_via_datatransfer(page, zip_path: Path, use_extension: bool = Tru
 
 
 def attach_zip(page, zip_path: Path) -> bool:
-    """Attach the context zip to the composer, verify its size/members, and wait until upload finishes (D14, D15, D16, Section 1.3c).
+    """Attach the context zip to the composer, verify its size/members, and wait until upload finishes (D14, D15, D16, Round 24 W1 & W3).
 
-    Uses the MV3 companion extension (`DataTransfer` File injection) first when installed,
-    then falls back to the pure-Python `input[type=file]` routes without opening the
-    Windows native OS file dialog (unless `ARGON_ALLOW_OS_FILE_DIALOG=1` is explicitly set).
-    Records the exact failure reason in `page._argon_last_operation_error` in seconds.
+    Route order (Round 24 R1.3):
+      1. CDP `DOM.setFileInputFiles` (`_attach_zip_via_cdp_dom_file_input()`) - zero copy;
+      2. Playwright `set_input_files` - zero copy;
+      3. Companion-extension `attach_archive` / `DataTransfer` (base64) - ONLY for archives at or below `MAX_BASE64_ATTACH_BYTES`
+         (with a loud warning fallback if > cap and no zero-copy route is available, R1.4);
+      4. OS file dialog - only when explicitly allowed (`ARGON_ALLOW_OS_FILE_DIALOG`).
     """
     t0 = time.monotonic()
     zp = Path(zip_path)
-    if not _verify_zip_has_no_credentials(zp):
-        err = AttachOperationError(
-            f"archive {zp.name} failed credential/integrity verification",
-            path_used="validation",
-            elapsed_seconds=time.monotonic() - t0,
-        )
-        setattr(page, "_argon_last_operation_error", err)
-        return False
+    setattr(page, "_argon_last_upload_error", "")
+    setattr(page, "_argon_last_upload_status", "")
+
+    # R3.1: Inspect archive first so the 100 MB cap (`archive_size_cap_exceeded`) is surfaced with its exact named reason.
     ok_zip, sz, entries, zip_err = _inspect_zip_archive(zp)
     if not ok_zip:
         err = AttachOperationError(
@@ -7083,41 +7143,121 @@ def attach_zip(page, zip_path: Path) -> bool:
             elapsed_seconds=time.monotonic() - t0,
         )
         setattr(page, "_argon_last_operation_error", err)
+        print(f"[ERROR] {err}", file=sys.stderr)
         return False
+
+    if not _verify_zip_has_no_credentials(zp):
+        err = AttachOperationError(
+            f"archive {zp.name} failed credential/integrity verification",
+            path_used="validation",
+            elapsed_seconds=time.monotonic() - t0,
+        )
+        setattr(page, "_argon_last_operation_error", err)
+        return False
+
+    eff_b64_cap = get_effective_base64_attach_cap(MAX_BASE64_ATTACH_BYTES)
+
+    # R3.2: An archive above MAX_BASE64_ATTACH_BYTES must be attached to a FRESH conversation.
+    if sz > eff_b64_cap:
+        has_existing_att, existing_att_detail = _conversation_holds_existing_attachment(page)
+        if has_existing_att:
+            fresh_reason = (
+                f"fresh_conversation_required_for_large_archive: archive {zp.name} ({sz} bytes) "
+                f"exceeds MAX_BASE64_ATTACH_BYTES ({eff_b64_cap} bytes) and the target conversation "
+                f"already holds an attachment ({existing_att_detail}); large archives require a fresh chat (--new-session)."
+            )
+            err = AttachOperationError(
+                fresh_reason,
+                path_used="fresh_conversation_guard",
+                elapsed_seconds=time.monotonic() - t0,
+            )
+            setattr(page, "_argon_last_operation_error", err)
+            print(f"[ERROR] {fresh_reason}", file=sys.stderr)
+            return False
+
     eff_win = _upload_timeout_for_archive(zp, floor_seconds=600.0)
     ext_active = _extension_is_available(page)
     path_label = "extension" if ext_active else "python_fallback"
     print(
         f"[+] Attaching archive {zp.name} ({sz} bytes, {entries} entries, "
-        f"upload window {eff_win:.0f}s, path={path_label})..."
+        f"upload window {eff_win:.0f}s, base64_cap={eff_b64_cap} bytes, path={path_label})..."
     )
 
-    # Route 0: Companion extension / DataTransfer File injection (no OS file dialog).
-    # For archives <= 64 MB, inject directly via DataTransfer; for larger archives or
-    # mock pages without evaluate support, fall through to set_input_files on input[type=file].
-    if sz <= 64 * 1024 * 1024:
-        dt_ok, dt_path, dt_reason = _attach_zip_via_datatransfer(page, zp, use_extension=ext_active)
-        if dt_ok:
-            setattr(page, "_argon_last_attach_path", dt_path)
-            setattr(page, "_argon_last_operation_error", None)
-            print(f"[+] Archive {zp.name} attached via {dt_path} (no OS file dialog).")
-            return True
-        if dt_reason == "the upload menu rendered no file input":
-            # Confirm with _zip_input before failing fast in seconds.
-            if _zip_input(page) is None:
-                err = AttachOperationError(
-                    "the upload menu rendered no file input",
-                    path_used=dt_path,
-                    elapsed_seconds=time.monotonic() - t0,
-                )
-                setattr(page, "_argon_last_operation_error", err)
-                print(f"[ERROR] {err}", file=sys.stderr)
-                return False
+    use_base64_primary = bool(sz <= eff_b64_cap)
+    initial_route = (
+        ("companion_extension_base64" if ext_active else "datatransfer_base64")
+        if use_base64_primary
+        else "cdp_dom_set_file_input_files"
+    )
+    route_line = format_archive_route_decision_line(
+        zp.name,
+        sz,
+        eff_b64_cap,
+        initial_route,
+        use_base64=use_base64_primary,
+    )
+    setattr(page, "_argon_last_route_decision_line", route_line)
+    print(route_line)
+
+    # Probe _attach_zip_via_datatransfer:
+    # - When sz <= eff_b64_cap, this runs today's companion-extension / DataTransfer route (preserving F4).
+    # - When sz > eff_b64_cap, _attach_zip_via_datatransfer checks zp.stat().st_size FIRST without reading bytes
+    #   and returns (False, "size_cap_exceeded", "size_cap_exceeded") so we fall through to the zero-copy routes.
+    dt_ok, dt_path, dt_reason = _attach_zip_via_datatransfer(page, zp, use_extension=ext_active)
+    if dt_ok:
+        setattr(page, "_argon_last_attach_path", dt_path)
+        setattr(page, "_argon_last_operation_error", None)
+        print(f"[+] Archive {zp.name} attached via {dt_path} (no OS file dialog).")
+        return True
+    if dt_reason == "the upload menu rendered no file input":
+        if _zip_input(page) is None:
+            err = AttachOperationError(
+                "the upload menu rendered no file input",
+                path_used=dt_path,
+                elapsed_seconds=time.monotonic() - t0,
+            )
+            setattr(page, "_argon_last_operation_error", err)
+            print(f"[ERROR] {err}", file=sys.stderr)
+            return False
+    if dt_reason and ("upload_still_running" in dt_reason or "upload_failed" in dt_reason):
+        err = AttachOperationError(
+            dt_reason,
+            path_used=dt_path,
+            elapsed_seconds=time.monotonic() - t0,
+        )
+        setattr(page, "_argon_last_operation_error", err)
+        return False
 
     route_errors: List[str] = []
 
-    # 1. Open the upload menu first - that is when the file input appears.
+    # Zero-Copy Route 1 (R1.3 #1): CDP DOM.setFileInputFiles (_attach_zip_via_cdp_dom_file_input)
     _open_upload_menu(page)
+    try:
+        cdp_ok, cdp_path, cdp_reason = _attach_zip_via_cdp_dom_file_input(page, zp)
+    except Exception as cdp_exc:
+        cdp_ok, cdp_path, cdp_reason = False, "cdp_dom_file_input", f"{type(cdp_exc).__name__}: {cdp_exc}"
+    if cdp_ok:
+        try:
+            page.wait_for_timeout(800)
+        except Exception:
+            time.sleep(0.8)
+        if _wait_for_upload_complete(page, zp):
+            setattr(page, "_argon_last_attach_path", cdp_path)
+            setattr(page, "_argon_last_operation_error", None)
+            print(f"[+] Archive {zp.name} attached via {cdp_path} (zero-copy CDP DOM.setFileInputFiles).")
+            return True
+        up_err = str(getattr(page, "_argon_last_upload_error", "") or "upload did not complete within window")
+        err = AttachOperationError(
+            up_err,
+            path_used=cdp_path,
+            elapsed_seconds=time.monotonic() - t0,
+        )
+        setattr(page, "_argon_last_operation_error", err)
+        return False
+    elif cdp_reason:
+        route_errors.append(f"cdp_dom_file_input ({cdp_reason})")
+
+    # Zero-Copy Route 2a (R1.3 #2): Playwright set_input_files on _zip_input after opening upload menu
     el = _zip_input(page)
     if el is not None:
         try:
@@ -7127,14 +7267,21 @@ def attach_zip(page, zip_path: Path) -> bool:
                 setattr(page, "_argon_last_attach_path", "python_fallback")
                 setattr(page, "_argon_last_operation_error", None)
                 return True
-            route_errors.append("upload menu input[type=file] did not complete upload within window")
+            up_err = str(getattr(page, "_argon_last_upload_error", "") or "upload menu input[type=file] did not complete upload within window")
+            err = AttachOperationError(
+                up_err,
+                path_used="python_fallback",
+                elapsed_seconds=time.monotonic() - t0,
+            )
+            setattr(page, "_argon_last_operation_error", err)
+            return False
         except Exception as exc:
             route_errors.append(f"upload menu input[type=file] failed ({exc})")
             print(f"[!] Attach route 1 (upload menu file input) failed: {exc}", file=sys.stderr)
     else:
         route_errors.append("the upload menu rendered no file input")
 
-    # 2. A file input may already have been present.
+    # Zero-Copy Route 2b (R1.3 #2): Playwright set_input_files on any existing input[type=file]
     try:
         inputs = page.locator("input[type='file']")
         inp_count = min(inputs.count(), 4)
@@ -7146,6 +7293,14 @@ def attach_zip(page, zip_path: Path) -> bool:
                     setattr(page, "_argon_last_attach_path", "python_fallback")
                     setattr(page, "_argon_last_operation_error", None)
                     return True
+                up_err = str(getattr(page, "_argon_last_upload_error", "") or f"input[type=file] #{i} did not complete upload within window")
+                err = AttachOperationError(
+                    up_err,
+                    path_used="python_fallback",
+                    elapsed_seconds=time.monotonic() - t0,
+                )
+                setattr(page, "_argon_last_operation_error", err)
+                return False
             except Exception as exc:
                 route_errors.append(f"input[type=file] #{i} failed ({exc})")
                 print(f"[!] Attach route 2 (input[type=file] #{i}) failed: {exc}", file=sys.stderr)
@@ -7154,9 +7309,7 @@ def attach_zip(page, zip_path: Path) -> bool:
         route_errors.append(f"querying input[type=file] failed ({exc})")
         print(f"[!] Attach route 2 (querying input[type=file]) failed: {exc}", file=sys.stderr)
 
-    # 3. Native OS file chooser is disabled by default because it opens a real Windows file
-    # dialog that hangs unattended runs (Section 0.1 & 1.1). Only run if explicitly enabled
-    # or when running against a synthetic/mock page in unit tests that provides expect_file_chooser.
+    # Route 4 (R1.3 #4): Native OS file chooser is disabled by default unless ARGON_ALLOW_OS_FILE_DIALOG=1
     allow_os_dialog = str(os.environ.get("ARGON_ALLOW_OS_FILE_DIALOG") or "").strip().lower() in (
         "1",
         "true",
@@ -7186,9 +7339,44 @@ def attach_zip(page, zip_path: Path) -> bool:
             route_errors.append(f"locating upload menu entry failed ({exc})")
             print(f"[!] Attach route 3 (locating upload menu entry) failed: {exc}", file=sys.stderr)
 
+    # R1.4: When the cap was exceeded and no zero-copy route was available, log a loud warning
+    # and continue with the base64 route so the attach NEVER fails because of the base64 cap.
+    if not use_base64_primary and not getattr(page, "_argon_last_upload_error", ""):
+        print(
+            f"[WARNING] No zero-copy attach route was available for {zp.name} ({sz} bytes > cap {eff_b64_cap} bytes); "
+            "continuing with base64 DataTransfer route so attach does not fail because of the base64 cap.",
+            file=sys.stderr,
+        )
+        fb_line = format_archive_route_decision_line(
+            zp.name,
+            sz,
+            eff_b64_cap,
+            "companion_extension_base64_fallback" if ext_active else "datatransfer_base64_fallback",
+            use_base64=True,
+        )
+        setattr(page, "_argon_last_route_decision_line", fb_line)
+        print(fb_line)
+        fb_ok, fb_path, fb_reason = _attach_zip_via_datatransfer(
+            page, zp, use_extension=ext_active, allow_over_cap=True
+        )
+        if fb_ok:
+            setattr(page, "_argon_last_attach_path", fb_path)
+            setattr(page, "_argon_last_operation_error", None)
+            print(f"[+] Archive {zp.name} attached via {fb_path} (over-cap base64 fallback).")
+            return True
+        if fb_reason:
+            route_errors.append(f"base64_fallback ({fb_reason})")
+
+    no_input_only = (
+        "the upload menu rendered no file input" in route_errors
+        and all(
+            ("rendered no file input" in r or "cdp_dom_file_input" in r or "base64_fallback" in r)
+            for r in route_errors
+        )
+    )
     primary_reason = (
         "the upload menu rendered no file input"
-        if ("the upload menu rendered no file input" in route_errors and len(route_errors) == 1)
+        if no_input_only
         else ("; ".join(route_errors) or "no file input was available in the composer")
     )
     err = AttachOperationError(
@@ -7780,7 +7968,25 @@ def _execute_composer_send_sequence(
 
     # Step 3: Attach the archive and wait until THIS upload finishes.
     if zip_path is not None:
-        attached = _retry(lambda p: attach_zip(p, zip_path), page, attempts=2, delay=1.0)
+        def _attempt_attach_once_or_retry(p) -> bool:
+            if attach_zip(p, zip_path):
+                return True
+            op_err = getattr(p, "_argon_last_operation_error", None)
+            err_txt = str(getattr(op_err, "reason", "") or op_err or "")
+            if any(
+                tok in err_txt
+                for tok in (
+                    "archive_size_cap_exceeded",
+                    "fresh_conversation_required_for_large_archive",
+                    "upload_still_running",
+                    "upload_failed",
+                )
+            ):
+                return False
+            time.sleep(1.0)
+            return attach_zip(p, zip_path)
+
+        attached = _attempt_attach_once_or_retry(page)
         attach_path_used = str(getattr(page, "_argon_last_attach_path", "") or pipeline_path)
         ok_z, z_sz, z_cnt, _ = _inspect_zip_archive(zip_path)
         size_tag = f" ({z_sz} bytes, {z_cnt} entries, TASK_BRIEF.md verified)" if ok_z else " (invalid/corrupt archive)"
@@ -7846,6 +8052,28 @@ def _execute_composer_send_sequence(
         setattr(page, "_argon_last_operation_error", ModelSelectionError(send_model_reason, path_used=pipeline_path))
         print(f"[ERROR] Operation 'model' failed ({pipeline_path}): {send_model_reason}", file=sys.stderr)
         return mode_ok, model_ok, False
+
+    # R3.4: Never send the prompt before the upload has finished and been confirmed.
+    if zip_path is not None:
+        if _composer_upload_in_progress(page) or not _attachment_present(page, zip_path):
+            still_up = _composer_upload_in_progress(page)
+            eff_win_now = _upload_timeout_for_archive(Path(zip_path), floor_seconds=600.0)
+            up_state = "upload_still_running" if still_up else "upload_failed"
+            up_desc = (
+                "the upload is still running (spinner active right before send)"
+                if still_up
+                else "the upload failed (attachment cannot be confirmed in composer right before send)"
+            )
+            unconfirmed_reason = (
+                f"{up_state}: {up_desc} for {Path(zip_path).name} (effective_window={eff_win_now:.0f}s) - "
+                "refusing to send prompt before upload has finished and been confirmed"
+            )
+            p_log.append(f"upload confirmation before send : FAILED ({unconfirmed_reason})")
+            setattr(page, "_argon_failed_operation", "attach")
+            setattr(page, "_argon_failed_reason", unconfirmed_reason)
+            setattr(page, "_argon_last_operation_error", AttachOperationError(unconfirmed_reason, path_used=pipeline_path))
+            print(f"[ERROR] Operation 'attach' failed ({pipeline_path}): {unconfirmed_reason}", file=sys.stderr)
+            return mode_ok, model_ok, False
 
     # Step 4: The moment the upload has finished, verify the Flash guard and click send immediately.
     sent_ok = _click_send_immediately(
@@ -8685,16 +8913,25 @@ def run_preflight_selftest_cli(headless: bool = True, require_extension: bool = 
 try:
     from round23_reliability import (
         DEFAULT_WAIT_DEADLINE_SECONDS,
+        MAX_ARCHIVE_BYTES,
         MAX_BASE64_ATTACH_BYTES,
         _attach_zip_via_cdp_dom_file_input,
         _check_page_responsive,
+        _conversation_holds_existing_attachment,
         _is_toggle_control,
         _normalize_viewer_geometry,
         _prove_page_responsive_after_capture,
         _recover_wedged_tab_via_cdp,
         _verify_tab_on_own_conversation,
         attach_images_to_composer,
+        format_account_slot_resolution_line,
+        format_archive_route_decision_line,
+        get_effective_base64_attach_cap,
         install_round23_bridge_hooks,
+        resolve_account_index_to_slot,
+        resolve_slot_to_browser_account,
+        update_brief_summary_with_resolved_slot,
+        update_manual_handoff_with_resolved_slot,
     )
     install_round23_bridge_hooks(globals())
 except Exception as _r23_import_exc:
@@ -8738,6 +8975,21 @@ def run_preflight_selftest_cli(headless: bool = True, require_extension: bool = 
         f"{r24_rep.get('elapsed_ms')} ms: the re-apply patchers cannot kill the bridge, "
         f"the duplicate --attach-images option is repaired, "
         f"{r24_rep.get('images_reported')} images reach the composer)"
+    )
+    try:
+        from test_round24_workunits import run_round24_workunits_suite
+
+        r24_wu = run_round24_workunits_suite()
+    except Exception as r24_wu_exc:
+        print(f"[ERROR] Round 24 work-units self-test could not run: {r24_wu_exc}", file=sys.stderr)
+        return EXIT_PREFLIGHT_FAILED
+    if not r24_wu.get("ok"):
+        print(f"[ERROR] Round 24 work-units self-test failed: {r24_wu}", file=sys.stderr)
+        return EXIT_PREFLIGHT_FAILED
+    print(
+        f"  Round 24 work units   : OK ({r24_wu.get('passed')}/{r24_wu.get('total')} cases in "
+        f"{r24_wu.get('elapsed_ms')} ms: W1 base64 cap={r24_wu.get('base64_cap_bytes')}B + CDP zero-copy, "
+        f"W2 --account-index + resolved URLs, W3 100MB cap + fresh-chat guard + upload state)"
     )
     return EXIT_SUCCESS
 
@@ -10802,6 +11054,7 @@ def dispatch_to_argon(
     deadline_seconds: int = 5400,
     brief_summary: Optional[str] = None,
     attach_images: Optional[List[str]] = None,
+    account_index: Optional[int] = None,
 ) -> int:
     proj_root = Path(project_path).resolve()
     zip_path = proj_root / output_zip if not Path(output_zip).is_absolute() else Path(output_zip)
@@ -10940,7 +11193,7 @@ def dispatch_to_argon(
                     fail_reason_now = str(getattr(page_obj, "_argon_last_capture_failure_reason", "") or step_name)
                 except Exception:
                     cur_chat = ""
-            md_p, _ = write_manual_handoff_pack(
+            md_p, json_p = write_manual_handoff_pack(
                 proj_root=proj_root,
                 lane=lane or "new",
                 slot=active_slot or "/u/0/",
@@ -10960,6 +11213,15 @@ def dispatch_to_argon(
                 quarantined_file=q_file_now,
                 failure_reason=fail_reason_now,
             )
+            if resolved_browser_idx is not None:
+                update_manual_handoff_with_resolved_slot(
+                    md_p,
+                    json_p,
+                    slot=active_slot or "/u/0/",
+                    email=target_email or "",
+                    account_index=resolved_browser_idx,
+                    resolved_url=cur_chat or target_url or f"https://gemini.google.com/u/{resolved_browser_idx}/app",
+                )
             print("\n[i] Manual hand-off summary:")
             print(f"    Account e-mail : {target_email or '(none / unconfigured)'}")
             print(f"    Chat link      : {cur_chat or target_url or 'https://gemini.google.com/u/0/app'}")
@@ -11163,10 +11425,32 @@ def dispatch_to_argon(
             return EXIT_PREFLIGHT_FAILED
         print(f"[+] Archive ready to upload: {zip_path} ({z_bytes} bytes, {z_entries} entries)")
 
+    resolved_browser_idx: Optional[int] = None
+    if account_index is not None:
+        try:
+            idx_res = resolve_account_index_to_slot(
+                account_index,
+                pool_cfg=pool_cfg,
+                explicit_slot=slot,
+            )
+        except RuntimeError as exc_acct_idx:
+            print(f"[ERROR] {exc_acct_idx}", file=sys.stderr)
+            return (
+                EXIT_PREFLIGHT_FAILED
+                if "slot_account_index_conflict" in str(exc_acct_idx)
+                else EXIT_NOT_SIGNED_IN
+            )
+        slot = str(idx_res["slot"])
+        resolved_browser_idx = int(idx_res["account_index"])
+
     # D3: Apply Account Policy when selecting active_slot
     if slot:
         active_slot = normalize_slot(slot)
-        slot_reason = f"explicitly requested slot {active_slot}"
+        slot_reason = (
+            f"resolved from --account-index {account_index} -> pool slot {active_slot}"
+            if account_index is not None
+            else f"explicitly requested slot {active_slot}"
+        )
     else:
         active_slot, slot_reason = select_account_slot(
             pool_cfg=pool_cfg,
@@ -11355,17 +11639,18 @@ def dispatch_to_argon(
                 )
                 return EXIT_NOT_SIGNED_IN
             eff_idx = found_idx if found_idx is not None else expected_acct_idx
+            resolved_browser_idx = int(eff_idx)
             if found_idx is not None:
                 pool_cfg.set_account_index(active_slot, found_idx)
-            print(
-                f"[+] Argon browser account index for slot {active_slot} ({target_email or 'account'}): "
-                f"/u/{eff_idx}/ (verified_in_preferences={ok_idx}, registered_accounts={len(all_pref_emails)})"
-            )
             target_url = re.sub(
                 r"(gemini\.google\.com)/u/\d+/",
                 f"\\1/u/{eff_idx}/",
                 target_url,
                 flags=re.IGNORECASE,
+            )
+            print(
+                f"[+] Argon browser account index for slot {active_slot} ({target_email or 'account'}): "
+                f"/u/{eff_idx}/ (verified_in_preferences={ok_idx}, registered_accounts={len(all_pref_emails)}) -> {target_url}"
             )
 
             # Round 21 (FIX 5): the recorded account must be the account this lane
@@ -11389,6 +11674,18 @@ def dispatch_to_argon(
                 )
             target_email = live_email
             print(f"[+] Account actually used by this lane: {live_email} (/u/{eff_idx}/)")
+            res_app_url = f"https://gemini.google.com/u/{eff_idx}/app"
+            print(format_account_slot_resolution_line(active_slot, target_email, eff_idx, res_app_url))
+            slot_num_val = _slot_number(active_slot)
+            if slot_num_val != eff_idx:
+                print(
+                    f"[WARNING] Pool slot {active_slot} (slot number {slot_num_val}) resolves to a DIFFERENT "
+                    f"browser account index /u/{eff_idx}/ ({target_email}) -> {res_app_url} "
+                    "(pool slot != browser account index).",
+                    file=sys.stderr,
+                )
+            if not resume_chat and prompt_text:
+                _emit_send_failure(f"attempt_{current_attempt}_ready", None, page_obj=None)
 
         slot_lock.update_profile_dir(profile_dir)
         chrome_exe = find_chrome_executable()
@@ -11916,6 +12213,14 @@ def dispatch_to_argon(
                         bs_path = Path(brief_summary).resolve()
                         if bs_path.is_file():
                             try:
+                                if resolved_browser_idx is not None:
+                                    update_brief_summary_with_resolved_slot(
+                                        bs_path,
+                                        slot=active_slot,
+                                        email=target_email or "",
+                                        account_index=resolved_browser_idx,
+                                        resolved_url=target_url,
+                                    )
                                 print("\n" + "=" * 78)
                                 print(f"[i] Brief Summary ({bs_path}):")
                                 print("=" * 78)
@@ -13121,6 +13426,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Send the contents of this brief file as the task instead of --task.",
     )
     parser.add_argument("--slot", default=None, help="Account pool slot (e.g. /u/0/)")
+    parser.add_argument(
+        "--account-index",
+        type=int,
+        default=None,
+        metavar="N",
+        help="0-based browser account position in live Default/Preferences account_info (resolves N -> owning pool slot; refuses unregistered indices or --slot conflicts).",
+    )
     parser.add_argument("--headless", action="store_true", help="Run browser in headless mode")
     parser.add_argument(
         "--auto-apply",
@@ -13965,6 +14277,24 @@ def main(argv: Optional[List[str]] = None) -> int:
     if getattr(args, "no_extension", False):
         os.environ["ARGON_DISABLE_COMPANION_EXTENSION"] = "1"
 
+    if getattr(args, "account_index", None) is not None:
+        try:
+            acct_res = resolve_account_index_to_slot(
+                int(args.account_index),
+                explicit_slot=args.slot,
+            )
+        except RuntimeError as exc_acct:
+            print(f"[ERROR] {exc_acct}", file=sys.stderr)
+            return (
+                EXIT_PREFLIGHT_FAILED
+                if "slot_account_index_conflict" in str(exc_acct)
+                else EXIT_NOT_SIGNED_IN
+            )
+        args.slot = str(acct_res["slot"])
+        print(acct_res["line"])
+        if acct_res.get("warning"):
+            print(acct_res["warning"], file=sys.stderr)
+
     if getattr(args, "enable_shared_profile", False):
         cfg_en = PoolConfig()
         rep_en = cfg_en.enable_shared_profile_mode()
@@ -14068,15 +14398,32 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
 
     if getattr(args, "manual_handoff", False):
-        from manual_handoff import run_manual_handoff_cli
+        from manual_handoff import handoff_dir_for_lane, run_manual_handoff_cli
 
-        return run_manual_handoff_cli(
+        rc_mh = run_manual_handoff_cli(
             project_path=args.project_path,
             lane=args.lane,
             slot=args.slot,
             open_browser=getattr(args, "open_browser", False),
             mode=args.mode,
         )
+        try:
+            res_slot = resolve_slot_to_browser_account(args.slot)
+            h_dir = handoff_dir_for_lane(Path(args.project_path).resolve(), args.lane or "new")
+            update_manual_handoff_with_resolved_slot(
+                h_dir / "manual_handoff.md",
+                h_dir / "handoff.json",
+                slot=res_slot["slot"],
+                email=res_slot["email"],
+                account_index=res_slot["account_index"],
+                resolved_url=res_slot["resolved_url"],
+            )
+            print(res_slot["line"])
+            if res_slot.get("warning"):
+                print(res_slot["warning"], file=sys.stderr)
+        except Exception as _mh_res_exc:
+            print(f"[!] Could not resolve browser account index for manual hand-off: {_mh_res_exc}", file=sys.stderr)
+        return rc_mh
 
     if args.list_sessions:
         return list_sessions()
