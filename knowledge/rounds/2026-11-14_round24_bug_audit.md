@@ -171,3 +171,36 @@ test_round22_extension_install.py     PASS 5/5
 test_round23_reliability.py            PASS (all 8 rules)
 test_round24_bugfixes.py               PASS 5/5
 ```
+
+## 9. Round 24 outcome + three NEW findings from the live run
+
+The round-24 brief (`2026-11-14_round24_brief.md`) was sent ONCE at 10:41:18 and Argon's
+delivery (140,865 bytes, sha256 `688317e5…`, pre-flighted 31/31 hunks, 0 glued
+terminators) was applied with the bridge's own `Run-ArgonPatch.ps1`. It landed the three
+work units (commit `ebc5627`) and four extra fixes Argon found while reading the project.
+
+**NEW FINDING A — the composer is NOT cleared after a verified send.**
+The 35,724-character prompt stayed in the composer after the send (the bridge's own log:
+`prompt paste (extension) : OK (35724 chars in composer)` -> `sent` -> the composer still
+held the text). It LOOKS like a pending turn, and the send arrow stayed armed - so any
+later click or Enter fires the SAME prompt again. **Fix for round 25:** clear the composer
+and disarm the send button after a verified send, and treat "the composer still holds the
+prompt" as a failure of the send, not as a pending turn.
+
+**NEW FINDING B — a second turn can appear as a `queued-steering-turn`.**
+The live DOM of the chat (`gemini.google.com/u/2/app/c4d7ab7a723d592b`) held TWO
+`user-query` elements: the sent one (parent class `turn-content-visibility`) and a second
+one whose parent class is **`queued-steering-turn`** - a message submitted WHILE Gemini was
+already working. Counting `user-query` elements is therefore NOT a send count; the
+authoritative record is the bridge's own run log (`PROMPT SENT at <time>` appears once).
+The bridge must never treat a queued steering turn as a new send.
+
+**NEW FINDING C — `--resume` can pick up a STALE delivery.**
+`dispatch_argon.py:11122` short-circuits when the task state still carries a `delivered`
+path from an earlier round: this run recorded round 13's byte-identical
+`downloads/dual/round13_new/apply_changes.ps1` as THIS round's delivery (the
+`_is_leftover_delivery` defect Argon fixed in this round). **Recovery:** clear
+`delivered` / `delivery_hash` for the project and its lane in
+`~/.gemini/argon_task_state.json` (keep a `.bak`), then re-run
+`--resume --no-carry-over` - it then waits for the real chip and captures it.
+
