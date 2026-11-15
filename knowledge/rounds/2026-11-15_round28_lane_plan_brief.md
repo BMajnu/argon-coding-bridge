@@ -154,6 +154,31 @@ wrong. Required changes:
   - the hand-off pack names the chat URL, the expected file and the older digests.
 - **R7.2** Wire it into `--self-test` like the other suites.
 
+### W8 — A follow-up must never work from a STALE archive
+
+**F6 — The continuation already holds the previous round's archive.**
+A conversation that holds an attachment cannot take the whole context archive again (the
+Round 24 `fresh_conversation_required_for_large_archive` guard), so a follow-up that skips
+the attach makes Argon work from the codebase as it was in the PREVIOUS round - not the
+current one. That is why "the follow-up cannot focus properly" and why the new work never
+lands: the model is looking at a stale tree.
+
+- **R8.1** A follow-up must know which codebase the conversation already carries. The
+  hand-off pack and the prompt must state the archive that is already in the chat (file
+  name + byte size + SHA-256 + the project commit it was built from).
+- **R8.2** When the project's code changed since that archive was built, the follow-up must
+  attach a **FOCUSED archive**: only the files that changed since the archive was packaged
+  (plus a small `FOCUS_MANIFEST.md` listing the changed files, the base commit and the
+  archive's SHA-256). The focused archive replaces nothing - it is a second, small
+  attachment - and the bridge must therefore ALLOW a focused archive in a conversation that
+  already holds the full one (the 8.4 MB ceiling the other agent measured is the reason a
+  focused archive is needed at all).
+- **R8.3** When even a focused archive cannot be attached, the run must say so by name and
+  use a FRESH chat with the full archive - it must never send a follow-up that makes Argon
+  work from a stale tree without saying it.
+- **R8.4** The archive must carry a stamp (the project commit + the archive's own SHA-256)
+  so the next round can tell which codebase a conversation carries.
+
 ---
 
 ## PART C — HARD RULES
