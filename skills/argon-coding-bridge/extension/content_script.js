@@ -29,17 +29,8 @@
 
   // Round 27 Contract 3 R3.1: the model chip is LOCALISED, so the accepted Argon labels
   // must be the same list the Core uses (`SHARED_ARGON_MODEL_LABELS` in
-  // round23_reliability.py). It used to be referenced without ever being defined here,
-  // which made every model check throw a ReferenceError and broke the whole send path.
-  const ARGON_MODEL_LABELS = [
-    "Code & analysis 4 Argon",
-    "কোড ও বিশ্লেষণ 4 Argon",
-    "4 Argon",
-    "Gemini 4 Argon",
-    "Argon",
-    "আরগন",
-    "আর্গন"
-  ];
+  // round23_reliability.py). Alias to `SHARED_ARGON_MODEL_LABELS` as single source of truth.
+  const ARGON_MODEL_LABELS = SHARED_ARGON_MODEL_LABELS;
 
   const companionRuntime = {
     version: EXTENSION_VERSION,
@@ -64,9 +55,13 @@
       return Math.max(0, Math.floor(Number(o.effectiveBase64CapBytes)));
     }
     try {
-      const attrVal = document.documentElement && document.documentElement.getAttribute("data-argon-max-base64-attach-bytes");
-      if (attrVal !== null && attrVal !== "" && !Number.isNaN(Number(attrVal))) {
-        return Math.max(0, Math.floor(Number(attrVal)));
+      if (document && document.documentElement) {
+        const attrVal =
+          document.documentElement.getAttribute("data-argon-max-base64-attach-bytes") ||
+          document.documentElement.getAttribute("data-argon-max-base64-bytes");
+        if (attrVal !== null && attrVal !== "" && !Number.isNaN(Number(attrVal)) && Number(attrVal) > 0) {
+          return Math.max(0, Math.floor(Number(attrVal)));
+        }
       }
       if (typeof window !== "undefined" && window.ARGON_MAX_BASE64_ATTACH_MB !== undefined && window.ARGON_MAX_BASE64_ATTACH_MB !== "") {
         const mb = Number(window.ARGON_MAX_BASE64_ATTACH_MB);
@@ -809,18 +804,7 @@
   }
 
   function getEffectiveBase64CapBytes(opts) {
-    if (opts && Number(opts.maxBase64Bytes) > 0) {
-      return Number(opts.maxBase64Bytes);
-    }
-    try {
-      const attrVal = document && document.documentElement
-        ? Number(document.documentElement.getAttribute("data-argon-max-base64-bytes") || 0)
-        : 0;
-      if (attrVal > 0) {
-        return attrVal;
-      }
-    } catch (_err) {}
-    return MAX_BASE64_ATTACH_BYTES;
+    return getEffectiveBase64AttachCap(opts);
   }
 
   async function attachArchiveViaDataTransfer(payload) {
@@ -1397,42 +1381,18 @@
       return pasteViaDataTransfer(pl.promptText || "", Boolean(pl.appendMode));
     }
     if (act === "disarm_prompt_guard") {
-      disarmPromptAliveGuard(pl.reason || "explicit_disarm");
-      return {
-        ok: true,
-        operation: "disarm_prompt_guard",
-        path: "extension",
-        keepPromptAlive: companionRuntime.keepPromptAlive,
-        cachedPromptText: companionRuntime.cachedPromptText,
-        sendPerformed: companionRuntime.sendPerformed,
-        disarmReason: companionRuntime.disarmReason
-      };
-    }
-    if (act === "get_runtime_state") {
-      return {
-        ok: true,
-        operation: "get_runtime_state",
-        path: "extension",
-        keepPromptAlive: companionRuntime.keepPromptAlive,
-        cachedPromptText: companionRuntime.cachedPromptText,
-        cachedPromptTextLength: (companionRuntime.cachedPromptText || "").length,
-        sendPerformed: companionRuntime.sendPerformed,
-        turnsAtPaste: companionRuntime.turnsAtPaste,
-        currentTurns: countConversationTurns(),
-        queuedSteeringPresent: hasQueuedSteeringTurn(),
-        composerClearedCount: companionRuntime.composerClearedCount,
-        disarmReason: companionRuntime.disarmReason
-      };
-    }
-    if (act === "disarm_prompt_guard") {
-      disarmCompanionPromptGuard(pl.reason || "disarm_prompt_guard");
+      const reasonStr = pl.reason || "disarm_prompt_guard";
+      disarmPromptAliveGuard(reasonStr);
+      disarmCompanionPromptGuard(reasonStr);
       return {
         ok: true,
         operation: "disarm_prompt_guard",
         path: "extension",
         keepPromptAlive: false,
         cachedPromptText: "",
-        reason: companionRuntime.disarmReason
+        sendPerformed: Boolean(companionRuntime.sendPerformed),
+        disarmReason: String(companionRuntime.disarmReason || ""),
+        reason: String(companionRuntime.disarmReason || "")
       };
     }
     if (act === "get_runtime_state") {
@@ -1448,6 +1408,7 @@
         sendPerformed: Boolean(companionRuntime.sendPerformed),
         turnsAtPaste: Number(companionRuntime.turnsAtPaste || 0),
         currentTurns: countConversationDomTurns(),
+        queuedSteeringPresent: hasQueuedSteeringTurn(),
         composerClearedCount: Number(companionRuntime.composerClearedCount || 0),
         disarmReason: String(companionRuntime.disarmReason || ""),
         sharedModelLabels: SHARED_ARGON_MODEL_LABELS.slice()

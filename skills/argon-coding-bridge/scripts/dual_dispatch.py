@@ -302,15 +302,17 @@ def run_dual_dispatch(
         winner_label = str(winner_info.get("winner") or "followup")
     elif isinstance(session_entry, dict) and (session_entry.get("chat_id") or session_entry.get("chat_url")):
         followup_slot = normalize_slot(slot or session_entry.get("slot") or "/u/0/")
+        followup_url_slot = _url_slot_for_account(followup_slot, isolated_profile=False)
         followup_chat_id = str(session_entry.get("chat_id") or "")
         followup_chat_url = str(
-            session_entry.get("chat_url") or f"https://gemini.google.com/u/0/app/{followup_chat_id}"
+            session_entry.get("chat_url") or f"https://gemini.google.com{followup_url_slot}app/{followup_chat_id}"
         )
         winner_label = "followup"
     else:
         followup_slot = normalize_slot(slot or (pool_cfg.active_slot() if pool_cfg else "/u/0/"))
+        followup_url_slot = _url_slot_for_account(followup_slot, isolated_profile=False)
         followup_chat_id = "(new-followup-chat)"
-        followup_chat_url = f"https://gemini.google.com/u/0/app"
+        followup_chat_url = f"https://gemini.google.com{followup_url_slot}app"
         winner_label = "followup"
 
     new_slot = pick_new_session_slot(pool_cfg, followup_slot, preferred_slot=second_slot)

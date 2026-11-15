@@ -9554,6 +9554,25 @@ def run_preflight_selftest_cli(headless: bool = True, require_extension: bool = 
     if not r24_wu.get("ok"):
         print(f"[ERROR] Round 24 work-units self-test failed: {r24_wu}", file=sys.stderr)
         return EXIT_PREFLIGHT_FAILED
+    print(
+        f"  Round 24 work units   : OK ({r24_wu.get('passed')}/{r24_wu.get('total')} cases in "
+        f"{r24_wu.get('elapsed_ms')} ms: W1 base64 cap={r24_wu.get('base64_cap_bytes')}B + CDP zero-copy, "
+        f"W2 --account-index + resolved URLs, W3 100MB cap + fresh-chat guard + upload state)"
+    )
+    try:
+        from test_round26_composer_clear import run_round26_suite
+
+        r26_rep = run_round26_suite()
+    except Exception as r26_exc:
+        print(f"[ERROR] Round 26 composer-clear self-test could not run: {r26_exc}", file=sys.stderr)
+        return EXIT_PREFLIGHT_FAILED
+    if not r26_rep.get("ok"):
+        print(f"[ERROR] Round 26 composer-clear self-test failed: {r26_rep}", file=sys.stderr)
+        return EXIT_PREFLIGHT_FAILED
+    print(
+        f"  Round 26 composer     : OK ({r26_rep.get('passed')}/{r26_rep.get('total')} cases in "
+        f"{r26_rep.get('elapsed_ms')} ms: DOM clear, foreign text preserved, queued-steering-turn & extension disarm verified)"
+    )
     try:
         from test_round27_two_lane import run_round27_two_lane_suite
 
@@ -9566,26 +9585,7 @@ def run_preflight_selftest_cli(headless: bool = True, require_extension: bool = 
         return EXIT_PREFLIGHT_FAILED
     print(
         f"  Round 27 two-lane+ext : OK ({r27_rep.get('passed')}/{r27_rep.get('total')} cases in "
-        f"{r27_rep.get('elapsed_ms')} ms: W1-W7 + Contracts 1-6 verified)"
-    )
-    print(
-        f"  Round 24 work units   : OK ({r24_wu.get('passed')}/{r24_wu.get('total')} cases in "
-        f"{r24_wu.get('elapsed_ms')} ms: W1 base64 cap={r24_wu.get('base64_cap_bytes')}B + CDP zero-copy, "
-        f"W2 --account-index + resolved URLs, W3 100MB cap + fresh-chat guard + upload state)"
-    )
-    try:
-        from test_round27_two_lane import run_round27_suite
-
-        r27_rep = run_round27_suite()
-    except Exception as r27_exc:
-        print(f"[ERROR] Round 27 two-lane & contracts self-test could not run: {r27_exc}", file=sys.stderr)
-        return EXIT_PREFLIGHT_FAILED
-    if not r27_rep.get("ok"):
-        print(f"[ERROR] Round 27 two-lane & contracts self-test failed: {r27_rep}", file=sys.stderr)
-        return EXIT_PREFLIGHT_FAILED
-    print(
-        f"  Round 27 contracts    : OK ({r27_rep.get('passed')}/{r27_rep.get('total')} cases in "
-        f"{r27_rep.get('elapsed_ms')} ms: Contracts 1-6 + W1-W7 verified across Core and Extension)"
+        f"{r27_rep.get('elapsed_ms')} ms: W1-W7 + Contracts 1-6 verified across Core and Extension)"
     )
     return EXIT_SUCCESS
 

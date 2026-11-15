@@ -1760,34 +1760,6 @@ def _install_cdp_playwright_fallback_if_missing() -> None:
         def wait_for_timeout(self, ms: float) -> None:
             time.sleep(max(0.0, float(ms) / 1000.0))
 
-        @property
-        def keyboard(self) -> Any:
-            pg = self
-
-            class _KeyboardShim:
-                def press(self, key_combo: str, **_kw: Any) -> None:
-                    combo = str(key_combo or "")
-                    ctrl = "Control+" in combo or "Meta+" in combo
-                    key_name = combo.split("+")[-1] if "+" in combo else combo
-                    try:
-                        pg.evaluate(
-                            "([k, c]) => { const el = document.activeElement || document.body; if (!el) return; el.dispatchEvent(new KeyboardEvent('keydown', { key: k, code: k, ctrlKey: Boolean(c), bubbles: true, cancelable: true })); }",
-                            [key_name, ctrl],
-                        )
-                    except Exception:
-                        pass
-
-                def insert_text(self, txt: str) -> None:
-                    try:
-                        pg.evaluate(
-                            "(t) => { const el = document.activeElement; if (el) { el.textContent = (el.textContent || '') + String(t || ''); el.dispatchEvent(new InputEvent('input', { bubbles: true, data: String(t || '') })); } }",
-                            str(txt or ""),
-                        )
-                    except Exception:
-                        pass
-
-            return _KeyboardShim()
-
     class _BrowserShim:
         def __init__(self, prof_dir: Path, ws: Any) -> None:
             self._prof_dir = prof_dir
