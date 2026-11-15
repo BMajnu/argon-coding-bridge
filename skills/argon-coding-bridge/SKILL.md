@@ -267,36 +267,39 @@ Why: a browser tool call on a browser that is not running FAILS, so the prompt a
 
 Fix a browser that will not open BEFORE you go on. Never send into a closed browser.
 
-### Step 4 - Hand over the manual-send material (Rule 11)
+### Step 4 - Hand over the manual-send material (Rule 11, W4 & W6 R6.3-R6.4)
 
 Command:
 `python "./skills/argon-coding-bridge/scripts/dispatch_argon.py" --project-path . --manual-handoff --lane followup --slot "<slot>"`
 
 Why: for every new request the material for a MANUAL send is handed over BEFORE the
-      automatic send starts - not at the end, not only after a failure. The pack holds
-      the exact prompt file, the prompt text and the `argon_context.zip` path, and the
-      browser of Step 3 is already open, so a human can click and send at any moment.
+      automatic send starts - not at the end, not only after a failure. The pack (`manual_handoff.md` and `handoff.json`) holds
+      the exact recorded conversation URL, the lane, the account e-mail, the prompt file path, the `argon_context.zip` path (plus the archive stamp already in the conversation and any focused archive path), the expected delivery file name (`apply_changes.ps1`), and **the SHA-256 of every earlier delivery**.
+
+- **Manual-send rule (R6.4)**: When sending by hand, open the **RECORDED conversation** (the exact quoted `chat_url` in `manual_handoff.md`), never whatever chat happens to be open. Attach the ZIP in the composer and **verify the attachment chip is visible in the composer BEFORE sending** the prompt.
+- **Manual-download rule (R6.3)**: Download **ONLY the `apply_changes.ps1` chip in the NEWEST assistant turn of THAT conversation** - **never an earlier turn's chip and never an item from the browser's download list** (the download list is not the delivery). Always compare the downloaded file's SHA-256 against the `DeliveryLedger` digests listed in `manual_handoff.md` before applying.
 
 Give the user the prompt path and the zip path in your reply, and keep the pack
 updated on every attempt of the ladder (Rule 8).
 
-### Step 5 - Send the FOLLOW-UP first
+### Step 5 - Send the FOLLOW-UP first (W1 & W6 R6.1-R6.2)
 Command:  `python "./skills/argon-coding-bridge/scripts/dispatch_argon.py" --project-path . --task "<task>" --slot "<the account that holds the chat>" --lane followup`
 Why:  the follow-up runs in the conversation that already knows this codebase.
-      Send this one FIRST and let it finish.
+      **a follow-up NEVER opens a new chat; if it cannot continue the recorded conversation it STOPS and reports - it never sends a new session instead.**
+      When the project's code changed since the conversation's archive was built, the follow-up attaches a small **focused archive** (`argon_focused_context.zip` with `FOCUS_MANIFEST.md` and only the changed files); if even a focused archive cannot be attached, it states so by name and switches to a fresh chat with the full archive so Argon never works from a stale tree.
+      Send this lane FIRST and read its step screenshot before starting the second lane.
 
-### Step 6 - CHECK the follow-up before you go on
-Read the screenshot of the run (the path is printed) and check three things:
-  a. the conversation was in TASK mode (not Chat),
-  b. the model chip said 4 Argon,
-  c. Argon produced a real answer, not a chat-style reply.
-If anything is wrong, FIX IT FIRST and send the follow-up again.
-Only when the follow-up is confirmed good do you continue to Step 7.
+### Step 6 - CHECK the follow-up screenshot and lane plan BEFORE the second lane is sent (W2 & W6 R6.2, R6.6)
+The agent **reads the step screenshot of EVERY step before acting**. After Step 5, read the step screenshot (the path is printed) and check four things:
+  a. the lane plan was satisfied (`lane: followup -> continuing chat <id> (<url>)` on the recorded conversation, never a new chat),
+  b. the conversation was in TASK mode (not Chat),
+  c. the model chip said `Code & analysis 4 Argon` (never Flash, never Hydrogen),
+  d. Argon produced a real answer, not a chat-style reply.
+**A lane-plan mismatch is fixed BEFORE the second lane is sent.** Only when the follow-up is confirmed on its recorded conversation do you continue to Step 7.
 
-### Step 7 - Then run the NEW task
-Command:  `python "./skills/argon-coding-bridge/scripts/dispatch_argon.py" --project-path . --task "<task>" --new-session --slot "<another account>"`
-Why:  a new task belongs in a new conversation, on a different account, so the
-      two runs never collide.
+### Step 7 - Then run the NEW lane (Two-Lane Recipe: Follow-Up + New, Never Two New Lanes — W2 & W6 R6.2)
+Command:  `python "./skills/argon-coding-bridge/scripts/dispatch_argon.py" --project-path . --task "<task>" --new-session --lane new --slot "<another account>"`
+Why:  the two-lane recipe is explicitly **follow-up (recorded chat, its own account) + new (fresh chat, another account) - never two new lanes**. The agent runs the follow-up lane first, reads its step screenshot, fixes any lane-plan mismatch, and only then runs the new lane on a different account.
 
 ### The bounded retry ladder (send failures AND delivery failures)
 
@@ -371,7 +374,9 @@ Why:  releases the task in `~/.gemini/argon_tasks.json` so the next round sees
 | **The answer is a chat-style reply instead of work** | The prompt went out in Chat mode. | Open a new chat (`--new-session`), switch it to Task mode, check the `4 Argon` chip in `.argon_backup/shots/<NN>-preflight.png`, and resend. |
 | **Gemini says the archive is unreadable / binary data** | Binary files (fonts, images, media, or non-UTF-8 data) were included in the archive. | The packager must exclude every binary file by extension and 8 KB NUL/UTF-8 content check and enforce the 100 MB archive cap; re-run `package_context.py` to rebuild `argon_context.zip`. |
 | **The prompt landed in an old conversation** | The new chat was not verified empty after loading. | The run must verify after the conversation loads that there are zero user messages and zero assistant turns and report the `chat_id` it used; re-run with `--new-session`. |
-| **Old delivery downloaded again** | A previous round's `apply_changes.ps1` chip was downloaded and matched a digest in `DeliveryLedger` or an existing patch. | `_is_leftover_delivery` refuses the duplicate, **keeps** the rejected file in `.argon_quarantine/<timestamp>_apply_changes.ps1` at a printed absolute path (never deleting it), names the exact duplicate SHA-256 check that failed, and stops capturing that chip. Follow the bounded retry ladder. |
+| **The follow-up opened a new chat** | `--lane followup` was omitted, or had no recorded conversation in `TaskState` / `SessionStore`, or navigated to `/app` instead of the recorded `/app/<chat_id>`. | **a follow-up NEVER opens a new chat; if it cannot continue the recorded conversation it STOPS and reports - it never sends a new session instead.** Verify `lane: followup -> continuing chat <id>` and fix any `lane plan VIOLATED: the follow-up opened a new chat` BEFORE sending the second lane. |
+| **The old delivery was downloaded again** | An earlier turn's chip or an item from the browser's download list was taken instead of the newest assistant turn's chip, or Argon re-attached an old file whose SHA-256 is already in `DeliveryLedger`. | Capture considers ONLY the chips of the newest assistant turn (never an earlier turn and never the browser's download list), and refuses any digest matching an earlier round with `this is round <id>'s delivery (sha256 ...), not a new one - the capture refuses it`. |
+| **The installer applied an older patch** | `Run-ArgonPatch.ps1` previously sorted downloads by `LastWriteTime`, so a re-downloaded old patch looked newest and got applied again. | `Run-ArgonPatch.ps1` now selects the patch by `DeliveryLedger` / `TaskState` (never by `LastWriteTime`), prints all candidates with their SHA-256 and ledger decision, and refuses any file whose SHA-256 belongs to an older round unless `-Force` is passed. |
 | **No download after the task finished** | Argon finished answering inline or the viewer toolbar button did not trigger before timeout. | Read `.argon_backup/shots/<NN>-delivered.png` or `failed.png`; if a chip is visible in the newest turn, run `--resume` to capture it or download `apply_changes.ps1` from the viewer toolbar and run `Open_Argon_Apply.bat`. |
 | **Browser opens again and again** | A retry loop re-opened the preview or re-dispatched without checking `TaskState` / `DeliveryLedger`. | Single-capture mode exits immediately after one valid toolbar download. Use `--list-tasks` to inspect active runs. |
 | **A task is already running on this account (`EXIT_ALREADY_RUNNING = 9`)** | `TaskState` or `TaskRegistry` shows an in-flight `sent` or `waiting` task for this exact project/lane. | Read the printed screenshot path with your image reader; run `--resume` to wait for the running task, or pass `--force` to explicitly mark the old task `superseded` and start fresh. |
@@ -853,11 +858,11 @@ understanding, the earlier decisions and the earlier ideas in front of it. Only 
 archive is new - it is the current state of the files.
 
 ```bash
-# Uses the project's existing conversation when there is one.
-python "./skills/argon-coding-bridge/scripts/dispatch_argon.py" --task "Next change" --project-path .
+# Continue the project's recorded conversation (MUST pass --lane followup explicitly):
+python "./skills/argon-coding-bridge/scripts/dispatch_argon.py" --task "Next change" --project-path . --lane followup
 
 # Force a brand new conversation for this project:
-python "./skills/argon-coding-bridge/scripts/dispatch_argon.py" --task "Next change" --project-path . --new-session
+python "./skills/argon-coding-bridge/scripts/dispatch_argon.py" --task "Next change" --project-path . --new-session --lane new
 
 # Dual-session dispatch (follow-up in the recorded winning chat + brand-new chat on a second slot):
 python "./skills/argon-coding-bridge/scripts/dispatch_argon.py" --dual --task "Next change" --project-path .

@@ -2094,7 +2094,19 @@ def install_round23_bridge_hooks(ns: Dict[str, Any]) -> None:
             # 2. Clamp viewer geometry before any click so overflowing <pre> never wedges layout (Rule R11)
             _normalize_viewer_geometry(page)
 
+            # W3 (R3.1): Refuse any chip that is not in the newest assistant turn after the last user message.
+            after_user_fn = ns.get("_element_is_after_last_user_turn")
+            if chip is not None and callable(after_user_fn) and not after_user_fn(chip):
+                print(
+                    "[!] Refusing to open delivery chip: it belongs to an earlier turn before the last user message.",
+                    file=sys.stderr,
+                )
+                return None
+
             result_path: Optional[Path] = None
+            is_leftover_fn = ns.get("_is_leftover_delivery")
+            infer_proj_fn = ns.get("_infer_project_root_from_dest")
+            eff_proj = project_path or (infer_proj_fn(dest_dir) if callable(infer_proj_fn) else None)
             try:
                 # If the viewer click is simulated/known to overflow or hang, bound it strictly and fall back to Drive viewer/text
                 if getattr(page, "_argon_overflow_viewer_hang_click", False) and callable(orig_download_from_drive_text):
@@ -2110,17 +2122,31 @@ def install_round23_bridge_hooks(ns: Dict[str, Any]) -> None:
                         previous_hashes=previous_hashes,
                         chip=chip,
                         timeout_seconds=timeout_seconds,
-                        project_path=project_path,
+                        project_path=eff_proj,
                     )
-                if result_path is None and callable(orig_download_from_drive_text):
+                capture_exhausted = bool(getattr(page, "_argon_chip_capture_exhausted", False))
+                if result_path is None and not capture_exhausted and callable(orig_download_from_drive_text):
                     dt_path, _ = orig_download_from_drive_text(page, dest_dir)
                     if dt_path is not None and dt_path.is_file():
-                        result_path = dt_path
-                if result_path is None and callable(orig_read_senna_preview_text):
+                        dt_txt = dt_path.read_text(encoding="utf-8", errors="replace")
+                        if callable(is_leftover_fn) and is_leftover_fn(
+                            dt_txt, previous_hashes, project_path=eff_proj, exclude_path=dt_path
+                        ):
+                            try:
+                                dt_path.unlink()
+                            except Exception:
+                                pass
+                        else:
+                            result_path = dt_path
+                if result_path is None and not capture_exhausted and callable(orig_read_senna_preview_text):
                     raw_pre = orig_read_senna_preview_text(page, chip=chip)
                     if raw_pre:
                         clean_pre = orig_strip_viewer_tail(raw_pre) if callable(orig_strip_viewer_tail) else raw_pre
-                        if (not callable(orig_looks_like_patch) or orig_looks_like_patch(clean_pre)) and (
+                        if callable(is_leftover_fn) and is_leftover_fn(
+                            clean_pre, previous_hashes, project_path=eff_proj
+                        ):
+                            result_path = None
+                        elif (not callable(orig_looks_like_patch) or orig_looks_like_patch(clean_pre)) and (
                             not callable(orig_patch_is_complete) or orig_patch_is_complete(clean_pre)
                         ):
                             out_f = dest_dir / "apply_changes.ps1"
@@ -2133,6 +2159,7 @@ def install_round23_bridge_hooks(ns: Dict[str, Any]) -> None:
             if result_path is not None and Path(result_path).is_file():
                 try:
                     dl_txt_proof = Path(result_path).read_text(encoding="utf-8", errors="replace")
+                    byte_sz_val = len(dl_txt_proof.encode("utf-8"))
                     sha_fn = ns.get("_sha256_full")
                     sha_val = sha_fn(dl_txt_proof) if callable(sha_fn) else ""
                     ext_cid_fn = ns.get("_extract_chat_id")
@@ -2144,17 +2171,36 @@ def install_round23_bridge_hooks(ns: Dict[str, Any]) -> None:
                     turns_fn = ns.get("_assistant_turns")
                     turns_list = turns_fn(page) if callable(turns_fn) else []
                     turn_idx_val = max(0, len(turns_list) - 1) if turns_list else 0
+                    ledger_cls = ns.get("DeliveryLedger")
+                    ledger_rec: Dict[str, Any] = {}
+                    if eff_proj is not None and callable(ledger_cls):
+                        ledger_rec = ledger_cls().record(
+                            eff_proj,
+                            dl_txt_proof,
+                            chat_id=cid_val,
+                            file_path=str(result_path),
+                        )
+                    else:
+                        ledger_rec = {
+                            "sha256": sha_val,
+                            "chat_id": cid_val,
+                            "file_path": str(result_path),
+                        }
                     proof_obj = {
                         "chat_id": cid_val,
                         "turn_index": turn_idx_val,
                         "file_name": Path(result_path).name,
+                        "byte_size": byte_sz_val,
                         "sha256": sha_val,
+                        "ledger_entry": ledger_rec,
                     }
                     if getattr(page, "_argon_last_capture_proof", None) != proof_obj:
                         setattr(page, "_argon_last_capture_proof", proof_obj)
                         print(
                             f"[+] Delivery chip proof: chat_id={cid_val or '(unknown)'} | "
-                            f"turn_index={turn_idx_val} | file_name={Path(result_path).name} | sha256={sha_val}"
+                            f"turn_index={turn_idx_val} | file_name={Path(result_path).name} | "
+                            f"byte_size={byte_sz_val} | sha256={sha_val} | "
+                            f"ledger_entry={json.dumps(ledger_rec, sort_keys=True)}"
                         )
                 except Exception:
                     pass

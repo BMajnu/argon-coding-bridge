@@ -340,8 +340,10 @@ def build_followup_prompt(
     diagnostic_evidence: Optional[Dict[str, Any]] = None,
     winning_chat_id: str = "",
     winning_slot: str = "",
+    conversation_archive: Optional[Dict[str, Any]] = None,
+    focused_archive: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """Build the FOLLOW-UP prompt for a chat that already holds the earlier project work."""
+    """Build the FOLLOW-UP prompt for a chat that already holds the earlier project work (W8 R8.1, R8.2)."""
     base = build_surgical_prompt(
         task_description=task_description,
         target_directory=target_directory,
@@ -353,18 +355,61 @@ def build_followup_prompt(
     if lines and lines[0].startswith("I have uploaded the relevant codebase context"):
         lines[0] = DUAL_FOLLOWUP_HEADER
     rebuilt = "\n".join(lines) + "\n"
+
+    extra_note_lines: List[str] = []
     provenance_parts = []
     if winning_slot:
         provenance_parts.append(f"slot `{winning_slot}`")
     if winning_chat_id:
         provenance_parts.append(f"conversation `{winning_chat_id}`")
     if provenance_parts:
-        prov_line = (
+        extra_note_lines.append(
             "- Winning session provenance: this follow-up continues in "
             + ", ".join(provenance_parts)
             + " (the winning session from the previous round)."
         )
-        rebuilt = rebuilt.replace(CONTINUATION_NOTE, CONTINUATION_NOTE + "\n" + prov_line, 1)
+
+    # W8 (R8.1): State the archive that is already in the conversation (file name + byte size + SHA-256 + commit)
+    conv_arch: Dict[str, Any] = dict(conversation_archive) if isinstance(conversation_archive, dict) else {}
+    if not conv_arch and target_directory:
+        try:
+            from package_context import read_archive_stamp
+
+            t_root = Path(target_directory).resolve()
+            conv_arch = read_archive_stamp(t_root / "argon_context.zip", t_root)
+        except Exception:
+            conv_arch = {}
+    if conv_arch:
+        c_fname = str(conv_arch.get("file_name") or "argon_context.zip")
+        c_size = int(conv_arch.get("byte_size") or 0)
+        c_sha = str(conv_arch.get("sha256") or conv_arch.get("archive_sha256") or "(unknown)")
+        c_commit = str(conv_arch.get("git_commit") or conv_arch.get("commit") or "(unknown)")
+        extra_note_lines.append(
+            f"- Archive already in conversation: `{c_fname}` "
+            f"(size=`{c_size}` bytes, sha256=`{c_sha}`, commit=`{c_commit}`)."
+        )
+
+    # W8 (R8.2): When code changed since the base archive, state the attached FOCUSED archive
+    if isinstance(focused_archive, dict) and (focused_archive.get("needed") or focused_archive.get("changed_files")):
+        f_fname = str(focused_archive.get("file_name") or "argon_focused_context.zip")
+        f_size = int(focused_archive.get("byte_size") or 0)
+        f_sha = str(focused_archive.get("sha256") or focused_archive.get("payload_sha256") or "")
+        f_base_c = str(focused_archive.get("base_commit") or "")
+        f_cur_c = str(focused_archive.get("current_commit") or "")
+        f_changed = list(focused_archive.get("changed_files") or [])
+        extra_note_lines.append(
+            f"- Focused archive attached for changed files: `{f_fname}` "
+            f"(size=`{f_size}` bytes, sha256=`{f_sha}`, base_commit=`{f_base_c}` -> current_commit=`{f_cur_c}`, "
+            f"changed_files={len(f_changed)}: {', '.join(f_changed[:12])}). "
+            "Read `FOCUS_MANIFEST.md` in the focused archive for the updated files."
+        )
+
+    if extra_note_lines:
+        rebuilt = rebuilt.replace(
+            CONTINUATION_NOTE,
+            CONTINUATION_NOTE + "\n" + "\n".join(extra_note_lines),
+            1,
+        )
     return _ensure_no_guessing_rule(rebuilt)
 
 
@@ -1325,33 +1370,58 @@ def _chip_matches_patch_name(chip) -> bool:
 
 
 def _element_is_after_last_user_turn(el) -> bool:
-    """Return True when no user message appears after `el` in document order (D1.3).
+    """Return True ONLY when `el` is in the newest assistant turn after the last user message (D1.3, W3 R3.1).
 
     In a follow-up conversation that already holds an earlier delivery, an
     earlier round's assistant turn (and its chip) precedes the newest user
-    message in the DOM. Checking document position guarantees that an earlier
-    round's chip is never mistaken for the newest assistant turn's delivery.
+    message or a newer assistant turn in the DOM. Checking document position
+    against BOTH the last user message and the newest assistant turn guarantees
+    that an earlier round's chip is never opened.
     When evaluation fails, returns False so an older turn's chip is never opened.
     """
     try:
         return bool(
             el.evaluate(
                 """node => {
-                    const selectors = [
+                    if (!node) return false;
+                    const userSelectors = [
                         'user-query',
                         '[data-test-id="user-query"]',
                         '.user-query-text',
                         '.query-text',
                         'message-turn.user-query',
-                        'div.user-query'
+                        'div.user-query',
+                        '.user-turn'
                     ];
-                    const users = document.querySelectorAll(selectors.join(','));
-                    if (!users || !users.length) return true;
-                    const lastUser = users[users.length - 1];
-                    if (lastUser === node || lastUser.contains(node)) return false;
-                    const pos = node.compareDocumentPosition(lastUser);
-                    if (pos & Node.DOCUMENT_POSITION_FOLLOWING) {
-                        return false;
+                    const users = document.querySelectorAll(userSelectors.join(','));
+                    if (users && users.length) {
+                        const lastUser = users[users.length - 1];
+                        if (lastUser === node || lastUser.contains(node)) return false;
+                        const pos = node.compareDocumentPosition(lastUser);
+                        if (pos & Node.DOCUMENT_POSITION_FOLLOWING) {
+                            return false;
+                        }
+                    }
+                    const assistantSelectors = [
+                        'model-response',
+                        '[data-test-id="model-response"]',
+                        '.model-response-text',
+                        'message-turn.model-response',
+                        'div.model-response',
+                        '.model-turn'
+                    ];
+                    for (const aSel of assistantSelectors) {
+                        const aTurns = document.querySelectorAll(aSel);
+                        if (aTurns && aTurns.length > 1) {
+                            const newestTurn = aTurns[aTurns.length - 1];
+                            if (node !== newestTurn && !newestTurn.contains(node) && !node.contains(newestTurn)) {
+                                const aPos = node.compareDocumentPosition(newestTurn);
+                                if (aPos & Node.DOCUMENT_POSITION_FOLLOWING) {
+                                    return false;
+                                }
+                            }
+                            break;
+                        }
                     }
                     return true;
                 }"""
@@ -1407,6 +1477,8 @@ def _generated_file_chip(page):
                 return matched_in_turn[-1]
         except Exception:
             pass
+        # W3 (R3.1): When assistant turns exist in the DOM, NEVER fall back to chips outside `turns[-1]`.
+        return None
 
     patch_items = [
         item["chip"]
@@ -1515,6 +1587,8 @@ def _new_delivery_chip(page, chips_before: int, responses_before: int):
                 cand = chips.nth(j)
                 if not _safe_visible(cand):
                     continue
+                if not _element_is_after_last_user_turn(cand):
+                    continue
                 if _chip_matches_patch_name(cand):
                     matched.append(cand)
             if matched:
@@ -1522,6 +1596,8 @@ def _new_delivery_chip(page, chips_before: int, responses_before: int):
                 return matched[-1]
         except Exception:
             pass
+        # W3 (R3.1): When assistant turns exist, never fall back to chips outside the newest assistant turn.
+        return None
 
     try:
         all_chips = page.locator("generated-file")
@@ -2773,6 +2849,28 @@ def _sha256_full(text: str) -> str:
         return ""
 
 
+def _sha256_file(path: Any) -> str:
+    """SHA-256 of a file's RAW BYTES.
+
+    `_hash_text` hashes the raw TEXT (trailing newline included) and `_sha256_full` hashes
+    the STRIPPED text, so neither of them equals the digest the operating system reports
+    for the file on disk. The ledger therefore also stores the file's own digest
+    (`file_sha256`) - that is the value the duplicate check must compare, because it is the
+    value that describes the file that is about to be applied (Round 24/28 review).
+    """
+    try:
+        p = Path(str(path)).expanduser()
+        if not p.is_file():
+            return ""
+        h = hashlib.sha256()
+        with p.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return ""
+
+
 class DeliveryLedger:
     """Per-project delivery ledger tracking every handled patch by SHA-256, chat_id, round_id, and timestamp (D1.2)."""
 
@@ -2819,19 +2917,28 @@ class DeliveryLedger:
         projects[canonical] = []
         return projects[canonical]
 
-    def lookup_digest(self, project_path: Any, text: str) -> Optional[Dict[str, Any]]:
-        """Return the ledger record if `text` was already handled for `project_path` or across any project, else None."""
+    def lookup_digest(
+        self,
+        project_path: Any,
+        text: str,
+        file_path: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        """Return the ledger record if `text` (or the file it came from) was already handled."""
         if not text or not text.strip():
             return None
         short_h = _hash_text(text)
         full_h = _sha256_full(text)
         short_norm = _hash_text(text.replace("\r\n", "\n").strip())
+        file_h = _sha256_file(file_path) if file_path else ""
         for entry in self._proj_entries(project_path):
             if not isinstance(entry, dict):
                 continue
             eh_short = str(entry.get("short_hash") or "")
             eh_full = str(entry.get("sha256") or "")
+            eh_file = str(entry.get("file_sha256") or "")
             if (short_h and eh_short in (short_h, short_norm)) or (full_h and eh_full == full_h):
+                return entry
+            if file_h and eh_file and eh_file == file_h:
                 return entry
         self.load()
         projects = self.data.get("projects", {})
@@ -2843,7 +2950,10 @@ class DeliveryLedger:
                             continue
                         eh_short = str(entry.get("short_hash") or "")
                         eh_full = str(entry.get("sha256") or "")
+                        eh_file = str(entry.get("file_sha256") or "")
                         if (short_h and eh_short in (short_h, short_norm)) or (full_h and eh_full == full_h):
+                            return entry
+                        if file_h and eh_file and eh_file == file_h:
                             return entry
         return None
 
@@ -2856,6 +2966,8 @@ class DeliveryLedger:
                     out.add(str(entry["short_hash"]))
                 if entry.get("sha256"):
                     out.add(str(entry["sha256"]))
+                if entry.get("file_sha256"):
+                    out.add(str(entry["file_sha256"]))
         return out
 
     def record(
@@ -2868,13 +2980,17 @@ class DeliveryLedger:
         file_path: str = "",
     ) -> Dict[str, Any]:
         """Record a handled delivery in the ledger so it is never downloaded again."""
-        existing = self.lookup_digest(project_path, text)
+        existing = self.lookup_digest(project_path, text, file_path=file_path)
         if existing is not None:
             return existing
         entries = self._proj_entries(project_path)
         rec = {
             "short_hash": _hash_text(text),
             "sha256": _sha256_full(text),
+            # The digest of the FILE on disk (raw bytes). `_hash_text` hashes the raw text
+            # and `_sha256_full` the stripped text, so neither matches what the OS reports
+            # for the file - this one does (Round 24/28 review).
+            "file_sha256": _sha256_file(file_path) if file_path else "",
             "chat_id": str(chat_id or ""),
             "round_id": str(round_id or time.strftime("%Y%m%d_%H%M%S")),
             "lane": str(lane or ""),
@@ -2937,10 +3053,13 @@ def _is_leftover_delivery(
             if ledger_hit is not None:
                 hit_round = ledger_hit.get("round_id") or "previous"
                 same_digest_line = f"same digest as round {hit_round} - Argon re-attached the same file"
+                refusal_line = f"this is round {hit_round}'s delivery (sha256 {full_sha}), not a new one - the capture refuses it"
                 print(f"[!] {same_digest_line}")
+                print(f"[!] {refusal_line}")
                 print(
                     f"\n[!] REFUSED DUPLICATE DELIVERY:\n"
                     f"    SHA-256  : {full_sha}\n"
+                    f"    {refusal_line}\n"
                     f"    {same_digest_line}\n"
                     f"    Duplicate: round {hit_round} "
                     f"(chat={ledger_hit.get('chat_id') or '?'}, captured_at={ledger_hit.get('timestamp') or '?'}, "
@@ -2954,9 +3073,12 @@ def _is_leftover_delivery(
             pass
     if previous_hashes and ((digest and digest in previous_hashes) or (full_sha and full_sha in previous_hashes)):
         reattach_msg = "same digest as round previous - Argon re-attached the same file"
+        refusal_line = f"this is round previous's delivery (sha256 {full_sha}), not a new one - the capture refuses it"
+        print(f"[!] {refusal_line}")
         print(
             f"\n[!] REFUSED DUPLICATE DELIVERY ({reattach_msg}):\n"
             f"    SHA-256  : {full_sha} (digest={digest})\n"
+            f"    {refusal_line}\n"
             f"    Duplicate: matches a known pre-existing hash from earlier rounds ({reattach_msg}).\n"
             f"    Waiting for the new delivery chip.",
             file=sys.stderr,
@@ -2980,10 +3102,14 @@ def _is_leftover_delivery(
                             try:
                                 content_f = ps1_file.read_text(encoding="utf-8", errors="replace")
                                 if _sha256_full(content_f) == full_sha:
-                                    reattach_msg = f"same digest as round {ps1_file.parent.name or 'previous'} - Argon re-attached the same file"
+                                    hit_r = ps1_file.parent.name or "previous"
+                                    reattach_msg = f"same digest as round {hit_r} - Argon re-attached the same file"
+                                    refusal_line = f"this is round {hit_r}'s delivery (sha256 {full_sha}), not a new one - the capture refuses it"
+                                    print(f"[!] {refusal_line}")
                                     print(
                                         f"\n[!] REFUSED DUPLICATE DELIVERY ({reattach_msg}):\n"
                                         f"    SHA-256  : {full_sha}\n"
+                                        f"    {refusal_line}\n"
                                         f"    Duplicate: byte-identical to existing repository patch: {ps1_file} ({reattach_msg})\n"
                                         f"    Waiting for the new delivery chip.",
                                         file=sys.stderr,
@@ -2994,6 +3120,233 @@ def _is_leftover_delivery(
         except Exception:
             pass
     return False
+
+
+def select_installer_patch_by_ledger(
+    project_path: Any,
+    patch_file: str = "",
+    search_paths: Optional[List[Union[str, Path]]] = None,
+    force: bool = False,
+    ledger_path: Optional[Path] = None,
+    task_state_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Select the patch file to apply using DeliveryLedger / TaskState, NEVER by LastWriteTime mtime (W5 R5.1-R5.3)."""
+    proj_root = Path(str(project_path)).expanduser().resolve()
+    ledger = DeliveryLedger(ledger_path)
+    entries = list(ledger._proj_entries(proj_root))
+    ts = TaskState(task_state_path)
+    ts_entry = ts.get(proj_root) or {}
+
+    current_ledger_entry = entries[-1] if entries else None
+    older_entries = entries[:-1] if len(entries) > 1 else []
+    older_by_sha: Dict[str, Dict[str, Any]] = {}
+    for oe in older_entries:
+        if isinstance(oe, dict) and oe.get("sha256"):
+            older_by_sha[str(oe["sha256"])] = oe
+
+    current_sha = str((current_ledger_entry or {}).get("sha256") or "")
+    current_short = str((current_ledger_entry or {}).get("short_hash") or (ts_entry.get("delivery_hash") or ""))
+    current_round = str((current_ledger_entry or {}).get("round_id") or "current")
+    current_recorded_path = str((ts_entry.get("delivered") or (current_ledger_entry or {}).get("file_path") or "")).strip()
+
+    # If TaskState explicitly points to a different delivery_hash than the last ledger entry, mark any non-matching ledger entry as older.
+    ts_deliv_hash = str(ts_entry.get("delivery_hash") or "").strip()
+    if ts_deliv_hash and current_ledger_entry and str(current_ledger_entry.get("short_hash") or "") != ts_deliv_hash:
+        for e in entries:
+            if isinstance(e, dict) and str(e.get("short_hash") or "") == ts_deliv_hash:
+                current_ledger_entry = e
+                current_sha = str(e.get("sha256") or "")
+                current_short = ts_deliv_hash
+                current_round = str(e.get("round_id") or "current")
+            elif isinstance(e, dict) and e.get("sha256"):
+                older_by_sha[str(e["sha256"])] = e
+
+    # R5.2: With -PatchFile given explicitly, that file wins (unless it matches an older ledger entry without -Force, R5.3).
+    if patch_file and str(patch_file).strip():
+        exp_path = Path(str(patch_file)).expanduser().resolve()
+        if not exp_path.is_file():
+            msg = f"The -PatchFile you specified does not exist: {exp_path}"
+            print(f"[ERROR] {msg}", file=sys.stderr)
+            return {"ok": False, "selected_path": None, "reason": msg, "candidates": [], "exit_code": 2}
+        exp_txt = exp_path.read_text(encoding="utf-8", errors="replace")
+        exp_sha = _sha256_full(exp_txt)
+        if exp_sha in older_by_sha and not force:
+            old_rec = older_by_sha[exp_sha]
+            old_rid = str(old_rec.get("round_id") or "previous")
+            msg = (
+                f"Refusing to apply older patch {exp_path.name} (sha256={exp_sha}): "
+                f"belongs to earlier round {old_rid} in DeliveryLedger (pass -Force to override)."
+            )
+            print(f"[ERROR] {msg}", file=sys.stderr)
+            return {
+                "ok": False,
+                "selected_path": None,
+                "reason": msg,
+                "refused_round_id": old_rid,
+                "sha256": exp_sha,
+                "candidates": [{"path": str(exp_path), "sha256": exp_sha, "decision": f"REFUSED (older round {old_rid})"}],
+                "exit_code": 5,
+            }
+        decision = f"SELECTED (explicit -PatchFile{' with -Force' if force else ''})"
+        print(f"[+] Installer ledger decision: {exp_path} | sha256={exp_sha} | {decision}")
+        return {
+            "ok": True,
+            "selected_path": exp_path,
+            "sha256": exp_sha,
+            "reason": decision,
+            "candidates": [{"path": str(exp_path), "sha256": exp_sha, "decision": decision}],
+            "exit_code": 0,
+        }
+
+    # Gather candidate files WITHOUT sorting by LastWriteTime to pick a winner (R5.1).
+    cand_paths: List[Path] = []
+    seen_p: set[str] = set()
+
+    def _add_cand_file(p: Path) -> None:
+        try:
+            rp = p.resolve()
+        except Exception:
+            rp = p
+        if not rp.is_file():
+            return
+        name_low = rp.name.lower()
+        if ".bak-" in name_low or name_low.startswith("apply_changes_round") or "round" in name_low and name_low.startswith("apply_changes "):
+            return
+        key = str(rp).lower() if os.name == "nt" else str(rp)
+        if key not in seen_p:
+            seen_p.add(key)
+            cand_paths.append(rp)
+
+    if current_recorded_path:
+        _add_cand_file(Path(current_recorded_path))
+
+    dirs_to_scan: List[Path] = [proj_root / "downloads"]
+    if search_paths:
+        for sp in search_paths:
+            if not sp:
+                continue
+            sp_p = Path(sp).expanduser()
+            if sp_p.is_file():
+                _add_cand_file(sp_p)
+            elif sp_p.is_dir():
+                dirs_to_scan.append(sp_p)
+
+    for d in dirs_to_scan:
+        if d.is_dir():
+            for f in sorted(d.glob("apply_changes*.ps1"), key=lambda x: x.name.lower()):
+                _add_cand_file(f)
+            for sub in ("followup", "new"):
+                sd = d / sub
+                if sd.is_dir():
+                    for f in sorted(sd.glob("apply_changes*.ps1"), key=lambda x: x.name.lower()):
+                        _add_cand_file(f)
+
+    candidate_reports: List[Dict[str, Any]] = []
+    matching_current: List[Path] = []
+    older_found: List[Tuple[Path, str, str]] = []
+    unrecorded_found: List[Tuple[Path, str]] = []
+
+    for cp in cand_paths:
+        txt = cp.read_text(encoding="utf-8", errors="replace")
+        c_sha = _sha256_full(txt)
+        c_short = _hash_text(txt)
+        if current_sha and c_sha == current_sha:
+            dec = f"CURRENT_LEDGER_MATCH (round {current_round})"
+            matching_current.append(cp)
+        elif current_short and c_short == current_short and c_sha not in older_by_sha:
+            dec = f"CURRENT_TASKSTATE_MATCH (round {current_round})"
+            matching_current.append(cp)
+        elif c_sha in older_by_sha:
+            o_rid = str(older_by_sha[c_sha].get("round_id") or "previous")
+            if force:
+                dec = f"OLDER_ROUND_ALLOWED_BY_FORCE (round {o_rid})"
+                matching_current.append(cp)
+            else:
+                dec = f"REFUSED_OLDER_ROUND (belongs to round {o_rid})"
+                older_found.append((cp, c_sha, o_rid))
+        else:
+            dec = "UNRECORDED_IN_LEDGER"
+            unrecorded_found.append((cp, c_sha))
+        candidate_reports.append({"path": str(cp), "sha256": c_sha, "decision": dec})
+
+    if len(candidate_reports) > 1 or older_found:
+        print("[i] Candidate patch files evaluated against DeliveryLedger (never sorted by LastWriteTime):")
+        for cr in candidate_reports:
+            print(f"    - {cr['path']} | sha256={cr['sha256']} | ledger_decision={cr['decision']}")
+
+    if matching_current:
+        # If multiple copies have the exact same current ledger SHA-256, prefer the recorded path; if distinct digests matched, refuse to guess.
+        unique_shas = {
+            _sha256_full(p.read_text(encoding="utf-8", errors="replace"))
+            for p in matching_current
+        }
+        if len(unique_shas) > 1:
+            msg = "Multiple candidate files with different SHA-256 digests matched; refusing to guess. Pass -PatchFile explicitly."
+            print(f"[ERROR] {msg}", file=sys.stderr)
+            return {"ok": False, "selected_path": None, "reason": msg, "candidates": candidate_reports, "exit_code": 5}
+        chosen = matching_current[0]
+        if current_recorded_path:
+            for mp in matching_current:
+                if str(mp) == str(Path(current_recorded_path).resolve()):
+                    chosen = mp
+                    break
+        chosen_sha = _sha256_full(chosen.read_text(encoding="utf-8", errors="replace"))
+        print(f"[+] Ledger decision: selected {chosen} (round={current_round}, sha256={chosen_sha})")
+        return {
+            "ok": True,
+            "selected_path": chosen,
+            "sha256": chosen_sha,
+            "round_id": current_round,
+            "reason": f"selected by DeliveryLedger (round {current_round})",
+            "candidates": candidate_reports,
+            "exit_code": 0,
+        }
+
+    if older_found and not unrecorded_found:
+        cp0, sha0, rid0 = older_found[0]
+        msg = (
+            f"Refusing to apply older patch {cp0.name} (sha256={sha0}): "
+            f"belongs to earlier round {rid0} in DeliveryLedger (pass -Force to override)."
+        )
+        print(f"[ERROR] {msg}", file=sys.stderr)
+        return {
+            "ok": False,
+            "selected_path": None,
+            "reason": msg,
+            "refused_round_id": rid0,
+            "sha256": sha0,
+            "candidates": candidate_reports,
+            "exit_code": 5,
+        }
+
+    if len(candidate_reports) > 1:
+        msg = (
+            f"Found {len(candidate_reports)} candidate patch files and none matches the current DeliveryLedger entry - "
+            "refusing to guess by LastWriteTime. Pass -PatchFile explicitly."
+        )
+        print(f"[ERROR] {msg}", file=sys.stderr)
+        return {
+            "ok": False,
+            "selected_path": None,
+            "reason": msg,
+            "candidates": candidate_reports,
+            "exit_code": 5,
+        }
+
+    if len(unrecorded_found) == 1 and not entries:
+        only_p, only_sha = unrecorded_found[0]
+        return {
+            "ok": True,
+            "selected_path": only_p,
+            "sha256": only_sha,
+            "reason": "single candidate (empty ledger)",
+            "candidates": candidate_reports,
+            "exit_code": 0,
+        }
+
+    msg = "No valid current delivery patch found in DeliveryLedger or searched folders."
+    print(f"[ERROR] {msg}", file=sys.stderr)
+    return {"ok": False, "selected_path": None, "reason": msg, "candidates": candidate_reports, "exit_code": 2}
 
 
 def _patch_is_complete(text: str) -> _PatchCheckResult:
@@ -3237,17 +3590,18 @@ def capture_generated_file(
                         downloaded = canonical_dest
                 except Exception:
                     pass
+                ledger_entry_created: Dict[str, Any] = {}
                 if proj_for_ledger is not None:
                     try:
                         cid_now = _extract_chat_id(str(getattr(page, "url", "") or "")) or ""
-                        DeliveryLedger().record(
+                        ledger_entry_created = DeliveryLedger().record(
                             proj_for_ledger,
                             dl_text,
                             chat_id=cid_now,
                             file_path=str(downloaded),
                         )
                     except Exception:
-                        pass
+                        ledger_entry_created = {}
                 try:
                     extra_assets = capture_additional_round_artifacts(page, dest_dir)
                     bundle_info = write_delivery_bundle(dest_dir, patch_path=downloaded, asset_paths=extra_assets)
@@ -3261,16 +3615,28 @@ def capture_generated_file(
                 turns_proof = _assistant_turns(page)
                 turn_idx_proof = max(0, len(turns_proof) - 1) if turns_proof else 0
                 sha_proof = _sha256_full(dl_text)
+                byte_sz_proof = len(dl_text.encode("utf-8"))
+                if not ledger_entry_created:
+                    ledger_entry_created = {
+                        "short_hash": _hash_text(dl_text),
+                        "sha256": sha_proof,
+                        "chat_id": cid_proof,
+                        "file_path": str(downloaded),
+                    }
                 proof_dict = {
                     "chat_id": cid_proof,
                     "turn_index": turn_idx_proof,
                     "file_name": downloaded.name,
+                    "byte_size": byte_sz_proof,
                     "sha256": sha_proof,
+                    "ledger_entry": ledger_entry_created,
                 }
                 setattr(page, "_argon_last_capture_proof", proof_dict)
                 print(
                     f"[+] Delivery chip proof: chat_id={cid_proof or '(unknown)'} | "
-                    f"turn_index={turn_idx_proof} | file_name={downloaded.name} | sha256={sha_proof}"
+                    f"turn_index={turn_idx_proof} | file_name={downloaded.name} | "
+                    f"byte_size={byte_sz_proof} | sha256={sha_proof} | "
+                    f"ledger_entry={json.dumps(ledger_entry_created, sort_keys=True)}"
                 )
                 print(
                     f"[+] Captured delivery file: {downloaded.name} "
@@ -6833,7 +7199,12 @@ def _inspect_zip_archive(zip_path: Path) -> tuple[bool, int, int, str]:
             members = zf.namelist()
             if not members:
                 return False, sz, 0, f"archive {zp.name} has 0 entries"
-            for req_member in ("TASK_BRIEF.md", "API_INDEX.md"):
+            req_members = (
+                ("FOCUS_MANIFEST.md",)
+                if "FOCUS_MANIFEST.md" in members
+                else ("TASK_BRIEF.md", "API_INDEX.md")
+            )
+            for req_member in req_members:
                 if req_member not in members:
                     return False, sz, len(members), f"archive {zp.name} is missing required member {req_member}"
                 raw_req = zf.read(req_member)
@@ -7462,17 +7833,53 @@ def attach_zip(page, zip_path: Path) -> bool:
     eff_b64_cap = get_effective_base64_attach_cap()
     has_existing_att, existing_att_detail = _conversation_holds_existing_attachment(page)
 
-    # Round 27 W1 R1.4 & W3 R3.3: In a continuation that already holds an attachment, skip attaching a second archive.
+    is_focused_archive = bool(getattr(page, "_argon_allow_focused_archive", False))
+    if not is_focused_archive:
+        try:
+            with zipfile.ZipFile(zp, "r") as _zf_chk:
+                if "FOCUS_MANIFEST.md" in _zf_chk.namelist():
+                    is_focused_archive = True
+        except Exception:
+            pass
+
+    # Round 27 W1 R1.4 & W3 R3.3 + Round 28 W8 R8.2/R8.3:
+    # - A full archive in a continuation that already holds an attachment is skipped.
+    # - A FOCUSED archive (carrying FOCUS_MANIFEST.md with only the files changed since the base archive)
+    #   IS allowed as a second small attachment in a continuation!
+    # - If even the focused archive cannot be attached (e.g. exceeds eff_b64_cap), say so by name and
+    #   flag `_argon_focused_archive_requires_fresh_chat = True` so the caller switches to a FRESH chat.
     if bool(getattr(page, "_argon_is_continuation", False)) and has_existing_att:
-        skip_msg = (
-            f"conversation already holds an attachment ({existing_att_detail}) - "
-            "skipping second archive attach in continuation"
+        if not is_focused_archive:
+            skip_msg = (
+                f"conversation already holds an attachment ({existing_att_detail}) - "
+                "skipping second archive attach in continuation"
+            )
+            print(f"[+] {skip_msg}")
+            setattr(page, "_argon_last_attach_path", "skipped_existing_in_continuation")
+            setattr(page, "_argon_skipped_second_archive", skip_msg)
+            setattr(page, "_argon_last_operation_error", None)
+            return True
+        if sz > eff_b64_cap:
+            fallback_reason = (
+                f"focused_archive_cannot_be_attached: focused archive {zp.name} ({sz} bytes) "
+                f"exceeds attach ceiling ({eff_b64_cap} bytes) in a conversation that already holds "
+                f"an attachment ({existing_att_detail}) - switching to a FRESH chat with the full archive"
+            )
+            print(f"[ERROR] {fallback_reason}", file=sys.stderr)
+            print(f"[!] {fallback_reason}")
+            setattr(page, "_argon_focused_archive_requires_fresh_chat", True)
+            setattr(page, "_argon_focused_archive_failure_reason", fallback_reason)
+            err = AttachOperationError(
+                fallback_reason,
+                path_used="focused_archive_guard",
+                elapsed_seconds=time.monotonic() - t0,
+            )
+            setattr(page, "_argon_last_operation_error", err)
+            return False
+        print(
+            f"[+] Conversation already holds base archive ({existing_att_detail}); "
+            f"allowing focused archive {zp.name} ({sz} bytes) with changed files in continuation (W8 R8.2)..."
         )
-        print(f"[+] {skip_msg}")
-        setattr(page, "_argon_last_attach_path", "skipped_existing_in_continuation")
-        setattr(page, "_argon_skipped_second_archive", skip_msg)
-        setattr(page, "_argon_last_operation_error", None)
-        return True
 
     # R3.2: An archive above MAX_BASE64_ATTACH_BYTES on a non-continuation page with an existing attachment is refused.
     if sz > eff_b64_cap and has_existing_att:
@@ -9586,6 +9993,24 @@ def run_preflight_selftest_cli(headless: bool = True, require_extension: bool = 
     print(
         f"  Round 27 two-lane+ext : OK ({r27_rep.get('passed')}/{r27_rep.get('total')} cases in "
         f"{r27_rep.get('elapsed_ms')} ms: W1-W7 + Contracts 1-6 verified across Core and Extension)"
+    )
+    # Round 28 (W1-W8): the lane plan, the delivery selection and the focused archive.
+    # Argon's own delivery carried this wiring, but its anchor text was the pre-review
+    # Round-27 print line, so the block no longer matched the tree and was skipped -
+    # it is re-anchored here to the current print line.
+    try:
+        from test_round28_lane_plan import run_round28_lane_plan_suite
+
+        r28_rep = run_round28_lane_plan_suite()
+    except Exception as r28_exc:
+        print(f"[ERROR] Round 28 lane-plan & delivery self-test could not run: {r28_exc}", file=sys.stderr)
+        return EXIT_PREFLIGHT_FAILED
+    if not r28_rep.get("ok"):
+        print(f"[ERROR] Round 28 lane-plan & delivery self-test failed: {r28_rep}", file=sys.stderr)
+        return EXIT_PREFLIGHT_FAILED
+    print(
+        f"  Round 28 lane+delivery: OK ({r28_rep.get('passed')}/{r28_rep.get('total')} cases in "
+        f"{r28_rep.get('elapsed_ms')} ms: W1-W8 followup refusal, two-lane plan, newest-turn capture, ledger installer & focused archive)"
     )
     return EXIT_SUCCESS
 
@@ -11770,7 +12195,7 @@ def check_concurrent_lane_guard(
     req_slot = normalize_slot(requested_slot) if requested_slot else ""
 
     reg.reclaim_dead_tasks(proj_root)
-    reg.prune_stale_tasks(proj_root)
+    reg.prune_stale_tasks()
 
     existing_lane_state = ts.get(proj_root, lane=requested_lane) if requested_lane else None
     if isinstance(existing_lane_state, dict):
@@ -11837,7 +12262,7 @@ def check_concurrent_lane_guard(
                 break
 
     if blocking_entry is None:
-        reg_active = reg.active_tasks_for_project(proj_root, lane=requested_lane, include_stale=False)
+        reg_active = reg.active_tasks_for_project(proj_root, lane=requested_lane)
         for ra_item in reg_active:
             ra_pid = int(ra_item.get("pid") or 0)
             if ra_pid and ra_pid != os.getpid() and not _pid_alive(ra_pid):
@@ -11941,94 +12366,322 @@ def resolve_lane_conversation(
     session_store: Optional[SessionStore] = None,
     task_state_store: Optional[TaskState] = None,
 ) -> Dict[str, Any]:
-    """Round 27 (W1.1-W1.3 & Contract 6 R6.2): Resolve the conversation for `--lane followup` vs `--lane new`.
+    """Round 28 (W1 R1.1-R1.3): Resolve the conversation for `--lane followup` vs `--lane new`.
 
-    - When `lane == 'followup'` and a recorded conversation exists, returns `is_continuation=True`,
-      the recorded `session`, its `slot`, and prints `lane: followup -> continuing chat <id> (<url>)`.
-    - When `lane == 'followup'` and NO recorded conversation exists, prints
-      `no recorded conversation for lane 'followup'` and `lane: followup -> NEW chat (no recorded conversation)`,
-      and returns `is_continuation=False`.
-    - When `lane == 'new'` or `new_session=True`, returns `is_continuation=False`.
+    - When `lane == 'followup'` and a recorded conversation exists in `TaskState` (`lanes['followup']`)
+      or `SessionStore`, returns `is_continuation=True`, `refused=False`, and prints:
+      `lane: followup -> continuing chat <id> (<url>)`.
+    - When `lane == 'followup'` and NO recorded conversation exists (or `new_session=True`),
+      STOPS and REFUSES with the named reason:
+      `followup has no recorded conversation for this project - refusing to start a new chat`
+      and prints `lane: followup -> REFUSED (no recorded conversation)`. Never falls through to a new chat.
     """
     ss = session_store or SessionStore()
     ts = task_state_store or TaskState()
     clean_lane = str(lane or "").strip().lower()
 
+    if clean_lane == "followup" and new_session:
+        refusal_reason = "followup has no recorded conversation for this project - refusing to start a new chat (--new-session cannot be combined with --lane followup)"
+        refusal_line = "lane: followup -> REFUSED (no recorded conversation)"
+        print(f"[ERROR] {refusal_reason}", file=sys.stderr)
+        print(f"[+] {refusal_line}")
+        return {
+            "session": None,
+            "is_continuation": False,
+            "refused": True,
+            "refusal_reason": refusal_reason,
+            "slot": active_slot,
+            "chat_id": "",
+            "chat_url": "",
+            "log_line": refusal_line,
+            "no_recorded_followup": True,
+            "exit_code": EXIT_PREFLIGHT_FAILED,
+        }
+
     if resume_chat or new_session or clean_lane == "new":
         if clean_lane == "new":
-            line = f"lane: new -> NEW chat on {active_slot}"
+            line = f"lane: new -> fresh chat on {active_slot}"
             print(f"[+] {line}")
             return {
                 "session": None,
                 "is_continuation": False,
+                "refused": False,
                 "slot": active_slot,
                 "chat_id": "",
                 "chat_url": "",
                 "log_line": line,
                 "no_recorded_followup": False,
+                "exit_code": EXIT_SUCCESS,
             }
         return {
             "session": None,
             "is_continuation": False,
+            "refused": False,
             "slot": active_slot,
             "chat_id": "",
             "chat_url": "",
             "log_line": "",
             "no_recorded_followup": False,
+            "exit_code": EXIT_SUCCESS,
         }
 
-    session = ss.lookup_for_lane(proj_root, lane=clean_lane or None, mode=mode, task_state_store=ts)
+    # R1.1: Check TaskState (`lanes['followup']`) and SessionStore (`ss.lookup`)
+    session: Optional[Dict[str, Any]] = None
+    if clean_lane == "followup":
+        ts_fol = ts.get(proj_root, lane="followup")
+        if isinstance(ts_fol, dict) and (ts_fol.get("chat_url") or ts_fol.get("chat_id")):
+            c_id_ts = str(ts_fol.get("chat_id") or _extract_chat_id(str(ts_fol.get("chat_url") or "")) or "").strip()
+            c_slot_ts = normalize_slot(str(ts_fol.get("slot") or active_slot))
+            c_url_ts = str(ts_fol.get("chat_url") or (f"https://gemini.google.com{c_slot_ts}app/{c_id_ts}" if c_id_ts else "")).strip()
+            if c_id_ts or c_url_ts:
+                session = dict(ts_fol)
+                session["chat_id"] = c_id_ts
+                session["chat_url"] = c_url_ts
+                session["slot"] = c_slot_ts
+                session.setdefault("mode", (mode or "gemini").strip().lower())
+
+    if session is None:
+        session = ss.lookup(
+            proj_root,
+            mode=mode,
+            lane=clean_lane or None,
+            slot=explicit_slot if clean_lane != "followup" else None,
+        )
+
+    if session is None and clean_lane == "followup":
+        for fb_lane in ("new", None):
+            ts_fb = ts.get(proj_root, lane=fb_lane) if fb_lane else ts.get(proj_root)
+            if isinstance(ts_fb, dict) and (ts_fb.get("chat_url") or ts_fb.get("chat_id")):
+                c_id_fb = str(ts_fb.get("chat_id") or _extract_chat_id(str(ts_fb.get("chat_url") or "")) or "").strip()
+                c_slot_fb = normalize_slot(str(ts_fb.get("slot") or active_slot))
+                c_url_fb = str(ts_fb.get("chat_url") or (f"https://gemini.google.com{c_slot_fb}app/{c_id_fb}" if c_id_fb else "")).strip()
+                if c_id_fb or c_url_fb:
+                    session = dict(ts_fb)
+                    session["chat_id"] = c_id_fb
+                    session["chat_url"] = c_url_fb
+                    session["slot"] = c_slot_fb
+                    session.setdefault("mode", (mode or "gemini").strip().lower())
+                    break
+
     if session and (session.get("mode") or "gemini") != (mode or "gemini").strip().lower():
         session = None
 
-    # Only drop the recorded session on a slot mismatch when the caller EXPLICITLY passed a different
-    # slot for a non-followup run. For `--lane followup`, the follow-up conversation lives on its
-    # recorded slot unless an explicit conflicting slot was forced.
     if session and explicit_slot is not None and session.get("slot"):
         if normalize_slot(session["slot"]) != normalize_slot(explicit_slot):
-            if clean_lane != "followup":
-                session = None
+            if clean_lane == "followup":
+                # R1.2: Recorded conversation lives on a different slot than explicitly forced -> refuse!
+                rec_s = normalize_slot(session["slot"])
+                req_s = normalize_slot(explicit_slot)
+                refusal_reason = (
+                    f"followup has no recorded conversation for this project on requested slot {req_s} "
+                    f"(recorded conversation lives on {rec_s}) - refusing to start a new chat"
+                )
+                refusal_line = "lane: followup -> REFUSED (no recorded conversation)"
+                print(f"[ERROR] {refusal_reason}", file=sys.stderr)
+                print(f"[+] {refusal_line}")
+                return {
+                    "session": None,
+                    "is_continuation": False,
+                    "refused": True,
+                    "refusal_reason": refusal_reason,
+                    "slot": req_s,
+                    "chat_id": "",
+                    "chat_url": "",
+                    "log_line": refusal_line,
+                    "no_recorded_followup": True,
+                    "exit_code": EXIT_PREFLIGHT_FAILED,
+                }
+            session = None
 
     if session and (session.get("chat_url") or session.get("chat_id")):
-        cid = str(session.get("chat_id") or _extract_chat_id(str(session.get("chat_url") or "")) or "")
+        cid = str(session.get("chat_id") or _extract_chat_id(str(session.get("chat_url") or "")) or "").strip()
         s_slot = normalize_slot(str(session.get("slot") or active_slot))
-        c_url = str(session.get("chat_url") or f"https://gemini.google.com{s_slot}app/{cid}")
-        eff_lane_label = clean_lane or "followup"
-        line = f"lane: {eff_lane_label} -> continuing chat {cid} ({c_url})"
-        print(f"[+] {line}")
-        return {
-            "session": session,
-            "is_continuation": True,
-            "slot": s_slot if explicit_slot is None else normalize_slot(explicit_slot),
-            "chat_id": cid,
-            "chat_url": c_url,
-            "log_line": line,
-            "no_recorded_followup": False,
-        }
+        c_url = str(session.get("chat_url") or (f"https://gemini.google.com{s_slot}app/{cid}" if cid else "")).strip()
+        if cid and cid != "(new-followup-chat)" and c_url:
+            eff_lane_label = clean_lane or "followup"
+            line = f"lane: {eff_lane_label} -> continuing chat {cid} ({c_url})"
+            print(f"[+] {line}")
+            return {
+                "session": session,
+                "is_continuation": True,
+                "refused": False,
+                "slot": s_slot if explicit_slot is None else normalize_slot(explicit_slot),
+                "chat_id": cid,
+                "chat_url": c_url,
+                "log_line": line,
+                "no_recorded_followup": False,
+                "exit_code": EXIT_SUCCESS,
+            }
 
     if clean_lane == "followup":
-        msg1 = "no recorded conversation for lane 'followup'"
-        msg2 = "lane: followup -> NEW chat (no recorded conversation)"
-        print(f"[!] {msg1}")
-        print(f"[+] {msg2}")
+        refusal_reason = "followup has no recorded conversation for this project - refusing to start a new chat"
+        refusal_line = "lane: followup -> REFUSED (no recorded conversation)"
+        print(f"[ERROR] {refusal_reason}", file=sys.stderr)
+        print(f"[+] {refusal_line}")
         return {
             "session": None,
             "is_continuation": False,
+            "refused": True,
+            "refusal_reason": refusal_reason,
             "slot": active_slot,
             "chat_id": "",
             "chat_url": "",
-            "log_line": f"{msg1} | {msg2}",
+            "log_line": refusal_line,
             "no_recorded_followup": True,
+            "exit_code": EXIT_PREFLIGHT_FAILED,
         }
 
     return {
         "session": None,
         "is_continuation": False,
+        "refused": False,
         "slot": active_slot,
         "chat_id": "",
         "chat_url": "",
         "log_line": "",
         "no_recorded_followup": False,
+        "exit_code": EXIT_SUCCESS,
+    }
+
+
+def resolve_and_verify_two_lane_plan(
+    proj_root: Path,
+    mode: str = "gemini",
+    followup_slot: Optional[str] = None,
+    new_slot: Optional[str] = None,
+    pool_cfg: Optional[PoolConfig] = None,
+    session_store: Optional[SessionStore] = None,
+    task_state_store: Optional[TaskState] = None,
+) -> Dict[str, Any]:
+    """Round 28 (W2 R2.1-R2.2): Resolve and verify a two-lane plan BEFORE anything is sent.
+
+    A two-lane run means EXACTLY:
+      - one lane that CONTINUES a recorded chat (`followup`, on the account that holds the conversation)
+      - one lane that opens a FRESH chat (`new`, on another account)
+    Two new lanes or two lanes on the same slot are never valid.
+    """
+    proj_root = Path(proj_root).resolve()
+    ss = session_store or SessionStore()
+    ts = task_state_store or TaskState()
+
+    f_res = resolve_lane_conversation(
+        proj_root=proj_root,
+        lane="followup",
+        mode=mode,
+        active_slot=normalize_slot(followup_slot or "/u/0/"),
+        explicit_slot=followup_slot,
+        new_session=False,
+        resume_chat=False,
+        session_store=ss,
+        task_state_store=ts,
+    )
+    if f_res.get("refused") or not f_res.get("is_continuation") or not f_res.get("chat_id"):
+        reason = str(
+            f_res.get("refusal_reason")
+            or "followup has no recorded conversation for this project - refusing to start a new chat"
+        )
+        print(f"[ERROR] Two-lane plan aborted before send: {reason}", file=sys.stderr)
+        return {
+            "ok": False,
+            "reason": reason,
+            "plan_line": "",
+            "followup_chat_id": "",
+            "followup_chat_url": "",
+            "followup_slot": "",
+            "new_slot": "",
+            "exit_code": EXIT_PREFLIGHT_FAILED,
+        }
+
+    resolved_f_slot = normalize_slot(str(f_res["slot"]))
+    resolved_f_cid = str(f_res["chat_id"])
+    resolved_f_url = str(f_res["chat_url"])
+
+    if new_slot:
+        resolved_n_slot = normalize_slot(new_slot)
+    else:
+        resolved_n_slot, _ = select_account_slot(
+            pool_cfg=pool_cfg,
+            project_path=proj_root,
+            mode=mode,
+            requested_slot=None,
+            new_session=True,
+            lane="new",
+            exclude_slots={resolved_f_slot},
+        )
+        resolved_n_slot = normalize_slot(resolved_n_slot)
+
+    if not resolved_n_slot or resolved_n_slot == resolved_f_slot:
+        reason = (
+            f"two-lane plan cannot be satisfied: followup lane ({resolved_f_slot}) and new lane "
+            f"({resolved_n_slot or 'none'}) would use the same slot - refusing before send"
+        )
+        print(f"[ERROR] {reason}", file=sys.stderr)
+        print(f"[+] {reason}")
+        return {
+            "ok": False,
+            "reason": reason,
+            "plan_line": "",
+            "followup_chat_id": resolved_f_cid,
+            "followup_chat_url": resolved_f_url,
+            "followup_slot": resolved_f_slot,
+            "new_slot": resolved_n_slot,
+            "exit_code": EXIT_PREFLIGHT_FAILED,
+        }
+
+    plan_line = f"lane plan: followup -> continuing {resolved_f_cid} on {resolved_f_slot} | new -> fresh chat on {resolved_n_slot}"
+    print(f"[+] {plan_line}")
+    return {
+        "ok": True,
+        "reason": "",
+        "plan_line": plan_line,
+        "followup_chat_id": resolved_f_cid,
+        "followup_chat_url": resolved_f_url,
+        "followup_slot": resolved_f_slot,
+        "new_slot": resolved_n_slot,
+        "exit_code": EXIT_SUCCESS,
+    }
+
+
+def verify_two_lane_outcome(
+    plan: Dict[str, Any],
+    followup_actual_chat_id: str,
+    new_actual_chat_id: str,
+) -> Dict[str, Any]:
+    """Round 28 (W2 R2.3): Verify after send that `followup` kept its recorded chat_id and `new` opened a fresh chat_id."""
+    expected_f_cid = str((plan or {}).get("followup_chat_id") or "").strip()
+    actual_f_cid = str(followup_actual_chat_id or "").strip()
+    actual_n_cid = str(new_actual_chat_id or "").strip()
+
+    if not expected_f_cid or not actual_f_cid or actual_f_cid != expected_f_cid:
+        msg = "lane plan VIOLATED: the follow-up opened a new chat"
+        print(f"[ERROR] {msg} (expected={expected_f_cid!r}, actual={actual_f_cid!r})", file=sys.stderr)
+        print(f"[!] {msg}")
+        return {
+            "ok": False,
+            "violated": True,
+            "reason": msg,
+            "accept_delivery": False,
+            "exit_code": EXIT_FAILURE,
+        }
+
+    if not actual_n_cid or actual_n_cid == expected_f_cid or actual_n_cid.startswith("(new-"):
+        msg = "lane plan VIOLATED: the new lane did not open a fresh chat"
+        print(f"[ERROR] {msg} (followup={expected_f_cid!r}, new={actual_n_cid!r})", file=sys.stderr)
+        print(f"[!] {msg}")
+        return {
+            "ok": False,
+            "violated": True,
+            "reason": msg,
+            "accept_delivery": False,
+            "exit_code": EXIT_FAILURE,
+        }
+
+    return {
+        "ok": True,
+        "violated": False,
+        "reason": "",
+        "accept_delivery": True,
+        "exit_code": EXIT_SUCCESS,
     }
 
 
@@ -12419,6 +13072,35 @@ def dispatch_to_argon(
                     )
                 return EXIT_SUCCESS
 
+    # W1 (R1.1-R1.3): If `--lane followup` is requested (and not `--resume`), verify a recorded
+    # conversation exists BEFORE packaging or opening any browser. Never fall through to a new chat.
+    eff_lane_pre = (lane or ("new" if new_session else "single")).strip().lower()
+    if eff_lane_pre == "followup" and not resume_chat:
+        pre_lane_res = resolve_lane_conversation(
+            proj_root=proj_root,
+            lane="followup",
+            mode=mode,
+            active_slot=normalize_slot(slot or "/u/0/"),
+            explicit_slot=slot,
+            new_session=new_session,
+            resume_chat=resume_chat,
+            session_store=session_store,
+            task_state_store=task_state_store,
+        )
+        if pre_lane_res.get("refused"):
+            return int(pre_lane_res.get("exit_code") or EXIT_PREFLIGHT_FAILED)
+
+    # W8 (R8.1 & R8.2): Capture the conversation's existing archive stamp before repackaging
+    from package_context import build_focused_archive, read_archive_stamp
+
+    prior_conv_archive_stamp: Dict[str, Any] = {}
+    if not resume_chat and not new_session and eff_lane_pre != "new":
+        prev_sess_for_stamp = session_store.lookup(proj_root, mode=mode, lane=eff_lane_pre) or {}
+        if isinstance(prev_sess_for_stamp.get("archive_stamp"), dict) and prev_sess_for_stamp["archive_stamp"].get("file_hashes"):
+            prior_conv_archive_stamp = dict(prev_sess_for_stamp["archive_stamp"])
+        elif (proj_root / ".argon_backup" / "archive_stamp.json").is_file() or zip_path.is_file():
+            prior_conv_archive_stamp = read_archive_stamp(zip_path if zip_path.is_file() else None, proj_root)
+
     # 2. Package codebase context (skipped on --resume or when --skip-package reuses a pre-built archive)
     if not resume_chat and not (skip_package and zip_path.is_file()):
         package_context(
@@ -12489,28 +13171,26 @@ def dispatch_to_argon(
     print(f"[+] Slot browser profile: {slot_profile}")
 
     eff_lane_label = (lane or ("new" if new_session else "single")).strip().lower()
-    session = (
-        None
-        if (new_session or eff_lane_label == "new" or resume_chat)
-        else session_store.lookup(
-            proj_root,
-            mode=mode,
-            lane=eff_lane_label,
-            slot=active_slot if slot is not None else None,
-        )
+    lane_resolution = resolve_lane_conversation(
+        proj_root=proj_root,
+        lane=eff_lane_label,
+        mode=mode,
+        active_slot=active_slot,
+        explicit_slot=slot,
+        new_session=new_session,
+        resume_chat=resume_chat,
+        session_store=session_store,
+        task_state_store=task_state_store,
     )
-    if session and (session.get("mode") or "gemini") != (mode or "gemini").strip().lower():
-        session = None
-    # A Gemini conversation URL belongs to the Google account slot it was created in.
-    # If an explicit slot was requested (e.g. during pool rotation) that differs from
-    # the stored session's slot, start a fresh chat on the requested slot.
-    if session and slot is not None and session.get("slot"):
-        if normalize_slot(session["slot"]) != active_slot:
-            session = None
+    if lane_resolution.get("refused"):
+        return int(lane_resolution.get("exit_code") or EXIT_PREFLIGHT_FAILED)
 
+    session = lane_resolution.get("session")
     is_continuation = bool(
-        session and session.get("chat_url") and not resume_chat and not new_session and eff_lane_label != "new"
+        lane_resolution.get("is_continuation") and session and session.get("chat_url") and not resume_chat and not new_session and eff_lane_label != "new"
     )
+    expected_followup_chat_id = str(lane_resolution.get("chat_id") or "") if is_continuation else ""
+
     if resume_chat and resume_entry is not None:
         if slot is None and resume_entry.get("slot"):
             active_slot = normalize_slot(resume_entry["slot"])
@@ -12544,10 +13224,14 @@ def dispatch_to_argon(
         isolated_slot = _profile_is_isolated_slot(slot_profile)
         target_url = _normalize_gemini_chat_url(str(session["chat_url"]), isolated_profile=isolated_slot, slot=active_slot)
         cont_cid = str(session.get("chat_id") or _extract_chat_id(target_url) or "(stored)")
+        expected_followup_chat_id = cont_cid
         print(f"[+] lane: {eff_lane_label} -> continuing chat {cont_cid} ({target_url})")
     else:
         if eff_lane_label == "followup":
-            print("[!] no recorded conversation for lane 'followup'")
+            refusal_msg = "followup has no recorded conversation for this project - refusing to start a new chat"
+            print(f"[ERROR] {refusal_msg}", file=sys.stderr)
+            print("[+] lane: followup -> REFUSED (no recorded conversation)")
+            return EXIT_PREFLIGHT_FAILED
         pool_cfg.set_active_slot(active_slot)
         active_account = pool_cfg.get_by_slot(active_slot)
         target_email = active_account.get("email") if active_account else None
@@ -12555,9 +13239,6 @@ def dispatch_to_argon(
         try:
             target_url = get_target_url(mode, active_slot, isolated_profile=isolated_slot)
         except RuntimeError as exc_url:
-            # Round 21: the slot's account is not signed in to the Argon browser. Refusing
-            # here is the whole point - the old silent fallback opened `/u/<slot number>/`,
-            # which is a DIFFERENT Google account, and the task ran under the wrong identity.
             print(f"[!] {exc_url}", file=sys.stderr)
             print(
                 "[!] Refusing to open a URL for an account that is not signed in - the pool slot "
@@ -12565,7 +13246,29 @@ def dispatch_to_argon(
                 file=sys.stderr,
             )
             return EXIT_NOT_SIGNED_IN
-        print(f"[+] lane: {eff_lane_label} -> NEW chat (pending) (no recorded conversation)")
+        print(f"[+] lane: {eff_lane_label} -> fresh chat on {active_slot}")
+
+    # W8 (R8.1-R8.3): If this is a continuation and code changed since `prior_conv_archive_stamp`,
+    # build a FOCUSED archive (`argon_focused_context.zip`) to attach in the continuation.
+    focused_archive_info: Dict[str, Any] = {"needed": False}
+    send_zip_path: Path = zip_path
+    if is_continuation and prior_conv_archive_stamp.get("file_hashes"):
+        try:
+            focused_archive_info = build_focused_archive(
+                proj_root,
+                base_stamp=prior_conv_archive_stamp,
+                output_zip=active_downloads_dir / "argon_focused_context.zip",
+            )
+            if focused_archive_info.get("needed") and focused_archive_info.get("focused_zip_path"):
+                send_zip_path = Path(focused_archive_info["focused_zip_path"])
+                print(
+                    f"[+] Built focused archive for continuation (W8 R8.2): {send_zip_path} "
+                    f"({focused_archive_info.get('byte_size')} bytes, "
+                    f"changed_files={len(focused_archive_info.get('changed_files') or [])}, "
+                    f"sha256={focused_archive_info.get('sha256')})"
+                )
+        except Exception as _foc_err:
+            print(f"[!] Warning while building focused archive: {_foc_err}", file=sys.stderr)
 
     prior_task_entry = task_state_store.get(proj_root) or {}
     prior_diag_evidence: Optional[Dict[str, Any]] = None
@@ -12579,6 +13282,16 @@ def dispatch_to_argon(
         prompt_text = ""
     elif prompt_file and Path(prompt_file).is_file():
         prompt_text = Path(prompt_file).read_text(encoding="utf-8")
+    elif is_continuation:
+        prompt_text = build_followup_prompt(
+            task,
+            target_directory=str(proj_root),
+            diagnostic_evidence=prior_diag_evidence,
+            winning_chat_id=expected_followup_chat_id,
+            winning_slot=active_slot,
+            conversation_archive=prior_conv_archive_stamp,
+            focused_archive=focused_archive_info if focused_archive_info.get("needed") else None,
+        )
     else:
         prompt_text = build_surgical_prompt(
             task,
@@ -13253,12 +13966,16 @@ def dispatch_to_argon(
                         else:
                             print(f"[!] Warning: Brief summary file not found at {bs_path}; continuing without summary display.", file=sys.stderr)
 
-                    # Rule 5 & Rule 8: Execute the unified send sequence
-                    # (1. find composer & select 4 Argon -> 2. paste prompt -> 3. attach zip -> 4. click send immediately on upload completion).
+                    # Rule 5 & Rule 8 + W8 (R8.2/R8.3): Execute the unified send sequence.
+                    # When a focused archive was built for a continuation, attach `send_zip_path`.
+                    # If even the focused archive cannot be attached (R8.3), say so by name and
+                    # switch to a FRESH chat with the full archive so Argon never works from a stale tree.
+                    if is_continuation and send_zip_path != zip_path:
+                        setattr(page, "_argon_allow_focused_archive", True)
                     try:
                         mode_ok, model_ok, attached = _execute_composer_send_sequence(
                             page=page,
-                            zip_path=zip_path,
+                            zip_path=send_zip_path,
                             prompt_text=prompt_text,
                             manual_setup=manual_setup,
                             is_continuation=is_continuation,
@@ -13270,6 +13987,46 @@ def dispatch_to_argon(
                             new_session=new_session,
                             attach_images=attach_images,
                         )
+                        if (
+                            is_continuation
+                            and focused_archive_info.get("needed")
+                            and (not attached or getattr(page, "_argon_focused_archive_requires_fresh_chat", False))
+                        ):
+                            foc_reason = str(
+                                getattr(page, "_argon_focused_archive_failure_reason", "")
+                                or "focused_archive_cannot_be_attached"
+                            )
+                            print(
+                                f"[!] {foc_reason} - switching to a FRESH chat with the full archive ({zip_path.name}) "
+                                "so Argon never works from a stale tree (W8 R8.3)."
+                            )
+                            setattr(page, "_argon_allow_focused_archive", False)
+                            setattr(page, "_argon_is_continuation", False)
+                            is_continuation = False
+                            new_session = True
+                            eff_lane_label = "new"
+                            expected_followup_chat_id = ""
+                            if _start_fresh_chat(
+                                page,
+                                active_slot,
+                                isolated_profile=_profile_is_isolated_slot(profile_dir),
+                                forbidden_chat_ids=forbidden_new_chat_ids,
+                            ):
+                                preflight.clear()
+                                mode_ok, model_ok, attached = _execute_composer_send_sequence(
+                                    page=page,
+                                    zip_path=zip_path,
+                                    prompt_text=prompt_text,
+                                    manual_setup=manual_setup,
+                                    is_continuation=False,
+                                    recorded_ws_mode="unknown",
+                                    on_progress=_track_send_progress,
+                                    preflight_log=preflight,
+                                    task_text=task,
+                                    prev_state=prev_state,
+                                    new_session=True,
+                                    attach_images=attach_images,
+                                )
                         just_sent_prompt = bool(mode_ok and model_ok and attached)
                     except Exception as send_exc:
                         if _is_target_closed_error(send_exc):
@@ -13475,8 +14232,20 @@ def dispatch_to_argon(
 
             # ------------------------------------------------- remember session --
             chat_id = _wait_for_chat_id(page)
-            if not is_continuation and not resume_chat and chat_id:
-                print(f"[+] lane: {eff_lane_label} -> NEW chat {chat_id} (no recorded conversation)")
+            # W2 (R2.3): If this was a follow-up continuation, verify the chat_id is still the RECORDED one.
+            if is_continuation and expected_followup_chat_id and chat_id and chat_id != expected_followup_chat_id:
+                viol_msg = "lane plan VIOLATED: the follow-up opened a new chat"
+                print(f"[ERROR] {viol_msg} (expected={expected_followup_chat_id}, actual={chat_id})", file=sys.stderr)
+                print(f"[!] {viol_msg}")
+                task_registry.register_done(
+                    proj_root,
+                    lane=lane,
+                    slot=active_slot,
+                    status="failed",
+                    end_reason=viol_msg,
+                )
+                return EXIT_PREFLIGHT_FAILED
+
             if not is_continuation and not resume_chat and chat_id and chat_id in forbidden_new_chat_ids:
                 shot_foreign = _take_step_screenshot(
                     page,
@@ -13538,10 +14307,10 @@ def dispatch_to_argon(
                         page_url=effective_chat_url,
                         account=target_email or "",
                     )
-                if not is_continuation and not resume_chat:  # round-27 fix: the resolver flag was never assigned here
-                    print(f"[+] lane: followup -> NEW chat {chat_id} (no recorded conversation)")
-                elif (lane or "").strip().lower() == "new" or new_session:
-                    print(f"[+] lane: new -> NEW chat {chat_id} ({effective_chat_url})")
+                if is_continuation or resume_chat:
+                    print(f"[+] lane: {eff_lane_label} -> continuing chat {chat_id} ({effective_chat_url})")
+                else:
+                    print(f"[+] lane: {eff_lane_label} -> NEW chat {chat_id} ({effective_chat_url})")
                 print(f"[+] Remembered the session for this project: {effective_chat_url}")
                 if chat_title:
                     print(f"    conversation name : {chat_title}")
@@ -14962,29 +15731,13 @@ def append_followup_to_running_task(
 
     if not is_task_active:
         eff_lane = lane or "followup"
-        print(
-            f"[+] No currently running task found for {proj_root} (lane={eff_lane}); "
-            "executing --append-followup as an ordinary follow-up dispatch."
+        refusal_msg = (
+            f"append-followup has no running task for {proj_root} (lane={eff_lane}) - "
+            "refusing to append or start a new chat"
         )
-        return dispatch_to_argon(
-            task=append_text,
-            project_path=str(proj_root),
-            mode=mode,
-            slot=slot,
-            headless=headless,
-            auto_apply=auto_apply,
-            manual_setup=manual_setup,
-            target_files=target_files,
-            output_zip=output_zip,
-            new_session=False,
-            resume=False,
-            verify_timeout=verify_timeout,
-            verify_cmd=verify_cmd,
-            skip_verify=skip_verify,
-            lane=eff_lane,
-            deadline_seconds=deadline_seconds,
-            attach_images=attach_images,
-        )
+        print(f"[ERROR] {refusal_msg}", file=sys.stderr)
+        print(f"[+] lane: {eff_lane} -> REFUSED (no running task for --append-followup)")
+        return EXIT_PREFLIGHT_FAILED
 
     eff_lane = str(lane or ts_entry.get("lane") or reg_entry.get("lane") or "followup")
     eff_slot = normalize_slot(slot or ts_entry.get("slot") or reg_entry.get("slot") or pool_cfg.active_slot())

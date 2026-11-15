@@ -7,6 +7,8 @@ strips secrets (.env*), and enforces a realistic max code file size (default 15M
 import os
 import sys
 import fnmatch
+import hashlib
+import json
 import zipfile
 import argparse
 import subprocess
@@ -239,9 +241,12 @@ def is_source_file(path: Path) -> bool:
 GENERATED_ARTEFACTS = {
     "apply_changes.ps1",
     "argon_context.zip",
+    "argon_focused_context.zip",
     "argon_package.zip",
     "argon_delivery.zip",
     "delivery_manifest.md",
+    "focus_manifest.md",
+    "archive_stamp.json",
     "argon_task_prompt.md",
     "argon_response.txt",
     "argon_response.md",
@@ -251,6 +256,317 @@ GENERATED_ARTEFACTS = {
     "argon_sessions.json",
     "argon_task_state.json",
 }
+
+
+def get_git_head_commit(proj_root: Path) -> str:
+    """Return the current HEAD git commit of `proj_root`, or a deterministic tree tag when not in git (W8 R8.4)."""
+    try:
+        res = subprocess.run(
+            ["git", "-C", str(proj_root), "rev-parse", "HEAD"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=True,
+            timeout=10,
+        )
+        sha = (res.stdout or "").strip()
+        if sha:
+            return sha
+    except Exception:
+        pass
+    h = hashlib.sha256()
+    try:
+        for p in sorted(proj_root.rglob("*")):
+            if p.is_file() and not is_generated_artefact(p.relative_to(proj_root)):
+                rel_s = p.relative_to(proj_root).as_posix()
+                if not is_dependency_or_build_path(Path(rel_s)) and not is_secret(p.name):
+                    h.update(rel_s.encode("utf-8", errors="replace"))
+                    try:
+                        h.update(p.read_bytes())
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+    return "tree-" + h.hexdigest()[:16]
+
+
+def compute_project_file_hashes(
+    proj_root: Path,
+    selected_files: list[Path] | None = None,
+) -> tuple[dict[str, str], str]:
+    """Compute per-file SHA-256 digests and a combined tree SHA-256 for `selected_files` (W8 R8.2, R8.4)."""
+    file_hashes: dict[str, str] = {}
+    tree_hasher = hashlib.sha256()
+    files_to_hash: list[Path] = []
+    if selected_files is not None:
+        files_to_hash = sorted(selected_files, key=lambda p: p.as_posix().lower())
+    else:
+        for root, dirs, files in os.walk(proj_root):
+            dirs[:] = sorted(
+                d
+                for d in dirs
+                if d.lower() not in _DEFAULT_EXCLUDED_DIRS_LOWER
+                and d.lower() not in {".argon_backup", "downloads", "__pycache__", "scratch"}
+            )
+            for fn in sorted(files):
+                fp = Path(root) / fn
+                if not fp.is_file():
+                    continue
+                rel = fp.relative_to(proj_root)
+                if (
+                    is_dependency_or_build_path(rel)
+                    or is_secret(fn)
+                    or is_generated_artefact(rel)
+                    or fp.suffix.lower() in DEFAULT_EXCLUDED_EXTS
+                ):
+                    continue
+                is_bin, _ = is_binary_file(fp)
+                if is_bin:
+                    continue
+                files_to_hash.append(rel)
+        files_to_hash.sort(key=lambda p: p.as_posix().lower())
+
+    for rel in files_to_hash:
+        full = proj_root / rel
+        if not full.is_file():
+            continue
+        try:
+            raw = full.read_bytes()
+        except OSError:
+            continue
+        f_sha = hashlib.sha256(raw).hexdigest()
+        rel_posix = rel.as_posix()
+        file_hashes[rel_posix] = f_sha
+        tree_hasher.update(f"{rel_posix}:{f_sha}\n".encode("utf-8"))
+    return file_hashes, tree_hasher.hexdigest()
+
+
+def read_archive_stamp(
+    zip_path: str | Path | None = None,
+    project_path: str | Path | None = None,
+) -> dict:
+    """Read the archive stamp (file_name, byte_size, sha256, git_commit, file_hashes) from a zip or project (W8 R8.1, R8.4)."""
+    stamp: dict = {}
+    proj_root = Path(project_path).resolve() if project_path else None
+    zp = Path(zip_path).resolve() if zip_path else (proj_root / "argon_context.zip" if proj_root else None)
+
+    if proj_root is not None:
+        sidecar = proj_root / ".argon_backup" / "archive_stamp.json"
+        if sidecar.is_file():
+            try:
+                parsed = json.loads(sidecar.read_text(encoding="utf-8"))
+                if isinstance(parsed, dict):
+                    stamp.update(parsed)
+            except Exception:
+                pass
+
+    if zp is not None and zp.is_file():
+        try:
+            with zipfile.ZipFile(zp, "r") as zf:
+                if "ARCHIVE_STAMP.json" in zf.namelist():
+                    inner = json.loads(zf.read("ARCHIVE_STAMP.json").decode("utf-8", errors="replace"))
+                    if isinstance(inner, dict):
+                        for k, v in inner.items():
+                            if v is not None and (k not in stamp or k in ("file_hashes", "git_commit", "commit", "tree_sha256")):
+                                stamp[k] = v
+        except Exception:
+            pass
+        try:
+            raw_zip = zp.read_bytes()
+            outer_sha = hashlib.sha256(raw_zip).hexdigest()
+            stamp["file_name"] = zp.name
+            stamp["byte_size"] = len(raw_zip)
+            stamp["sha256"] = outer_sha
+            stamp["archive_sha256"] = outer_sha
+        except Exception:
+            pass
+
+    if proj_root is not None and not stamp.get("git_commit"):
+        stamp["git_commit"] = get_git_head_commit(proj_root)
+    if stamp.get("git_commit") and not stamp.get("commit"):
+        stamp["commit"] = stamp["git_commit"]
+    if stamp.get("sha256") and not stamp.get("archive_sha256"):
+        stamp["archive_sha256"] = stamp["sha256"]
+    stamp.setdefault("file_name", zp.name if zp is not None else "argon_context.zip")
+    stamp.setdefault("byte_size", 0)
+    stamp.setdefault("sha256", stamp.get("tree_sha256") or "")
+    stamp.setdefault("archive_sha256", stamp.get("sha256") or "")
+    stamp.setdefault("git_commit", "")
+    stamp.setdefault("commit", stamp.get("git_commit") or "")
+    stamp.setdefault("file_hashes", {})
+    return stamp
+
+
+def build_focused_archive(
+    project_path: str | Path,
+    base_stamp: dict | None = None,
+    output_zip: str | Path | None = None,
+    changed_files: list[str] | None = None,
+    base_zip_path: str | Path | None = None,
+) -> dict:
+    """Build a FOCUSED archive containing ONLY files changed since `base_stamp` plus `FOCUS_MANIFEST.md` (W8 R8.2)."""
+    proj_root = Path(project_path).resolve()
+    eff_base = dict(base_stamp) if isinstance(base_stamp, dict) and base_stamp else read_archive_stamp(base_zip_path, proj_root)
+    base_hashes = eff_base.get("file_hashes") if isinstance(eff_base.get("file_hashes"), dict) else {}
+    base_commit = str(eff_base.get("git_commit") or eff_base.get("commit") or "unknown")
+    base_sha = str(eff_base.get("sha256") or eff_base.get("archive_sha256") or eff_base.get("tree_sha256") or "unknown")
+    base_fname = str(eff_base.get("file_name") or "argon_context.zip")
+    base_fsize = int(eff_base.get("byte_size") or 0)
+
+    cur_hashes, cur_tree_sha = compute_project_file_hashes(proj_root)
+    cur_commit = get_git_head_commit(proj_root)
+
+    changed_rels: list[Path] = []
+    deleted_rels: list[str] = []
+    if changed_files is not None:
+        for cf in changed_files:
+            rel_p = Path(cf)
+            if rel_p.is_absolute():
+                try:
+                    rel_p = rel_p.relative_to(proj_root)
+                except ValueError:
+                    continue
+            if (proj_root / rel_p).is_file():
+                changed_rels.append(rel_p)
+    elif base_hashes:
+        for rel_posix, f_sha in sorted(cur_hashes.items()):
+            if base_hashes.get(rel_posix) != f_sha:
+                changed_rels.append(Path(rel_posix))
+        for old_rel in sorted(base_hashes.keys()):
+            if old_rel not in cur_hashes:
+                deleted_rels.append(old_rel)
+    elif base_commit and base_commit != "unknown" and cur_commit != base_commit and not base_commit.startswith("tree-"):
+        try:
+            diff_res = subprocess.run(
+                ["git", "-C", str(proj_root), "diff", "--name-only", base_commit],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+            for ln in (diff_res.stdout or "").splitlines():
+                cand = ln.strip()
+                if cand and (proj_root / cand).is_file() and not is_generated_artefact(Path(cand)):
+                    changed_rels.append(Path(cand))
+        except Exception:
+            pass
+
+    dedup_changed: list[Path] = []
+    seen_c: set[str] = set()
+    for r in changed_rels:
+        rk = r.as_posix().lower()
+        if rk not in seen_c and (proj_root / r).is_file():
+            seen_c.add(rk)
+            dedup_changed.append(r)
+
+    if not dedup_changed:
+        return {
+            "needed": False,
+            "changed_files": [],
+            "deleted_files": deleted_rels,
+            "focused_zip_path": None,
+            "file_name": "",
+            "byte_size": 0,
+            "sha256": "",
+            "base_commit": base_commit,
+            "base_archive_sha256": base_sha,
+            "current_commit": cur_commit,
+            "base_stamp": eff_base,
+        }
+
+    out_zip = (
+        Path(output_zip).resolve()
+        if output_zip
+        else (proj_root / ".argon_backup" / "argon_focused_context.zip").resolve()
+    )
+    out_zip.parent.mkdir(parents=True, exist_ok=True)
+    tmp_zip = out_zip.with_name(f".{out_zip.name}.{os.getpid()}.tmp")
+
+    payload_hasher = hashlib.sha256()
+    changed_entries_md: list[str] = []
+    changed_hashes_map: dict[str, str] = {}
+    for rel in dedup_changed:
+        full_p = proj_root / rel
+        raw_b = full_p.read_bytes()
+        f_sha = hashlib.sha256(raw_b).hexdigest()
+        rel_posix = rel.as_posix()
+        changed_hashes_map[rel_posix] = f_sha
+        payload_hasher.update(f"{rel_posix}:{f_sha}\n".encode("utf-8"))
+        changed_entries_md.append(f"- `{rel_posix}` ({len(raw_b)} bytes, sha256=`{f_sha}`)")
+
+    focused_payload_sha = payload_hasher.hexdigest()
+    manifest_lines = [
+        "# Focused Context Archive Manifest (`FOCUS_MANIFEST.md`)",
+        "",
+        "This focused archive carries ONLY the files that changed since the conversation's base context archive was packaged.",
+        "It supplements (and replaces nothing in) the base archive already attached in this conversation.",
+        "",
+        "## Base Archive Already in Conversation",
+        f"- **Base Archive File:** `{base_fname}`",
+        f"- **Base Archive Size:** `{base_fsize}` bytes",
+        f"- **Base Archive SHA-256:** `{base_sha}`",
+        f"- **Base Project Commit:** `{base_commit}`",
+        "",
+        "## Focused Delta Summary",
+        f"- **Current Project Commit:** `{cur_commit}`",
+        f"- **Focused Payload SHA-256:** `{focused_payload_sha}`",
+        f"- **Changed Files Count:** `{len(dedup_changed)}`",
+        "",
+        "## Changed Files Included in This Focused Archive",
+        *changed_entries_md,
+    ]
+    if deleted_rels:
+        manifest_lines.extend([
+            "",
+            "## Files Removed Since Base Archive",
+            *[f"- `{d}`" for d in deleted_rels],
+        ])
+    manifest_text = "\n".join(manifest_lines) + "\n"
+
+    stamp_payload = {
+        "is_focused_archive": True,
+        "file_name": out_zip.name,
+        "base_archive_file": base_fname,
+        "base_archive_byte_size": base_fsize,
+        "base_archive_sha256": base_sha,
+        "base_commit": base_commit,
+        "git_commit": cur_commit,
+        "commit": cur_commit,
+        "tree_sha256": focused_payload_sha,
+        "archive_sha256": focused_payload_sha,
+        "sha256": focused_payload_sha,
+        "changed_files": [r.as_posix() for r in dedup_changed],
+        "deleted_files": deleted_rels,
+        "file_hashes": changed_hashes_map,
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+    with zipfile.ZipFile(tmp_zip, "w", zipfile.ZIP_STORED) as zf:
+        for rel in dedup_changed:
+            zf.write(proj_root / rel, arcname=str(rel))
+        zf.writestr("FOCUS_MANIFEST.md", manifest_text)
+        zf.writestr("ARCHIVE_STAMP.json", json.dumps(stamp_payload, indent=2, ensure_ascii=False) + "\n")
+
+    os.replace(str(tmp_zip), str(out_zip))
+    raw_focused_zip = out_zip.read_bytes()
+    focused_zip_sha = hashlib.sha256(raw_focused_zip).hexdigest()
+    focused_zip_size = len(raw_focused_zip)
+
+    return {
+        "needed": True,
+        "changed_files": [r.as_posix() for r in dedup_changed],
+        "deleted_files": deleted_rels,
+        "focused_zip_path": out_zip,
+        "file_name": out_zip.name,
+        "byte_size": focused_zip_size,
+        "sha256": focused_zip_sha,
+        "payload_sha256": focused_payload_sha,
+        "base_commit": base_commit,
+        "base_archive_sha256": base_sha,
+        "current_commit": cur_commit,
+        "base_stamp": eff_base,
+    }
 
 
 def is_generated_artefact(rel_path: Path) -> bool:
@@ -903,15 +1219,21 @@ def package_context(
     # ZIP_STORED, not DEFLATED: Gemini reads every member of the archive as
     # plain text, so the members must not be compressed. Every archive that has
     # actually been consumed by Argon in this project uses compress_type=0.
+    git_commit = get_git_head_commit(proj_root)
+    file_hashes, tree_sha256 = compute_project_file_hashes(proj_root, selected_files)
+    generated_ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
     with zipfile.ZipFile(tmp_zip_path, "w", zipfile.ZIP_STORED) as zf:
         for rel in selected_files:
             full = proj_root / rel
             zf.write(full, arcname=str(rel))
 
         brief_text = f"""# Task Brief for Gemini 4 Argon
-**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+**Generated:** {generated_ts}
 **Absolute Target Directory:** {proj_root}
 **Project Root:** {proj_root.name}
+**Project Commit:** {git_commit}
+**Source Tree SHA-256:** {tree_sha256}
 **Included Files Count:** {len(selected_files)}
 
 ## User Goal / Problem Statement:
@@ -985,6 +1307,19 @@ $TargetRoot = '{proj_root}'
             max_entries=max_archive_entries,
         )
         zf.writestr("TASK_BRIEF.md", brief_text)
+        inner_stamp = {
+            "is_focused_archive": False,
+            "file_name": out_zip_path.name,
+            "git_commit": git_commit,
+            "commit": git_commit,
+            "tree_sha256": tree_sha256,
+            "archive_sha256": tree_sha256,
+            "sha256": tree_sha256,
+            "included_files_count": len(selected_files),
+            "file_hashes": file_hashes,
+            "timestamp": generated_ts,
+        }
+        zf.writestr("ARCHIVE_STAMP.json", json.dumps(inner_stamp, indent=2, ensure_ascii=False) + "\n")
 
     # D13.2: Write TASK_BRIEF.md and API_INDEX.md atomically via temporary files + os.replace
     try:
@@ -1019,11 +1354,36 @@ $TargetRoot = '{proj_root}'
     size_bytes = out_zip_path.stat().st_size
     size_kb = round(size_bytes / 1024, 2)
     total_entries = len(archive_members)
+    outer_sha256 = hashlib.sha256(out_zip_path.read_bytes()).hexdigest()
+    final_stamp = {
+        "is_focused_archive": False,
+        "file_name": out_zip_path.name,
+        "byte_size": size_bytes,
+        "sha256": outer_sha256,
+        "archive_sha256": outer_sha256,
+        "tree_sha256": tree_sha256,
+        "git_commit": git_commit,
+        "commit": git_commit,
+        "included_files_count": len(selected_files),
+        "file_hashes": file_hashes,
+        "timestamp": generated_ts,
+    }
+    try:
+        stamp_file = proj_root / ".argon_backup" / "archive_stamp.json"
+        stamp_file.parent.mkdir(parents=True, exist_ok=True)
+        stamp_file.write_text(json.dumps(final_stamp, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    except Exception:
+        pass
+    print(
+        f"[+] Archive stamp: file={out_zip_path.name} | bytes={size_bytes} | "
+        f"sha256={outer_sha256} | commit={git_commit}"
+    )
     print(
         f"[SUCCESS] Packaged {len(selected_files)} source files | "
         f"entries={total_entries}, bytes={size_bytes} ({size_kb} KB), "
         f"binary files skipped={binary_skipped_count}, files skipped by cap={cap_skipped_count} -> {out_zip_path}"
     )
+    return final_stamp
 
 
 if __name__ == "__main__":

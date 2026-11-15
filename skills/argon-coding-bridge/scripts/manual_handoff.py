@@ -34,39 +34,47 @@ def format_progress_in_words(progress: str) -> str:
 
 def compute_missing_actions(send_progress: str, zip_path: Path, prompt_path: Path, chat_url: str) -> List[str]:
     p = str(send_progress or "none").strip().lower()
+    chip_rule = (
+        f"Download ONLY the 'apply_changes.ps1' chip in the NEWEST assistant turn of {chat_url} - "
+        "never an earlier chip and never an item from the browser's download list (the download list is not the delivery)."
+    )
+    attach_rule = (
+        f"Attach the ZIP archive ({zip_path.resolve()}) in the composer and verify that the attachment chip "
+        f"({zip_path.name}) is visible in the composer BEFORE the prompt is sent."
+    )
     if p == "none":
         return [
-            f"1. Open the conversation link in the Argon browser ({chat_url}).",
-            "2. Verify Task mode is active and '4 Argon (Complex tasks)' model is selected (never Flash).",
+            f'1. Open the exact recorded conversation URL in the Argon browser: "{chat_url}".',
+            "2. Verify Task mode is active and 'Code & analysis 4 Argon' model is selected (never Flash, never Hydrogen).",
             f"3. Copy the full prompt from {prompt_path.resolve()} and paste into the composer.",
-            f"4. Attach the context archive: {zip_path.resolve()}",
-            "5. The moment the upload spinner finishes, click the Send button immediately.",
-            "6. Wait for Argon to generate apply_changes.ps1 (and any image/SVG/audio artifacts) and download via the chip's Export -> Download menu item.",
+            f"4. {attach_rule}",
+            "5. The moment the upload spinner finishes and the attachment chip is visible, click the Send button immediately.",
+            f"6. {chip_rule}",
         ]
     elif p == "prompt_pasted":
         return [
-            f"1. Open the conversation link in the Argon browser ({chat_url}) where the prompt is already pasted.",
-            "2. Confirm the model chip still reads '4 Argon' (never Flash).",
-            f"3. Attach the context archive: {zip_path.resolve()}",
-            "4. The moment the upload finishes, click the Send button immediately.",
-            "5. Wait for Argon to generate apply_changes.ps1 and download via the chip's Export -> Download menu item.",
+            f'1. Open the exact recorded conversation URL in the Argon browser ("{chat_url}") where the prompt is already pasted.',
+            "2. Confirm the model chip still reads 'Code & analysis 4 Argon' (never Flash).",
+            f"3. {attach_rule}",
+            "4. The moment the upload finishes and the attachment chip is visible, click the Send button immediately.",
+            f"5. {chip_rule}",
         ]
     elif p == "zip_attached":
         return [
-            f"1. Focus the composer in the Argon browser ({chat_url}) where the prompt is pasted and the ZIP upload has finished.",
-            "2. Confirm the model chip reads '4 Argon' (never Flash) and click the Send button immediately.",
-            "3. Wait for Argon to generate apply_changes.ps1 and download via the chip's Export -> Download menu item.",
+            f'1. Focus the composer in the Argon browser ("{chat_url}") and verify the attachment chip ({zip_path.name}) is visible.',
+            "2. Confirm the model chip reads 'Code & analysis 4 Argon' (never Flash) and click the Send button immediately.",
+            f"3. {chip_rule}",
         ]
     elif p == "prompt_sent":
         return [
-            f"1. In the Argon browser ({chat_url}), verify Argon is generating the response.",
-            "2. Wait for the response to finish and look for the apply_changes.ps1 generated-file chip (and any asset chips).",
-            "3. Click the chip's Export button -> leaf 'Download' item, and save to the downloads folder (or run with --resume to build argon_delivery.zip and DELIVERY_MANIFEST.md automatically).",
+            f'1. In the Argon browser ("{chat_url}"), verify Argon is generating the response.',
+            f"2. {chip_rule}",
+            "3. Verify the downloaded file's SHA-256 does NOT match any earlier delivery digest listed in this hand-off pack before applying.",
         ]
     else:  # verified
         return [
-            f"1. Prompt was already verified in the conversation ({chat_url}).",
-            "2. Wait for the generated apply_changes.ps1 (and argon_delivery.zip bundle) or run with --resume.",
+            f'1. Prompt was already verified in the conversation ("{chat_url}").',
+            f"2. {chip_rule}",
         ]
 
 def compute_manual_commands(
@@ -127,8 +135,12 @@ def write_manual_handoff_pack(
     max_attempts: int = 3,
     quarantined_file: Optional[str] = None,
     failure_reason: str = "",
+    expected_delivery_file: str = "apply_changes.ps1",
+    earlier_deliveries: Optional[List[Dict[str, Any]]] = None,
+    conversation_archive: Optional[Dict[str, Any]] = None,
+    focused_archive_path: Optional[Path] = None,
 ) -> Tuple[Path, Path]:
-    """Write manual_handoff.md and handoff.json into .argon_backup/handoff/<timestamp>/."""
+    """Write manual_handoff.md and handoff.json into .argon_backup/handoff/<timestamp>/ (W4 R4.1-R4.3, W8 R8.1)."""
     proj_root = Path(proj_root).resolve()
     ts = timestamp or time.strftime("%Y%m%d_%H%M%S")
     handoff_dir = proj_root / ".argon_backup" / "handoff" / ts
@@ -142,12 +154,67 @@ def write_manual_handoff_pack(
     eff_session_dir = (session_folder or (proj_root / ".argon_backup")).resolve()
     eff_delivery_dir = (delivery_folder or (proj_root / "downloads" / eff_lane)).resolve()
     eff_delivery_dir.mkdir(parents=True, exist_ok=True)
+    eff_expected_file = (expected_delivery_file or "apply_changes.ps1").strip() or "apply_changes.ps1"
 
     if not eff_prompt_path.is_file() and prompt_text:
         try:
             eff_prompt_path.write_text(prompt_text, encoding="utf-8")
         except Exception:
             pass
+
+    # W4 R4.1: Collect SHA-256 digests of every earlier delivery from DeliveryLedger
+    resolved_earlier: List[Dict[str, Any]] = []
+    if earlier_deliveries is not None:
+        for item in earlier_deliveries:
+            if isinstance(item, dict) and item.get("sha256"):
+                resolved_earlier.append(dict(item))
+    else:
+        try:
+            from dispatch_argon import DeliveryLedger
+
+            ledger = DeliveryLedger()
+            for entry in ledger._proj_entries(proj_root):
+                if isinstance(entry, dict) and entry.get("sha256"):
+                    resolved_earlier.append(dict(entry))
+        except Exception:
+            pass
+        if not resolved_earlier:
+            mirror_p = proj_root / ".argon_backup" / "delivery_ledger.json"
+            if mirror_p.is_file():
+                try:
+                    raw_m = json.loads(mirror_p.read_text(encoding="utf-8"))
+                    if isinstance(raw_m, list):
+                        for entry in raw_m:
+                            if isinstance(entry, dict) and entry.get("sha256"):
+                                resolved_earlier.append(dict(entry))
+                except Exception:
+                    pass
+
+    earlier_sha256_list = [str(e.get("sha256") or "") for e in resolved_earlier if e.get("sha256")]
+
+    # W8 R8.1: Resolve the archive stamp that the conversation already carries
+    conv_arch: Dict[str, Any] = dict(conversation_archive) if isinstance(conversation_archive, dict) else {}
+    if not conv_arch:
+        try:
+            from package_context import read_archive_stamp
+
+            conv_arch = read_archive_stamp(eff_zip if eff_zip.is_file() else None, proj_root)
+        except Exception:
+            conv_arch = {}
+    conv_arch_name = str(conv_arch.get("file_name") or eff_zip.name)
+    conv_arch_size = int(conv_arch.get("byte_size") or (eff_zip.stat().st_size if eff_zip.is_file() else 0))
+    conv_arch_sha = str(conv_arch.get("sha256") or conv_arch.get("archive_sha256") or "(not yet computed)")
+    conv_arch_commit = str(conv_arch.get("git_commit") or conv_arch.get("commit") or "(unknown)")
+
+    # W4 R4.2 & R4.3: Explicit one-line chip rule and composer attachment rule
+    target_chip_rule = (
+        f"Download ONLY the `{eff_expected_file}` chip in the NEWEST assistant turn of `{eff_chat_url}` - "
+        "never an earlier chip and never an item from the browser's download list (the download list is not the delivery)."
+    )
+    attachment_rule = (
+        f"The ZIP archive (`{eff_zip}`) MUST be attached in the composer and the attachment chip (`{eff_zip.name}`) "
+        "MUST be visible in the composer BEFORE the prompt is sent."
+    )
 
     progress_words = format_progress_in_words(send_progress)
     missing_actions = compute_missing_actions(send_progress, eff_zip, eff_prompt_path, eff_chat_url)
@@ -190,33 +257,57 @@ def write_manual_handoff_pack(
         prompt_text.strip() if prompt_text.strip() else "(Prompt text was not provided or empty)",
         "```",
         "",
-        "## 5. Context Archive (ZIP)",
+        "## 5. Context Archive (ZIP) & Conversation Codebase Provenance",
         f"- **Absolute ZIP Path:** `{eff_zip}`",
         f"- **Exists on Disk:** {'Yes' if eff_zip.is_file() else 'No'}",
+        f"- **Composer Attachment Rule:** {attachment_rule}",
+        f"- **Archive Already in Conversation:** `{conv_arch_name}` (size=`{conv_arch_size}` bytes, sha256=`{conv_arch_sha}`, commit=`{conv_arch_commit}`)",
+    ]
+    if focused_archive_path:
+        md_lines.append(f"- **Focused Delta Archive Path:** `{Path(focused_archive_path).resolve()}`")
+
+    md_lines.extend([
         "",
-        "## 6. Dispatch Artefacts Folders",
+        "## 6. Expected Delivery & Earlier Delivery SHA-256 Digests",
+        f"- **Expected Delivery File Name:** `{eff_expected_file}`",
+        f"- **Which Chip to Download:** {target_chip_rule}",
+        "- **Earlier Delivery SHA-256 Digests (REFUSE any file matching these older rounds):**",
+    ])
+    if resolved_earlier:
+        for ed in resolved_earlier:
+            ed_round = str(ed.get("round_id") or "previous")
+            ed_sha = str(ed.get("sha256") or "")
+            ed_chat = str(ed.get("chat_id") or "?")
+            ed_file = str(ed.get("file_path") or "apply_changes.ps1")
+            md_lines.append(f"  - round `{ed_round}`: sha256=`{ed_sha}` (chat=`{ed_chat}`, file=`{ed_file}`)")
+    else:
+        md_lines.append("  - `(none - no earlier deliveries recorded in DeliveryLedger for this project)`")
+
+    md_lines.extend([
+        "",
+        "## 7. Dispatch Artefacts Folders",
         f"- **Backup Session Folder:** `{eff_session_dir}`",
         f"- **Delivery Folder:** `{eff_delivery_dir}`",
         "",
-        "## 7. How Far the Send Got (Progress)",
+        "## 8. How Far the Send Got (Progress)",
         f"- **Progress Status:** `{send_progress}`",
         f"- **Description:** {progress_words}",
         "",
-        "## 8. Where It Failed & Retry Ladder State",
+        "## 9. Where It Failed & Retry Ladder State",
         f"- **Ladder Phase:** `{phase}` (attempt `{attempt}` of `{max_attempts}`)",
         f"- **Failing Step:** `{failed_step}`",
         f"- **Failure Reason:** `{failure_reason or failed_step}`",
         f"- **Quarantined Patch Path:** `{quarantined_file or '(none)'}`",
         f"- **Last Step Screenshot:** `{shot_str}`",
         "",
-        "## 9. What Is Still Missing",
-    ]
+        "## 10. What Is Still Missing",
+    ])
     for action in missing_actions:
         md_lines.append(f"- {action}")
 
     md_lines.extend([
         "",
-        "## 10. Exact Commands to Finish by Hand",
+        "## 11. Exact Commands to Finish by Hand",
         "```powershell",
     ])
     for cmd in commands:
@@ -243,6 +334,18 @@ def write_manual_handoff_pack(
         "prompt_path": str(eff_prompt_path),
         "prompt_text": prompt_text,
         "zip_path": str(eff_zip),
+        "expected_delivery_file": eff_expected_file,
+        "target_chip_rule": target_chip_rule,
+        "attachment_rule": attachment_rule,
+        "earlier_deliveries": resolved_earlier,
+        "earlier_delivery_sha256s": earlier_sha256_list,
+        "conversation_archive": {
+            "file_name": conv_arch_name,
+            "byte_size": conv_arch_size,
+            "sha256": conv_arch_sha,
+            "git_commit": conv_arch_commit,
+        },
+        "focused_archive_path": str(Path(focused_archive_path).resolve()) if focused_archive_path else "",
         "session_folder": str(eff_session_dir),
         "delivery_folder": str(eff_delivery_dir),
         "send_progress": send_progress,
@@ -346,7 +449,7 @@ def run_manual_handoff_cli(
 
     sess_store = SessionStore()
     sess_store.load()
-    sess_entry = sess_store.lookup(proj_root, mode=mode) or {}
+    sess_entry = sess_store.lookup(proj_root, mode=mode, lane=eff_lane) or sess_store.lookup(proj_root, mode=mode) or {}
 
     task_state_store = TaskState()
     task_state_store.load()

@@ -38,6 +38,7 @@ from compare_argon_patches import compare_patches, render_comparison_html
 from dispatch_argon import (
     EXIT_ALREADY_RUNNING,
     EXIT_FAILURE,
+    EXIT_PREFLIGHT_FAILED,
     EXIT_SLOT_BUSY,
     EXIT_SUCCESS,
     MAX_TASKS_PER_SLOT,
@@ -45,6 +46,7 @@ from dispatch_argon import (
     SessionStore,
     SlotLock,
     TaskRegistry,
+    TaskState,
     _inspect_zip_archive,
     _pool_slots_in_order,
     _profile_dir_for_slot,
@@ -56,8 +58,10 @@ from dispatch_argon import (
     build_surgical_prompt,
     dispatch_to_argon,
     find_delivered_patch,
+    resolve_and_verify_two_lane_plan,
+    verify_two_lane_outcome,
 )
-from package_context import package_context
+from package_context import build_focused_archive, package_context, read_archive_stamp
 
 DUAL_DOWNLOADS_SUBDIR = "dual"
 
@@ -184,8 +188,10 @@ def prepare_dual_round(
     round_id: Optional[str] = None,
     winning_chat_id: str = "",
     winning_slot: str = "",
+    conversation_archive: Optional[Dict[str, Any]] = None,
+    focused_archive: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Create the per-round directory layout and write both prompts to disk (D4, D5, R1)."""
+    """Create the per-round directory layout and write both prompts to disk (D4, D5, R1, W8 R8.1)."""
     proj_root = Path(project_path).resolve()
     rid = (round_id or "").strip() or time.strftime("%Y%m%d_%H%M%S")
     round_dir = proj_root / "downloads" / DUAL_DOWNLOADS_SUBDIR / rid
@@ -199,6 +205,8 @@ def prepare_dual_round(
         target_directory=str(proj_root),
         winning_chat_id=winning_chat_id,
         winning_slot=winning_slot,
+        conversation_archive=conversation_archive,
+        focused_archive=focused_archive,
     )
     new_prompt = build_new_session_prompt(
         task_description=task,
@@ -265,6 +273,11 @@ def _ensure_canonical_patch_path(lane_dir: Path) -> Optional[Path]:
     return None
 
 
+# Round 28 (W1 / R1.1): a follow-up lane with no recorded conversation REFUSES to start a
+# new chat instead of silently sending a new session labelled "followup".
+EXIT_DUAL_FOLLOWUP_NO_RECORDED_CHAT = 4
+
+
 def run_dual_dispatch(
     task: str,
     project_path: str = ".",
@@ -292,30 +305,57 @@ def run_dual_dispatch(
     except Exception:
         pool_cfg = None
 
-    # E4.1 & E4.2: Resolve follow-up conversation (from recorded winner or stored project session)
-    # and run the two lanes as two separate processes, each with its own conversation and delivery folder.
+    # W2 (R2.1 & R2.2): Resolve and verify the two-lane plan BEFORE anything is packaged or sent.
+    # A two-lane run means EXACTLY: one lane that CONTINUES a recorded chat (followup, on its account)
+    # + one lane that opens a FRESH chat (new, on another account). Two new lanes are never correct.
     winner_info = session_store.get_winner(proj_root, mode=mode)
-    if winner_info is not None:
-        followup_slot = normalize_slot(slot or winner_info["slot"])
-        followup_chat_id = str(winner_info["chat_id"])
-        followup_chat_url = str(winner_info["chat_url"])
-        winner_label = str(winner_info.get("winner") or "followup")
-    elif isinstance(session_entry, dict) and (session_entry.get("chat_id") or session_entry.get("chat_url")):
-        followup_slot = normalize_slot(slot or session_entry.get("slot") or "/u/0/")
-        followup_url_slot = _url_slot_for_account(followup_slot, isolated_profile=False)
-        followup_chat_id = str(session_entry.get("chat_id") or "")
-        followup_chat_url = str(
-            session_entry.get("chat_url") or f"https://gemini.google.com{followup_url_slot}app/{followup_chat_id}"
+    winner_label = str((winner_info or {}).get("winner") or "followup")
+    candidate_new_slot = (
+        normalize_slot(second_slot)
+        if second_slot
+        else pick_new_session_slot(
+            pool_cfg,
+            normalize_slot(
+                slot
+                or (winner_info or {}).get("slot")
+                or (session_entry or {}).get("slot")
+                or "/u/0/"
+            ),
+            preferred_slot=None,
         )
-        winner_label = "followup"
-    else:
-        followup_slot = normalize_slot(slot or (pool_cfg.active_slot() if pool_cfg else "/u/0/"))
-        followup_url_slot = _url_slot_for_account(followup_slot, isolated_profile=False)
-        followup_chat_id = "(new-followup-chat)"
-        followup_chat_url = f"https://gemini.google.com{followup_url_slot}app"
-        winner_label = "followup"
+    )
+    plan = resolve_and_verify_two_lane_plan(
+        proj_root=proj_root,
+        mode=mode,
+        followup_slot=slot,
+        new_slot=candidate_new_slot,
+        pool_cfg=pool_cfg,
+        session_store=session_store,
+        task_state_store=TaskState(),
+    )
+    if not plan.get("ok"):
+        # Round 28 (W1 / R1.1): a follow-up lane NEVER opens a new chat. When there is no
+        # recorded conversation the dual dispatch refuses by name instead of silently
+        # sending a NEW session labelled "followup" - that is exactly what the owner saw
+        # on 2026-11-15 (two new chats, both called a follow-up).
+        reason = str(plan.get("reason") or "")
+        if "no recorded conversation" in reason:
+            print(f"[ERROR] {reason}", file=sys.stderr)
+            return EXIT_DUAL_FOLLOWUP_NO_RECORDED_CHAT
+        return int(plan.get("exit_code") or EXIT_PREFLIGHT_FAILED)
 
-    new_slot = pick_new_session_slot(pool_cfg, followup_slot, preferred_slot=second_slot)
+    followup_slot = str(plan["followup_slot"])
+    followup_chat_id = str(plan["followup_chat_id"])
+    followup_chat_url = str(plan["followup_chat_url"])
+    new_slot = str(plan["new_slot"])
+
+    # W8 (R8.1 & R8.2): Read the archive stamp already in the follow-up conversation before repackaging
+    prior_conv_stamp = (
+        dict((session_entry or {}).get("archive_stamp"))
+        if isinstance((session_entry or {}).get("archive_stamp"), dict)
+        else read_archive_stamp(proj_root / output_zip, proj_root)
+    )
+    focused_info = build_focused_archive(proj_root, base_stamp=prior_conv_stamp) if prior_conv_stamp else {"needed": False}
 
     round_meta = prepare_dual_round(
         task=task,
@@ -323,6 +363,8 @@ def run_dual_dispatch(
         round_id=round_id,
         winning_chat_id=followup_chat_id,
         winning_slot=followup_slot,
+        conversation_archive=prior_conv_stamp,
+        focused_archive=focused_info if focused_info.get("needed") else None,
     )
     rid = round_meta["round_id"]
     round_dir: Path = round_meta["round_dir"]
@@ -527,10 +569,19 @@ def run_dual_dispatch(
         merged_patch=str(merged_patch_path),
     )
 
-    f_final_cid = str(f_lane_data.get("chat_id") or followup_chat_id)
-    f_final_url = str(f_lane_data.get("chat_url") or followup_chat_url)
-    n_final_cid = str(n_lane_data.get("chat_id") or "(none)")
-    n_final_url = str(n_lane_data.get("chat_url") or new_initial_url)
+    ts_after = TaskState()
+    f_ts_after = ts_after.get(proj_root, lane="followup") or {}
+    n_ts_after = ts_after.get(proj_root, lane="new") or {}
+    f_final_cid = str(f_ts_after.get("chat_id") or f_lane_data.get("chat_id") or followup_chat_id)
+    f_final_url = str(f_ts_after.get("chat_url") or f_lane_data.get("chat_url") or followup_chat_url)
+    n_final_cid = str(n_ts_after.get("chat_id") or n_lane_data.get("chat_id") or "(none)")
+    n_final_url = str(n_ts_after.get("chat_url") or n_lane_data.get("chat_url") or new_initial_url)
+
+    # W2 (R2.3): Verify the two-lane plan actually happened after the send.
+    plan_outcome = verify_two_lane_outcome(plan, f_final_cid, n_final_cid if n_final_cid != "(none)" else "pending-new")
+    if not plan_outcome.get("ok") and "follow-up opened a new chat" in str(plan_outcome.get("reason") or ""):
+        followup_patch = None
+        return EXIT_FAILURE
 
     if followup_patch is not None and new_patch is not None:
         comparison = compare_patches(followup_patch, new_patch, project_path=proj_root)

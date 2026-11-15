@@ -36,7 +36,8 @@ param(
     [switch]$Rollback,
     [switch]$SkipVerify,
     [int]$VerifyTimeoutSeconds = 900,
-    [string]$VerifyCommand = ""
+    [string]$VerifyCommand = "",
+    [switch]$Force
 )
 
 $ErrorActionPreference = "Stop"
@@ -55,23 +56,114 @@ function Write-ArgonError([string]$Message) {
     Write-Host "[ERROR] $Message" -ForegroundColor Red
 }
 
-# Returns the newest file matching $Filter inside $Folder, or $null.
-function Get-NewestPatchIn([string]$Folder, [string]$Filter) {
-    if ([string]::IsNullOrWhiteSpace($Folder)) { return $null }
-    if (-not (Test-Path -LiteralPath $Folder -PathType Container)) { return $null }
+# Computes the normalized UTF-8 SHA-256 hex digest matching DeliveryLedger._sha256_full().
+function Get-ArgonPatchSha256([string]$FilePath) {
+    if ([string]::IsNullOrWhiteSpace($FilePath) -or -not (Test-Path -LiteralPath $FilePath -PathType Leaf)) {
+        return ""
+    }
+    $rawBytes = [System.IO.File]::ReadAllBytes($FilePath)
+    if ($rawBytes.Length -ge 3 -and $rawBytes[0] -eq 0xEF -and $rawBytes[1] -eq 0xBB -and $rawBytes[2] -eq 0xBF) {
+        $rawText = [System.Text.Encoding]::UTF8.GetString($rawBytes, 3, $rawBytes.Length - 3)
+    } else {
+        $rawText = [System.Text.Encoding]::UTF8.GetString($rawBytes)
+    }
+    $normText = $rawText.Replace("`r`n", "`n").Trim()
+    $normBytes = [System.Text.Encoding]::UTF8.GetBytes($normText)
+    $shaObj = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $hashBytes = $shaObj.ComputeHash($normBytes)
+    } finally {
+        $shaObj.Dispose()
+    }
+    return ([System.BitConverter]::ToString($hashBytes)).Replace("-", "").ToLowerInvariant()
+}
+
+# Returns ALL eligible candidate patch files in $Folder matching $Filter (never picking by LastWriteTime, W5 R5.1).
+function Get-CandidatePatchesIn([string]$Folder, [string]$Filter) {
+    if ([string]::IsNullOrWhiteSpace($Folder)) { return @() }
+    if (-not (Test-Path -LiteralPath $Folder -PathType Container)) { return @() }
     $items = @(Get-ChildItem -LiteralPath $Folder -Filter $Filter -File -ErrorAction SilentlyContinue)
-    # Archived copies of earlier rounds and the runner's own backups are
-    # leftovers, not deliveries. Picking one of them would re-apply a patch
-    # that was already applied.
     $items = @($items | Where-Object {
         $_.Name -notlike "*.bak-*" -and
         $_.Name -notlike "apply_changes_round*" -and
         $_.Name -notlike "apply_changes *round*"
-    })
-    if ($items.Count -eq 0) { return $null }
-    $newest = ($items | Sort-Object -Property LastWriteTime -Descending | Select-Object -First 1)
-    if (-not $newest) { return $null }
-    return $newest.FullName
+    } | Sort-Object -Property Name)
+    return @($items | ForEach-Object { $_.FullName })
+}
+
+# Loads DeliveryLedger and TaskState for $ProjRoot so patch selection is driven by the ledger, never by mtime (W5 R5.1-R5.3).
+function Get-ArgonLedgerContext([string]$ProjRoot) {
+    $normProj = $ProjRoot.Replace('\', '/').TrimEnd('/').ToLowerInvariant()
+    $entries = New-Object System.Collections.Generic.List[object]
+
+    $ledgerPath = if ($env:ARGON_DELIVERY_LEDGER_PATH) { $env:ARGON_DELIVERY_LEDGER_PATH } else { Join-Path (Join-Path $env:USERPROFILE ".gemini") "argon_delivery_ledger.json" }
+    if (Test-Path -LiteralPath $ledgerPath -PathType Leaf) {
+        try {
+            $ledgerJson = Get-Content -LiteralPath $ledgerPath -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($ledgerJson -and $ledgerJson.projects) {
+                foreach ($prop in $ledgerJson.projects.PSObject.Properties) {
+                    $kNorm = ([string]$prop.Name).Replace('\', '/').TrimEnd('/').ToLowerInvariant()
+                    if ($kNorm -eq $normProj -and $prop.Value) {
+                        foreach ($item in @($prop.Value)) { $entries.Add($item) }
+                    }
+                }
+            }
+        } catch {}
+    }
+
+    if ($entries.Count -eq 0) {
+        $mirrorPath = Join-Path (Join-Path $ProjRoot ".argon_backup") "delivery_ledger.json"
+        if (Test-Path -LiteralPath $mirrorPath -PathType Leaf) {
+            try {
+                $mirrorArr = Get-Content -LiteralPath $mirrorPath -Raw -Encoding UTF8 | ConvertFrom-Json
+                foreach ($item in @($mirrorArr)) {
+                    if ($item) { $entries.Add($item) }
+                }
+            } catch {}
+        }
+    }
+
+    $taskDeliveredPath = ""
+    $taskDeliveryHash = ""
+    $tsPath = if ($env:ARGON_TASK_STATE_PATH) { $env:ARGON_TASK_STATE_PATH } else { Join-Path (Join-Path $env:USERPROFILE ".gemini") "argon_task_state.json" }
+    if (Test-Path -LiteralPath $tsPath -PathType Leaf) {
+        try {
+            $tsJson = Get-Content -LiteralPath $tsPath -Raw -Encoding UTF8 | ConvertFrom-Json
+            $tasksContainer = if ($tsJson.tasks) { $tsJson.tasks } else { $tsJson }
+            if ($tasksContainer) {
+                foreach ($prop in $tasksContainer.PSObject.Properties) {
+                    $kNorm = ([string]$prop.Name).Replace('\', '/').TrimEnd('/').ToLowerInvariant()
+                    if ($kNorm -eq $normProj -and $prop.Value) {
+                        if ($prop.Value.delivered) { $taskDeliveredPath = [string]$prop.Value.delivered }
+                        if ($prop.Value.delivery_hash) { $taskDeliveryHash = [string]$prop.Value.delivery_hash }
+                    }
+                }
+            }
+        } catch {}
+    }
+
+    $currentEntry = $null
+    if ($entries.Count -gt 0) {
+        $currentEntry = $entries[$entries.Count - 1]
+    }
+    $olderBySha = @{}
+    if ($entries.Count -gt 1) {
+        for ($i = 0; $i -lt ($entries.Count - 1); $i++) {
+            $e = $entries[$i]
+            if ($e -and $e.sha256) {
+                $olderBySha[[string]$e.sha256] = $e
+            }
+        }
+    }
+    return [pscustomobject]@{
+        Entries           = $entries
+        CurrentEntry      = $currentEntry
+        CurrentSha256     = if ($currentEntry -and $currentEntry.sha256) { [string]$currentEntry.sha256 } else { "" }
+        CurrentShortHash  = if ($currentEntry -and $currentEntry.short_hash) { [string]$currentEntry.short_hash } else { $taskDeliveryHash }
+        CurrentRoundId    = if ($currentEntry -and $currentEntry.round_id) { [string]$currentEntry.round_id } else { "current" }
+        CurrentFilePath   = if ($taskDeliveredPath) { $taskDeliveredPath } elseif ($currentEntry -and $currentEntry.file_path) { [string]$currentEntry.file_path } else { "" }
+        OlderBySha        = $olderBySha
+    }
 }
 
 # Resolves a path to its long form. Resolve-Path can hand back the 8.3 short name
@@ -147,58 +239,139 @@ try {
     # ---------------------------------------------------- locate the patch --
 
     $foundPatch = $null
+    $ledgerCtx = Get-ArgonLedgerContext $projectRoot
 
     if (-not [string]::IsNullOrWhiteSpace($PatchFile)) {
-        # (a) explicit patch file - it must exist
+        # (a) explicit -PatchFile wins over discovery (W5 R5.2), subject to older-ledger refusal unless -Force (R5.3).
         if (-not (Test-Path -LiteralPath $PatchFile -PathType Leaf)) {
             Write-ArgonError "The -PatchFile you specified does not exist: $PatchFile"
             Write-Host "  Pass the full path of the delivered apply_changes.ps1, e.g." -ForegroundColor Gray
             Write-Host "  -PatchFile `"$env:USERPROFILE\Downloads\apply_changes (1).ps1`"" -ForegroundColor Gray
             exit 2
         }
-        $foundPatch = Get-LongPath $PatchFile
+        $explicitCandidate = Get-LongPath $PatchFile
+        $explicitSha = Get-ArgonPatchSha256 $explicitCandidate
+        if ($ledgerCtx.OlderBySha.ContainsKey($explicitSha) -and -not $Force) {
+            $oldRec = $ledgerCtx.OlderBySha[$explicitSha]
+            $oldRid = [string]$oldRec.round_id
+            Write-ArgonError "Refusing to apply older patch: $explicitCandidate (sha256=$explicitSha) belongs to earlier round $oldRid in DeliveryLedger. Pass -Force to override."
+            exit 5
+        }
+        Write-ArgonInfo "Explicit -PatchFile selected: $explicitCandidate (sha256=$explicitSha)"
+        $foundPatch = $explicitCandidate
     }
     else {
-        # Collect EVERY candidate from EVERY known location and take the newest.
-        # A freshly delivered download must beat a stale copy that happens to sit
-        # in the project root from an earlier run.
-        $candidates = New-Object System.Collections.Generic.List[object]
-
-        # An explicit file passed through -SearchPath wins outright.
-        foreach ($extra in $SearchPath) {
-            if ([string]::IsNullOrWhiteSpace($extra)) { continue }
-            if (Test-Path -LiteralPath $extra -PathType Leaf) {
-                $foundPatch = Get-LongPath $extra
-                break
+        # W5 (R5.1-R5.3): Choose the patch by DeliveryLedger / TaskState, NEVER by LastWriteTime.
+        $candidatePaths = New-Object System.Collections.Generic.List[string]
+        $seenCandidateKeys = @{}
+        function Add-CandidateFile([string]$CandPath) {
+            if ([string]::IsNullOrWhiteSpace($CandPath)) { return }
+            if (-not (Test-Path -LiteralPath $CandPath -PathType Leaf)) { return }
+            $longCand = Get-LongPath $CandPath
+            $key = $longCand.ToLowerInvariant()
+            if (-not $seenCandidateKeys.ContainsKey($key)) {
+                $seenCandidateKeys[$key] = $true
+                $candidatePaths.Add($longCand)
             }
         }
 
-        if (-not $foundPatch) {
-            # NOTE: the copy of the patch that THIS runner writes into the
-            # project root is always the PREVIOUS patch, never a new delivery,
-            # so it is not a candidate here. Only a real Gemini delivery counts:
-            # apply_changes.ps1 / apply_changes (1).ps1 and friends. Archived
-            # copies (apply_changes_roundN.ps1) and *.bak-* backups are
-            # leftovers and are ignored on purpose.
-            foreach ($pair in @(
-                @($projectDownloadsDir, "apply_changes*.ps1"),
-                @($downloadsDir, "apply_changes*.ps1"),
-                @($downloadsDir, "*argon*.ps1")
-            )) {
-                $newest = Get-NewestPatchIn $pair[0] $pair[1]
-                if ($newest) { $candidates.Add((Get-Item -LiteralPath $newest)) }
+        if ($ledgerCtx.CurrentFilePath -and (Test-Path -LiteralPath $ledgerCtx.CurrentFilePath -PathType Leaf)) {
+            Add-CandidateFile $ledgerCtx.CurrentFilePath
+        }
+        foreach ($extra in $SearchPath) {
+            if ([string]::IsNullOrWhiteSpace($extra)) { continue }
+            if (Test-Path -LiteralPath $extra -PathType Leaf) {
+                Add-CandidateFile $extra
+            } elseif (Test-Path -LiteralPath $extra -PathType Container) {
+                foreach ($cf in (Get-CandidatePatchesIn $extra "apply_changes*.ps1")) { Add-CandidateFile $cf }
             }
-            foreach ($extra in $SearchPath) {
-                if ([string]::IsNullOrWhiteSpace($extra)) { continue }
-                if (Test-Path -LiteralPath $extra -PathType Leaf) { continue }
-                $newest = Get-NewestPatchIn $extra "apply_changes*.ps1"
-                if ($newest) { $candidates.Add((Get-Item -LiteralPath $newest)) }
-            }
+        }
+        foreach ($sub in @("", "followup", "new")) {
+            $scanDir = if ($sub) { Join-Path $projectDownloadsDir $sub } else { $projectDownloadsDir }
+            foreach ($cf in (Get-CandidatePatchesIn $scanDir "apply_changes*.ps1")) { Add-CandidateFile $cf }
+        }
+        if ($SearchPath.Count -eq 0 -and $candidatePaths.Count -eq 0) {
+            foreach ($cf in (Get-CandidatePatchesIn $downloadsDir "apply_changes*.ps1")) { Add-CandidateFile $cf }
+            foreach ($cf in (Get-CandidatePatchesIn $downloadsDir "*argon*.ps1")) { Add-CandidateFile $cf }
+        }
 
-            if ($candidates.Count -gt 0) {
-                $best = $candidates | Sort-Object -Property LastWriteTime -Descending | Select-Object -First 1
-                if ($best) { $foundPatch = Get-LongPath $best.FullName }
+        $candidateReports = New-Object System.Collections.Generic.List[object]
+        $matchingCurrent = New-Object System.Collections.Generic.List[object]
+        $olderMatches = New-Object System.Collections.Generic.List[object]
+        $unrecordedMatches = New-Object System.Collections.Generic.List[object]
+
+        foreach ($cp in $candidatePaths) {
+            $cSha = Get-ArgonPatchSha256 $cp
+            $cShort = if ($cSha.Length -ge 16) { $cSha.Substring(0, 16) } else { $cSha }
+            if ($ledgerCtx.CurrentSha256 -and $cSha -eq $ledgerCtx.CurrentSha256) {
+                $dec = "CURRENT_LEDGER_MATCH (round $($ledgerCtx.CurrentRoundId))"
+                $rec = [pscustomobject]@{ Path = $cp; Sha256 = $cSha; Decision = $dec; RoundId = $ledgerCtx.CurrentRoundId }
+                $matchingCurrent.Add($rec)
             }
+            elseif ($ledgerCtx.CurrentShortHash -and $cShort -eq $ledgerCtx.CurrentShortHash -and -not $ledgerCtx.OlderBySha.ContainsKey($cSha)) {
+                $dec = "CURRENT_TASKSTATE_MATCH (round $($ledgerCtx.CurrentRoundId))"
+                $rec = [pscustomobject]@{ Path = $cp; Sha256 = $cSha; Decision = $dec; RoundId = $ledgerCtx.CurrentRoundId }
+                $matchingCurrent.Add($rec)
+            }
+            elseif ($ledgerCtx.OlderBySha.ContainsKey($cSha)) {
+                $oRec = $ledgerCtx.OlderBySha[$cSha]
+                $oRid = [string]$oRec.round_id
+                if ($Force) {
+                    $dec = "OLDER_ROUND_ALLOWED_BY_FORCE (round $oRid)"
+                    $rec = [pscustomobject]@{ Path = $cp; Sha256 = $cSha; Decision = $dec; RoundId = $oRid }
+                    $matchingCurrent.Add($rec)
+                } else {
+                    $dec = "REFUSED_OLDER_ROUND (belongs to round $oRid)"
+                    $rec = [pscustomobject]@{ Path = $cp; Sha256 = $cSha; Decision = $dec; RoundId = $oRid }
+                    $olderMatches.Add($rec)
+                }
+            }
+            else {
+                $dec = "UNRECORDED_IN_LEDGER"
+                $rec = [pscustomobject]@{ Path = $cp; Sha256 = $cSha; Decision = $dec; RoundId = "" }
+                $unrecordedMatches.Add($rec)
+            }
+            $candidateReports.Add($rec)
+        }
+
+        if ($candidateReports.Count -gt 1 -or $olderMatches.Count -gt 0) {
+            Write-ArgonInfo "Candidate patch files evaluated against DeliveryLedger (never chosen by LastWriteTime):"
+            foreach ($cr in $candidateReports) {
+                Write-Host ("    - {0} | sha256={1} | ledger_decision={2}" -f $cr.Path, $cr.Sha256, $cr.Decision) -ForegroundColor Gray
+            }
+        }
+
+        if ($matchingCurrent.Count -gt 0) {
+            $uniqueShas = @($matchingCurrent | Select-Object -ExpandProperty Sha256 -Unique)
+            if ($uniqueShas.Count -gt 1) {
+                Write-ArgonError "Multiple candidate files matched with different SHA-256 digests - refusing to guess. Pass -PatchFile explicitly."
+                exit 5
+            }
+            $chosenObj = $matchingCurrent[0]
+            if ($ledgerCtx.CurrentFilePath) {
+                $recLong = Get-LongPath $ledgerCtx.CurrentFilePath
+                foreach ($mc in $matchingCurrent) {
+                    if ([string]::Equals($mc.Path, $recLong, [System.StringComparison]::OrdinalIgnoreCase)) {
+                        $chosenObj = $mc
+                        break
+                    }
+                }
+            }
+            $foundPatch = $chosenObj.Path
+            Write-ArgonInfo "Ledger decision: selected current task delivery $foundPatch (round=$($chosenObj.RoundId), sha256=$($chosenObj.Sha256))"
+        }
+        elseif ($olderMatches.Count -gt 0 -and $unrecordedMatches.Count -eq 0) {
+            $firstOld = $olderMatches[0]
+            Write-ArgonError "Refusing to apply older patch: $($firstOld.Path) (sha256=$($firstOld.Sha256)) belongs to earlier round $($firstOld.RoundId) in DeliveryLedger. Pass -Force to override."
+            exit 5
+        }
+        elseif ($candidateReports.Count -gt 1) {
+            Write-ArgonError "Found $($candidateReports.Count) candidate patch files and DeliveryLedger does not identify a single current delivery - refusing to guess by LastWriteTime. Pass -PatchFile explicitly."
+            exit 5
+        }
+        elseif ($unrecordedMatches.Count -eq 1 -and $ledgerCtx.Entries.Count -eq 0) {
+            $foundPatch = $unrecordedMatches[0].Path
+            Write-ArgonInfo "Ledger decision: single candidate selected (DeliveryLedger has no prior entries): $foundPatch (sha256=$($unrecordedMatches[0].Sha256))"
         }
     }
 
