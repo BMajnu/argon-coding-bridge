@@ -13538,7 +13538,7 @@ def dispatch_to_argon(
                         page_url=effective_chat_url,
                         account=target_email or "",
                     )
-                if no_recorded_followup:
+                if not is_continuation and not resume_chat:  # round-27 fix: the resolver flag was never assigned here
                     print(f"[+] lane: followup -> NEW chat {chat_id} (no recorded conversation)")
                 elif (lane or "").strip().lower() == "new" or new_session:
                     print(f"[+] lane: new -> NEW chat {chat_id} ({effective_chat_url})")
@@ -14908,6 +14908,7 @@ def append_followup_to_running_task(
     verify_cmd: Optional[str] = None,
     skip_verify: bool = False,
     deadline_seconds: int = 1800,
+    attach_images: Optional[List[str]] = None,
 ) -> int:
     """Send an additional follow-up message into a currently running task's conversation
     without superseding it, or fall back to an ordinary follow-up if no task is running (Addendum B).
@@ -15450,6 +15451,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             verify_cmd=args.verify_cmd,
             skip_verify=args.skip_verify,
             deadline_seconds=args.deadline_seconds,
+            attach_images=attach_images,
         )
 
     if getattr(args, "manual_handoff", False):
