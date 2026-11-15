@@ -187,9 +187,12 @@ def case3_and_4_and_5_hermetic_throwaway_chrome() -> Dict[str, Any]:
         )
 
         # Case 5A: Verify live content-script marker on a Gemini page and CLI exit code 0
+        from safe_browser import get_repo_companion_extension_version
+
+        expected_marker = get_repo_companion_extension_version()
         cs_rep = verify_content_script_on_gemini(http_endpoint=http_ep, slot="/u/0/", timeout=12.0, hermetic_synthetic=True)
         assert cs_rep.get("ok") is True, f"Content script verification on Gemini page failed: {cs_rep}"
-        assert cs_rep.get("marker") == "1.16.0", f"Unexpected content script marker: {cs_rep}"
+        assert cs_rep.get("marker") == expected_marker, f"Unexpected content script marker: {cs_rep} (expected {expected_marker})"
 
         cli_rc = install_companion_extension_cli(
             slot="/u/0/",
@@ -214,7 +217,7 @@ def case3_and_4_and_5_hermetic_throwaway_chrome() -> Dict[str, Any]:
         assert ext_after_restart.get("ok") is True, f"Extension not re-installed after restart: {ext_after_restart}"
         assert ext_after_restart.get("id") == COMPANION_EXTENSION_ID
         cs_after_restart = verify_content_script_on_gemini(http_endpoint=http_ep_2, slot="/u/0/", timeout=12.0, hermetic_synthetic=True)
-        assert cs_after_restart.get("ok") is True and cs_after_restart.get("marker") == "1.16.0", (
+        assert cs_after_restart.get("ok") is True and cs_after_restart.get("marker") == expected_marker, (
             f"Content script not alive after restart: {cs_after_restart}"
         )
 

@@ -8,15 +8,38 @@
 (function () {
   "use strict";
 
-  const EXTENSION_VERSION = "1.16.0";
+  const EXTENSION_VERSION = "1.17.0";
+  const SHARED_ARGON_MODEL_LABELS = [
+    "Code & analysis 4 Argon",
+    "কোড ও বিশ্লেষণ 4 Argon",
+    "4 Argon",
+    "Gemini 4 Argon",
+    "Argon",
+    "আরগন",
+    "আর্গন"
+  ];
   const RE_TASK = /^\s*(task|টাস্ক)\s*$/i;
   const RE_CHAT = /^\s*(chat|চ্যাট|চাট)\s*$/i;
-  const RE_ARGON = /(code\s*&\s*analysis\s*4\s*argon|4\s*argon|gemini[\s\-_]*4[\s\-_]*argon|(?<![\w\-])argon(?![\w\-])|আর\u09cd?গন)/i;
+  const RE_ARGON = /(code\s*&\s*analysis\s*4\s*argon|কোড\s*ও\s*বিশ্লেষণ\s*4\s*argon|4\s*argon|gemini[\s\-_]*4[\s\-_]*argon|(?<![\w\-])argon(?![\w\-])|আর\u09cd?গন|আর্গন)/i;
   const RE_FLASH = /(?:^|\b)(?:3\.8\s*flash|2\.5\s*flash|2\.0\s*flash|gemini[\s\-_]*flash|flash|ফ্ল্যাশ|4\s*hydrogen|gemini[\s\-_]*4[\s\-_]*hydrogen|hydrogen|হাইড্রোজেন|everyday\s*help)(?:\b|$)/i;
   const RE_HYDROGEN = /(?:^|\b)(?:4\s*hydrogen|gemini[\s\-_]*4[\s\-_]*hydrogen|hydrogen|হাইড্রোজেন|everyday\s*help)(?:\b|$)/i;
   const MAX_BASE64_ATTACH_BYTES = 8 * 1024 * 1024;
   const RE_UPLOAD = /(upload|attach|file|আপলোড|ডিজাইসো|ফাইল|সংযুক্ত|টুল)/i;
   const RE_SEND = /(send|submit|পাঠান)/i;
+
+  // Round 27 Contract 3 R3.1: the model chip is LOCALISED, so the accepted Argon labels
+  // must be the same list the Core uses (`SHARED_ARGON_MODEL_LABELS` in
+  // round23_reliability.py). It used to be referenced without ever being defined here,
+  // which made every model check throw a ReferenceError and broke the whole send path.
+  const ARGON_MODEL_LABELS = [
+    "Code & analysis 4 Argon",
+    "কোড ও বিশ্লেষণ 4 Argon",
+    "4 Argon",
+    "Gemini 4 Argon",
+    "Argon",
+    "আরগন",
+    "আর্গন"
+  ];
 
   const companionRuntime = {
     version: EXTENSION_VERSION,
@@ -31,6 +54,29 @@
     driveFileIds: [],
     observerInstalled: false
   };
+
+  function getEffectiveBase64AttachCap(opts) {
+    const o = opts || {};
+    if (o.maxBase64Bytes !== undefined && o.maxBase64Bytes !== null && !Number.isNaN(Number(o.maxBase64Bytes))) {
+      return Math.max(0, Math.floor(Number(o.maxBase64Bytes)));
+    }
+    if (o.effectiveBase64CapBytes !== undefined && o.effectiveBase64CapBytes !== null && !Number.isNaN(Number(o.effectiveBase64CapBytes))) {
+      return Math.max(0, Math.floor(Number(o.effectiveBase64CapBytes)));
+    }
+    try {
+      const attrVal = document.documentElement && document.documentElement.getAttribute("data-argon-max-base64-attach-bytes");
+      if (attrVal !== null && attrVal !== "" && !Number.isNaN(Number(attrVal))) {
+        return Math.max(0, Math.floor(Number(attrVal)));
+      }
+      if (typeof window !== "undefined" && window.ARGON_MAX_BASE64_ATTACH_MB !== undefined && window.ARGON_MAX_BASE64_ATTACH_MB !== "") {
+        const mb = Number(window.ARGON_MAX_BASE64_ATTACH_MB);
+        if (!Number.isNaN(mb) && mb >= 0) {
+          return Math.floor(mb * 1024 * 1024);
+        }
+      }
+    } catch (_err) {}
+    return MAX_BASE64_ATTACH_BYTES;
+  }
 
   function countConversationTurns() {
     const selectors = [
@@ -48,6 +94,64 @@
     } catch (_err) {
       return document.querySelectorAll("user-query, .user-turn, model-response").length;
     }
+  }
+
+  function hasQueuedSteeringTurn() {
+    try {
+      return Boolean(document.querySelector(".queued-steering-turn, [class*='queued-steering-turn']"));
+    } catch (_err) {
+      return false;
+    }
+  }
+
+  function conversationAlreadyContainsPrompt(promptText) {
+    if (hasQueuedSteeringTurn()) {
+      return true;
+    }
+    const raw = String(promptText || companionRuntime.cachedPromptText || "")
+      .replace(/`/g, "")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (!raw || raw.length < 16) {
+      return false;
+    }
+    const probe = raw.slice(0, Math.min(raw.length, 120));
+    try {
+      const turns = Array.from(
+        document.querySelectorAll(
+          "user-query, [data-test-id='user-query'], message-turn.user-query, .user-query-container, .user-turn"
+        )
+      );
+      for (const t of turns) {
+        if (t.closest && t.closest("rich-textarea, .input-area, .chat-input, footer, form, [data-test-id='chat-input']")) {
+          continue;
+        }
+        const txt = String(t.innerText || t.textContent || "")
+          .replace(/`/g, "")
+          .replace(/\s+/g, " ")
+          .trim();
+        if (txt && txt.includes(probe)) {
+          return true;
+        }
+      }
+    } catch (_err) {}
+    return false;
+  }
+
+  function shouldDisarmObserverForDomState(promptText) {
+    if (companionRuntime.sendPerformed) {
+      return "send_performed";
+    }
+    if (hasQueuedSteeringTurn()) {
+      return "queued_steering_turn_present";
+    }
+    if (countConversationTurns() > companionRuntime.turnsAtPaste) {
+      return "conversation_gained_turn";
+    }
+    if (conversationAlreadyContainsPrompt(promptText)) {
+      return "prompt_already_in_conversation";
+    }
+    return "";
   }
 
   function disarmPromptAliveGuard(reason) {
@@ -169,7 +273,50 @@
     return fallback || document.body;
   }
 
+  function countConversationDomTurns() {
+    try {
+      return document.querySelectorAll(
+        "user-query, [data-test-id='user-query'], message-turn.user-query, .user-query-container, .user-turn, model-response, [data-test-id='model-response']"
+      ).length;
+    } catch (_err) {
+      return 0;
+    }
+  }
+
+  function hasQueuedSteeringTurnInDom() {
+    try {
+      return Boolean(document.querySelector(".queued-steering-turn, [class*='queued-steering-turn']"));
+    } catch (_err) {
+      return false;
+    }
+  }
+
+  function disarmCompanionPromptGuard(reason) {
+    companionRuntime.keepPromptAlive = false;
+    companionRuntime.cachedPromptText = "";
+    companionRuntime.sendPerformed = true;
+    companionRuntime.disarmReason = String(reason || "disarmed");
+    try {
+      if (document && document.documentElement) {
+        document.documentElement.setAttribute("data-argon-prompt-guard-disarmed", companionRuntime.disarmReason);
+      }
+    } catch (_err) {}
+  }
+
   function getComposerText(composer) {
+    if (companionRuntime.keepPromptAlive || companionRuntime.cachedPromptText) {
+      const curTurns = countConversationDomTurns();
+      if (
+        companionRuntime.sendPerformed ||
+        hasQueuedSteeringTurnInDom() ||
+        (typeof companionRuntime.turnsAtPaste === "number" && curTurns > companionRuntime.turnsAtPaste)
+      ) {
+        disarmCompanionPromptGuard(
+          hasQueuedSteeringTurnInDom() ? "queued_steering_turn_detected" : "conversation_gained_turn"
+        );
+        return "";
+      }
+    }
     const comp = composer || findLowestComposer();
     if (!comp) {
       return "";
@@ -179,6 +326,11 @@
   }
 
   function focusComposerDom(composer) {
+    if (!companionRuntime.keepPromptAlive) {
+      companionRuntime.sendPerformed = false;
+      companionRuntime.turnsAtPaste = countConversationDomTurns();
+      companionRuntime.disarmReason = "";
+    }
     const comp = composer || findLowestComposer();
     if (!comp) {
       return false;
@@ -297,7 +449,10 @@
       };
     }
 
-    if (!companionRuntime.sendPerformed) {
+    const domDisarm = shouldDisarmObserverForDomState(text);
+    if (domDisarm) {
+      disarmPromptAliveGuard(domDisarm);
+    } else if (!companionRuntime.sendPerformed) {
       companionRuntime.cachedPromptText = text;
       companionRuntime.keepPromptAlive = true;
       installComposerMutationGuard();
@@ -342,6 +497,22 @@
       }
     }
     return null;
+  }
+
+  async function waitForModelChipSemantic(waitMs, pollMs) {
+    const totalMs = Math.max(0, Number(waitMs || 0));
+    const stepMs = Math.max(25, Math.min(500, Number(pollMs || 200)));
+    const deadline = Date.now() + totalMs;
+    while (true) {
+      const chip = findModelChipSemantic();
+      if (chip) {
+        return chip;
+      }
+      if (Date.now() >= deadline) {
+        return null;
+      }
+      await new Promise((r) => setTimeout(r, stepMs));
+    }
   }
 
   function readModelChipName(chipEl) {
@@ -443,13 +614,35 @@
     }
 
     let chip = findModelChipSemantic();
+    const isCont = Boolean(opts.isContinuation);
+    const waitMs = (opts.waitForChipMs !== undefined)
+      ? Math.max(0, Number(opts.waitForChipMs || 0))
+      : ((opts.waitForChipSeconds !== undefined)
+        ? Math.max(0, Number(opts.waitForChipSeconds || 0) * 1000)
+        : (isCont ? 45000 : 0));
+    let waitedOnContinuation = false;
+    if (!chip && waitMs > 0) {
+      // Round 27 W7: on a CONTINUATION page the chip can take seconds to hydrate, so
+      // WAIT for it instead of taking a single snapshot. `waitedOnContinuation` says we
+      // did wait (it used to be referenced without ever being defined, which made every
+      // model check throw a ReferenceError and broke the whole send path).
+      waitedOnContinuation = isCont;
+      const deadlineMs = Date.now() + waitMs;
+      while (!chip && Date.now() < deadlineMs) {
+        await new Promise((r) => setTimeout(r, Math.min(150, Math.max(25, deadlineMs - Date.now()))));
+        chip = findModelChipSemantic();
+      }
+    }
     if (!chip) {
+      const waitSec = Math.max(1, Math.round((waitMs || 45000) / 1000));
       return {
         ok: false,
         operation: "model",
         path: "extension",
-        model: "(missing)",
-        reason: "model picker chip is missing from the page DOM (Rule R1: a missing model picker is a failure, not a pass)"
+        model: "(not visible)",
+        reason: isCont
+          ? `model chip (not visible) after ${waitSec} s on a continuation page - the conversation is still hydrating`
+          : "model picker chip is missing from the page DOM (Rule R1: a missing model picker is a failure, not a pass)"
       };
     }
     let chipName = readModelChipName(chip);
@@ -461,7 +654,9 @@
         operation: "model",
         path: "extension",
         mode: "task",
-        model: chipName
+        model: chipName,
+        waitedOnContinuation: waitedOnContinuation,
+        supportedLabels: ARGON_MODEL_LABELS.slice()
       };
     }
 
@@ -553,7 +748,9 @@
       operation: "model",
       path: "extension",
       mode: "task",
-      model: effectiveModel
+      model: effectiveModel,
+      waitedOnContinuation: waitedOnContinuation,
+      supportedLabels: ARGON_MODEL_LABELS.slice()
     };
   }
 
@@ -611,11 +808,42 @@
     return bytes;
   }
 
+  function getEffectiveBase64CapBytes(opts) {
+    if (opts && Number(opts.maxBase64Bytes) > 0) {
+      return Number(opts.maxBase64Bytes);
+    }
+    try {
+      const attrVal = document && document.documentElement
+        ? Number(document.documentElement.getAttribute("data-argon-max-base64-bytes") || 0)
+        : 0;
+      if (attrVal > 0) {
+        return attrVal;
+      }
+    } catch (_err) {}
+    return MAX_BASE64_ATTACH_BYTES;
+  }
+
   async function attachArchiveViaDataTransfer(payload) {
     const opts = payload || {};
     const fileName = String(opts.fileName || "argon_context.zip").trim();
     const expectedSize = Number(opts.expectedSize || 0);
+    const effectiveCap = getEffectiveBase64CapBytes(opts);
+    const allowOverCap = Boolean(opts.allowOverCap);
     let base64Data = String(opts.base64Data || "");
+    const estimatedBytes = expectedSize > 0
+      ? expectedSize
+      : (base64Data ? Math.floor((base64Data.length * 3) / 4) : 0);
+    if (!allowOverCap && estimatedBytes > effectiveCap) {
+      return {
+        ok: false,
+        operation: "attach",
+        path: "extension",
+        reason: "size_cap_exceeded",
+        maxBase64Bytes: effectiveCap,
+        size: estimatedBytes,
+        detail: `the base64 route can carry at most ${(effectiveCap / (1024 * 1024)).toFixed(2)} MB; above that the zero-copy route is used`
+      };
+    }
 
     if (!base64Data && opts.archiveUrl) {
       const swFetch = await sendServiceWorkerMessage("fetch_archive_bytes", {
@@ -641,6 +869,32 @@
       };
     }
 
+    let bytes = null;
+    try {
+      bytes = base64ToUint8Array(base64Data);
+    } catch (err) {
+      return {
+        ok: false,
+        operation: "attach",
+        path: "extension",
+        reason: `invalid base64 archive payload (${String(err)})`
+      };
+    }
+
+    if (!allowOverCap && bytes.byteLength > effectiveCap) {
+      const capMb = Math.round((effectiveCap / (1024 * 1024)) * 100) / 100;
+      return {
+        ok: false,
+        operation: "attach",
+        path: "extension",
+        fileName: fileName,
+        size: bytes.byteLength,
+        capBytes: effectiveCap,
+        reason: "size_cap_exceeded",
+        detail: `the base64 route can carry at most ${capMb} MB; above that the zero-copy route is used`
+      };
+    }
+
     let fileInput = findFileInputInDom();
     if (!fileInput) {
       const uploadBtn = findUploadButtonSemantic();
@@ -659,18 +913,6 @@
         operation: "attach",
         path: "extension",
         reason: "the upload menu rendered no file input"
-      };
-    }
-
-    let bytes = null;
-    try {
-      bytes = base64ToUint8Array(base64Data);
-    } catch (err) {
-      return {
-        ok: false,
-        operation: "attach",
-        path: "extension",
-        reason: `invalid base64 archive payload (${String(err)})`
       };
     }
 
@@ -706,8 +948,9 @@
 
     // If Gemini cleared the composer when the attachment completed, restore the prompt immediately (ONLY before send).
     if (companionRuntime.keepPromptAlive && companionRuntime.cachedPromptText) {
-      if (companionRuntime.sendPerformed || countConversationTurns() > companionRuntime.turnsAtPaste) {
-        disarmPromptAliveGuard("conversation_gained_turn");
+      const disarmCheck = shouldDisarmObserverForDomState(companionRuntime.cachedPromptText);
+      if (disarmCheck) {
+        disarmPromptAliveGuard(disarmCheck);
       } else {
         const curText = getComposerText();
         if (curText.length < Math.min(companionRuntime.cachedPromptText.trim().length, 8)) {
@@ -742,6 +985,7 @@
       fileName: fileName,
       stem: stem,
       size: bytes.byteLength,
+      capBytes: effectiveCap,
       chipVisible: chipVisible,
       inputHasFile: inputHasFile,
       composerRestored: companionRuntime.composerClearedCount > 0,
@@ -825,7 +1069,10 @@
     const expectedPrompt = String(opts.promptText || companionRuntime.cachedPromptText || "");
     const expectedMin = Math.max(1, Number(opts.expectedMinLen || Math.min(Math.floor(expectedPrompt.trim().length / 2), 40) || 1));
     let currentText = getComposerText(composer);
-    if (
+    const domDisarm = shouldDisarmObserverForDomState(expectedPrompt);
+    if (domDisarm) {
+      disarmPromptAliveGuard(domDisarm);
+    } else if (
       currentText.length < expectedMin &&
       expectedPrompt.trim() &&
       !companionRuntime.sendPerformed &&
@@ -857,7 +1104,8 @@
     const modelCheck = await ensureTaskModeAndArgonSemantic({
       manualSetup: Boolean(opts.manualSetup),
       isContinuation: Boolean(opts.isContinuation),
-      recordedWorkspaceMode: opts.recordedWorkspaceMode || "task"
+      recordedWorkspaceMode: opts.recordedWorkspaceMode || "task",
+      waitForChipMs: opts.waitForChipMs !== undefined ? opts.waitForChipMs : 0
     });
     if (!modelCheck.ok) {
       return {
@@ -935,8 +1183,9 @@
           }
         }
         if (companionRuntime.keepPromptAlive || companionRuntime.cachedPromptText) {
-          if (companionRuntime.sendPerformed || countConversationTurns() > companionRuntime.turnsAtPaste) {
-            disarmPromptAliveGuard("conversation_gained_turn");
+          const disarmCheck = shouldDisarmObserverForDomState(companionRuntime.cachedPromptText);
+          if (disarmCheck) {
+            disarmPromptAliveGuard(disarmCheck);
           } else if (companionRuntime.keepPromptAlive && companionRuntime.cachedPromptText) {
             const comp = findLowestComposer();
             if (comp && getComposerText(comp).length === 0) {
@@ -986,6 +1235,116 @@
     }, true);
   }
 
+  function extractChipFileNameSemantic(chip) {
+    if (!chip || !(chip instanceof Element)) {
+      return "";
+    }
+    const selectors = [
+      "generated-file-senna-preview .title-container [title]",
+      ".title-container [title]",
+      "[data-file-name]",
+      ".file-name-lr",
+      ".title-container"
+    ];
+    for (const sel of selectors) {
+      const node = chip.querySelector(sel);
+      if (node) {
+        const attr = String(node.getAttribute("title") || node.getAttribute("data-file-name") || "").trim();
+        if (attr && !/^(export|fullscreen|close|download|drive)$/i.test(attr)) {
+          return attr;
+        }
+        const txt = String(node.innerText || node.textContent || "").trim();
+        if (txt) {
+          const m = txt.match(/([A-Za-z0-9_.\- ()]+\.[A-Za-z0-9]{1,8})/);
+          if (m && m[1]) {
+            return m[1].trim();
+          }
+        }
+      }
+    }
+    const raw = String(chip.getAttribute("data-file-name") || chip.getAttribute("title") || chip.innerText || chip.textContent || "").trim();
+    const m = raw.match(/([A-Za-z0-9_.\- ()]+\.[A-Za-z0-9]{1,8})/);
+    if (m && m[1]) {
+      return m[1].trim();
+    }
+    if (/apply_changes/i.test(raw)) {
+      return "apply_changes.ps1";
+    }
+    return "";
+  }
+
+  function findLastTurnDeliveryChipSemantic() {
+    const turnSelectors = [
+      "model-response",
+      "[data-test-id='model-response']",
+      ".model-response-text",
+      "message-turn.model-response",
+      "div.model-response"
+    ];
+    let turns = [];
+    for (const sel of turnSelectors) {
+      const found = Array.from(document.querySelectorAll(sel));
+      if (found.length > 0) {
+        turns = found;
+        break;
+      }
+    }
+    const userNodes = Array.from(
+      document.querySelectorAll("user-query, [data-test-id='user-query'], message-turn.user-query, .user-query-container, .user-turn")
+    );
+    const lastUser = userNodes.length > 0 ? userNodes[userNodes.length - 1] : null;
+    const isAfterLastUser = (node) => {
+      if (!lastUser || !node) {
+        return true;
+      }
+      if (lastUser === node || (lastUser.contains && lastUser.contains(node))) {
+        return false;
+      }
+      const pos = node.compareDocumentPosition(lastUser);
+      return !(pos & Node.DOCUMENT_POSITION_FOLLOWING);
+    };
+
+    if (turns.length > 0) {
+      const newestTurn = turns[turns.length - 1];
+      if (!isAfterLastUser(newestTurn)) {
+        return { found: false, turnIndex: turns.length, fileName: "", fileId: "" };
+      }
+      const chips = Array.from(newestTurn.querySelectorAll("generated-file")).filter(isVisible);
+      const patchChips = chips.filter((c) => {
+        const fn = extractChipFileNameSemantic(c).toLowerCase();
+        return fn.includes("apply_changes") || fn.endsWith(".ps1");
+      });
+      if (patchChips.length > 0) {
+        const chosen = patchChips[patchChips.length - 1];
+        const fname = extractChipFileNameSemantic(chosen) || "apply_changes.ps1";
+        const fid = String(chosen.getAttribute("data-file-id") || chosen.getAttribute("data-drive-file-id") || "").trim();
+        return {
+          found: true,
+          turnIndex: turns.length,
+          fileName: fname,
+          fileId: fid
+        };
+      }
+      return { found: false, turnIndex: turns.length, fileName: "", fileId: "" };
+    }
+
+    const allChips = Array.from(document.querySelectorAll("generated-file")).filter((c) => isVisible(c) && isAfterLastUser(c));
+    const matching = allChips.filter((c) => {
+      const fn = extractChipFileNameSemantic(c).toLowerCase();
+      return fn.includes("apply_changes") || fn.endsWith(".ps1");
+    });
+    if (matching.length > 0) {
+      const chosen = matching[matching.length - 1];
+      return {
+        found: true,
+        turnIndex: 1,
+        fileName: extractChipFileNameSemantic(chosen) || "apply_changes.ps1",
+        fileId: String(chosen.getAttribute("data-file-id") || chosen.getAttribute("data-drive-file-id") || "").trim()
+      };
+    }
+    return { found: false, turnIndex: 0, fileName: "", fileId: "" };
+  }
+
   function recordDriveUrlIfPresent(rawUrl) {
     const url = String(rawUrl || "");
     if (!url.includes("drive.google.com") && !url.includes("/viewer/")) {
@@ -1027,6 +1386,7 @@
         path: "extension",
         version: EXTENSION_VERSION,
         lastModelSeen: companionRuntime.lastModelSeen,
+        supportedModelLabels: ARGON_MODEL_LABELS.slice(),
         driveFileIds: companionRuntime.driveFileIds.slice()
       };
     }
@@ -1059,8 +1419,38 @@
         sendPerformed: companionRuntime.sendPerformed,
         turnsAtPaste: companionRuntime.turnsAtPaste,
         currentTurns: countConversationTurns(),
+        queuedSteeringPresent: hasQueuedSteeringTurn(),
         composerClearedCount: companionRuntime.composerClearedCount,
         disarmReason: companionRuntime.disarmReason
+      };
+    }
+    if (act === "disarm_prompt_guard") {
+      disarmCompanionPromptGuard(pl.reason || "disarm_prompt_guard");
+      return {
+        ok: true,
+        operation: "disarm_prompt_guard",
+        path: "extension",
+        keepPromptAlive: false,
+        cachedPromptText: "",
+        reason: companionRuntime.disarmReason
+      };
+    }
+    if (act === "get_runtime_state") {
+      const cachedStr = String(companionRuntime.cachedPromptText || "");
+      return {
+        ok: true,
+        operation: "get_runtime_state",
+        path: "extension",
+        version: EXTENSION_VERSION,
+        keepPromptAlive: Boolean(companionRuntime.keepPromptAlive),
+        cachedPromptText: cachedStr,
+        cachedPromptTextLength: cachedStr.length,
+        sendPerformed: Boolean(companionRuntime.sendPerformed),
+        turnsAtPaste: Number(companionRuntime.turnsAtPaste || 0),
+        currentTurns: countConversationDomTurns(),
+        composerClearedCount: Number(companionRuntime.composerClearedCount || 0),
+        disarmReason: String(companionRuntime.disarmReason || ""),
+        sharedModelLabels: SHARED_ARGON_MODEL_LABELS.slice()
       };
     }
     if (act === "ensure_mode_and_model") {
@@ -1070,11 +1460,108 @@
       return await attachArchiveViaDataTransfer(pl);
     }
     if (act === "click_send") {
-      return await semanticClickSend(pl);
+      const opts = pl || {};
+      const composer = findLowestComposer();
+      if (!composer) {
+        return {
+          ok: false,
+          operation: "send",
+          path: "extension",
+          reason: "composer editable was not found before send"
+        };
+      }
+      const expectedPrompt = String(opts.promptText || companionRuntime.cachedPromptText || "");
+      const expectedMin = Math.max(1, Number(opts.expectedMinLen || Math.min(Math.floor(expectedPrompt.trim().length / 2), 40) || 1));
+      let currentText = getComposerText(composer);
+      if (
+        currentText.length < expectedMin &&
+        expectedPrompt.trim() &&
+        !companionRuntime.sendPerformed &&
+        countConversationDomTurns() <= Number(companionRuntime.turnsAtPaste || 0)
+      ) {
+        companionRuntime.composerClearedCount += 1;
+        const repasted = pasteViaDataTransfer(expectedPrompt, false);
+        if (!repasted.ok) {
+          return {
+            ok: false,
+            operation: "send",
+            path: "extension",
+            reason: `composer was cleared after upload and re-paste failed (${repasted.reason})`
+          };
+        }
+        currentText = getComposerText(composer);
+      }
+      if (currentText.length < expectedMin) {
+        return {
+          ok: false,
+          operation: "send",
+          path: "extension",
+          reason: `composer is empty before send (len=${currentText.length}, expected>=${expectedMin})`
+        };
+      }
+      const modelCheck = await ensureTaskModeAndArgonSemantic({
+        manualSetup: Boolean(opts.manualSetup),
+        isContinuation: Boolean(opts.isContinuation),
+        recordedWorkspaceMode: opts.recordedWorkspaceMode || "task"
+      });
+      if (!modelCheck.ok) {
+        return {
+          ok: false,
+          operation: modelCheck.operation || "model",
+          path: "extension",
+          reason: modelCheck.reason || "Hard Flash guard aborted send: model chip is not 4 Argon"
+        };
+      }
+      const sendBtn = findSemanticSendButton(composer);
+      if (!sendBtn) {
+        return {
+          ok: false,
+          operation: "send",
+          path: "extension",
+          reason: "semantic send button was not found inside the composer container"
+        };
+      }
+      disarmCompanionPromptGuard("click_send");
+      try {
+        sendBtn.click();
+      } catch (err) {
+        return {
+          ok: false,
+          operation: "send",
+          path: "extension",
+          reason: `clicking semantic send button failed (${String(err)})`
+        };
+      }
+      await new Promise((r) => setTimeout(r, 150));
+      const finalComposerText = getComposerText(composer);
+      const emptied = finalComposerText.length < expectedMin;
+      sendServiceWorkerMessage("record_operation", {
+        operation: "send",
+        ok: true,
+        composerEmptied: emptied,
+        composerClearedCount: companionRuntime.composerClearedCount,
+        at: new Date().toISOString()
+      });
+      return {
+        ok: true,
+        operation: "send",
+        path: "extension",
+        sendPerformed: true,
+        keepPromptAlive: false,
+        cachedPromptText: "",
+        cachedPromptTextLength: 0,
+        composerEmptied: emptied,
+        composerClearedCount: companionRuntime.composerClearedCount,
+        reason: ""
+      };
     }
     if (act === "capture_delivery") {
       const fid = pl.fileId || (companionRuntime.driveFileIds.length ? companionRuntime.driveFileIds[companionRuntime.driveFileIds.length - 1] : "");
-      return await sendServiceWorkerMessage("capture_delivery", Object.assign({}, pl, { fileId: fid }));
+      const capRes = await sendServiceWorkerMessage("capture_delivery", Object.assign({}, pl, { fileId: fid }));
+      if (capRes && typeof capRes === "object") {
+        capRes.fileName = String(pl.fileName || capRes.fileName || "apply_changes.ps1");
+      }
+      return capRes;
     }
     if (act === "get_state" || act === "set_state") {
       return await sendServiceWorkerMessage(act, pl);

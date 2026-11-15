@@ -59,15 +59,15 @@ def _read(path: Path) -> str:
 def check_four_fixes_status(dispatch_text: str, reliability_text: str) -> Dict[str, Any]:
     opt_count = dispatch_text.count('"--attach-images"')
     toggle_uses_filter = "_safe_visible(el) and _is_toggle_control(el)" in dispatch_text
-    cap_installed = (
+    cap_exported = "MAX_BASE64_ATTACH_BYTES" in reliability_text
+    # "imported" is not "used": the cap must be READ inside the base64 attach path.
+    m = re.search(r"def _attach_zip_via_datatransfer\b.*?(?=\ndef\s+)", dispatch_text, re.S)
+    datatransfer_body = m.group(0) if m else ""
+    cap_used = "MAX_BASE64_ATTACH_BYTES" in datatransfer_body and "size_cap_exceeded" in datatransfer_body
+    cap_installed = cap_used or (
         "MAX_DATATRANSFER_BASE64_ARCHIVE_BYTES" in dispatch_text
         and "size_cap_exceeded" in dispatch_text
     )
-    cap_exported = "MAX_BASE64_ATTACH_BYTES" in reliability_text
-    # "imported" is not "used": the cap must be READ inside the base64 attach path.
-    m = re.search(r"def _attach_zip_via_datatransfer\(.*?\n(?=\S)", dispatch_text, re.S)
-    datatransfer_body = m.group(0) if m else ""
-    cap_used = "MAX_BASE64_ATTACH_BYTES" in datatransfer_body
     return {
         "attach_images_flag": opt_count == 1 and "def attach_images_to_composer(" in reliability_text,
         "attach_images_option_count": opt_count,

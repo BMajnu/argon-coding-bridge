@@ -1076,7 +1076,9 @@ def apply_delivered_patch(project_path: Path, patch_path: Path) -> bool:
         try:
             if staged.exists():
                 stamp = time.strftime("%Y%m%d_%H%M%S")
-                shutil.copy2(str(staged), str(project_path / f"apply_changes.ps1.bak-{stamp}"))
+                bak_dir = project_path / ".argon_backup"
+                bak_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(str(staged), str(bak_dir / f"apply_changes.ps1.bak-{stamp}"))
             _copy_with_retry(patch_path, staged)
         except Exception as exc:
             print(f"[!] Could not stage the delivered patch: {exc}")
@@ -1401,6 +1403,7 @@ def _generated_file_chip(page):
                 if _chip_matches_patch_name(chip):
                     matched_in_turn.append(chip)
             if matched_in_turn:
+                setattr(page, "_argon_last_delivery_turn_index", len(turns))
                 return matched_in_turn[-1]
         except Exception:
             pass
@@ -1515,6 +1518,7 @@ def _new_delivery_chip(page, chips_before: int, responses_before: int):
                 if _chip_matches_patch_name(cand):
                     matched.append(cand)
             if matched:
+                setattr(page, "_argon_last_delivery_turn_index", len(turns))
                 return matched[-1]
         except Exception:
             pass
@@ -2931,10 +2935,14 @@ def _is_leftover_delivery(
         try:
             ledger_hit = DeliveryLedger().lookup_digest(project_path, text)
             if ledger_hit is not None:
+                hit_round = ledger_hit.get("round_id") or "previous"
+                same_digest_line = f"same digest as round {hit_round} - Argon re-attached the same file"
+                print(f"[!] {same_digest_line}")
                 print(
                     f"\n[!] REFUSED DUPLICATE DELIVERY:\n"
                     f"    SHA-256  : {full_sha}\n"
-                    f"    Duplicate: round {ledger_hit.get('round_id') or 'previous'} "
+                    f"    {same_digest_line}\n"
+                    f"    Duplicate: round {hit_round} "
                     f"(chat={ledger_hit.get('chat_id') or '?'}, captured_at={ledger_hit.get('timestamp') or '?'}, "
                     f"file={ledger_hit.get('file_path') or '?'})\n"
                     f"    This delivery is already known in ~/.gemini/argon_delivery_ledger.json.\n"
@@ -2945,10 +2953,11 @@ def _is_leftover_delivery(
         except Exception:
             pass
     if previous_hashes and ((digest and digest in previous_hashes) or (full_sha and full_sha in previous_hashes)):
+        reattach_msg = "same digest as round previous - Argon re-attached the same file"
         print(
-            f"\n[!] REFUSED DUPLICATE DELIVERY:\n"
+            f"\n[!] REFUSED DUPLICATE DELIVERY ({reattach_msg}):\n"
             f"    SHA-256  : {full_sha} (digest={digest})\n"
-            f"    Duplicate: matches a known pre-existing hash from earlier rounds.\n"
+            f"    Duplicate: matches a known pre-existing hash from earlier rounds ({reattach_msg}).\n"
             f"    Waiting for the new delivery chip.",
             file=sys.stderr,
         )
@@ -2971,10 +2980,11 @@ def _is_leftover_delivery(
                             try:
                                 content_f = ps1_file.read_text(encoding="utf-8", errors="replace")
                                 if _sha256_full(content_f) == full_sha:
+                                    reattach_msg = f"same digest as round {ps1_file.parent.name or 'previous'} - Argon re-attached the same file"
                                     print(
-                                        f"\n[!] REFUSED DUPLICATE DELIVERY:\n"
+                                        f"\n[!] REFUSED DUPLICATE DELIVERY ({reattach_msg}):\n"
                                         f"    SHA-256  : {full_sha}\n"
-                                        f"    Duplicate: byte-identical to existing repository patch: {ps1_file}\n"
+                                        f"    Duplicate: byte-identical to existing repository patch: {ps1_file} ({reattach_msg})\n"
                                         f"    Waiting for the new delivery chip.",
                                         file=sys.stderr,
                                     )
@@ -3247,9 +3257,24 @@ def capture_generated_file(
                     )
                 except Exception as bundle_exc:
                     print(f"[!] Warning while building delivery bundle: {bundle_exc}", file=sys.stderr)
+                cid_proof = _extract_chat_id(str(getattr(page, "url", "") or "")) or ""
+                turns_proof = _assistant_turns(page)
+                turn_idx_proof = max(0, len(turns_proof) - 1) if turns_proof else 0
+                sha_proof = _sha256_full(dl_text)
+                proof_dict = {
+                    "chat_id": cid_proof,
+                    "turn_index": turn_idx_proof,
+                    "file_name": downloaded.name,
+                    "sha256": sha_proof,
+                }
+                setattr(page, "_argon_last_capture_proof", proof_dict)
+                print(
+                    f"[+] Delivery chip proof: chat_id={cid_proof or '(unknown)'} | "
+                    f"turn_index={turn_idx_proof} | file_name={downloaded.name} | sha256={sha_proof}"
+                )
                 print(
                     f"[+] Captured delivery file: {downloaded.name} "
-                    f"(bytes={len(dl_text.encode('utf-8'))}, sha256={_sha256_full(dl_text)}, "
+                    f"(bytes={len(dl_text.encode('utf-8'))}, sha256={sha_proof}, "
                     f"attempt={attempt}/{MAX_CHIP_DOWNLOAD_ATTEMPTS})"
                 )
                 _close_preview(page)
@@ -4583,7 +4608,7 @@ def _copy_sqlite_databases(src_root: Path, dst_root: Path, allow_busy: bool = Fa
     return True
 
 
-def _launch_with_fallback(p, launch_kwargs: dict, chrome_exe: Optional[str], profile_dir: Path):
+def _r23_orig_launch_with_fallback(p, launch_kwargs: dict, chrome_exe: Optional[str], profile_dir: Path):
     """Launch the persistent context on profile_dir without touching a busy browser.
 
     Automatically loads the unpacked MV3 companion extension (`skills/argon-coding-bridge/extension/`)
@@ -4628,8 +4653,6 @@ def _launch_with_fallback(p, launch_kwargs: dict, chrome_exe: Optional[str], pro
     if last_exc is not None:
         raise last_exc
     return None
-
-_r23_orig_launch_with_fallback = _launch_with_fallback
 
 
 def _launch_with_fallback(p, launch_kwargs: dict, chrome_exe: Optional[str], profile_dir: Path):
@@ -4899,19 +4922,78 @@ class TaskRegistry:
         except Exception:
             return str(project_path)
 
-    def active_entries(self) -> List[Dict[str, Any]]:
+    def _is_entry_stale(
+        self,
+        e: Dict[str, Any],
+        max_age_seconds: float = 3600.0,
+        task_state_store: Optional[TaskState] = None,
+    ) -> tuple[bool, float, str]:
+        """Return (is_stale, age_seconds, reason) for a registry entry (Round 27 W6 R6.1)."""
+        now_ep = time.time()
+        started_ep = float(e.get("started_epoch") or 0.0)
+        if started_ep <= 0:
+            raw_started = str(e.get("started_at") or "").strip()
+            if raw_started:
+                try:
+                    started_ep = time.mktime(time.strptime(raw_started[:19], "%Y-%m-%d %H:%M:%S"))
+                except Exception:
+                    started_ep = 0.0
+        age = max(0.0, now_ep - started_ep) if started_ep > 0 else 0.0
+        pid = int(e.get("pid") or 0)
+        if pid > 0 and pid != os.getpid() and not _pid_alive(pid):
+            return True, age, f"dead_pid:{pid}"
+        if age >= max_age_seconds:
+            return True, age, f"age_exceeded:{int(round(age))}s"
+        proj_val = str(e.get("project") or "").strip()
+        lane_val = str(e.get("lane") or "").strip().lower()
+        if proj_val:
+            try:
+                ts_obj = task_state_store or TaskState()
+                ts_rec = (ts_obj.get(proj_val, lane=lane_val) if lane_val else None) or ts_obj.get(proj_val)
+                if isinstance(ts_rec, dict):
+                    st_val = str(ts_rec.get("state") or "").strip().lower()
+                    if st_val in (
+                        "delivered",
+                        "applied",
+                        "completed",
+                        "done",
+                        "failed",
+                        "superseded",
+                        "preflight_failed",
+                        "not_signed_in",
+                        "delivery_failed",
+                    ):
+                        return True, age, f"lane_finished:{st_val}"
+            except Exception:
+                pass
+        return False, age, ""
+
+    def active_entries(self, include_stale: bool = False, max_age_seconds: float = 3600.0) -> List[Dict[str, Any]]:
         self.load()
-        return [
+        raw_running = [
             e
             for e in (self.data.get("entries") or [])
             if isinstance(e, dict) and str(e.get("status") or "").strip().lower() == "running"
         ]
+        if include_stale:
+            return raw_running
+        ts_store: Optional[TaskState] = None
+        try:
+            ts_store = TaskState()
+        except Exception:
+            ts_store = None
+        live: List[Dict[str, Any]] = []
+        for e in raw_running:
+            is_st, _, _ = self._is_entry_stale(e, max_age_seconds=max_age_seconds, task_state_store=ts_store)
+            if not is_st:
+                live.append(e)
+        return live
 
     def active_tasks_for_slot(self, slot: str) -> List[Dict[str, Any]]:
         norm_s = normalize_slot(slot)
         return [
             e
-            for e in self.active_entries()
+            for e in self.active_entries(include_stale=False)
             if normalize_slot(str(e.get("slot") or "/u/0/")) == norm_s
         ]
 
@@ -4919,19 +5001,23 @@ class TaskRegistry:
         self,
         project_path: Any,
         lane: Optional[str] = None,
+        slot: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         wanted = _normalize_project_key(project_path)
+        norm_s = normalize_slot(slot) if slot else ""
         out: List[Dict[str, Any]] = []
-        for e in self.active_entries():
+        for e in self.active_entries(include_stale=False):
             if _normalize_project_key(e.get("project", "")) != wanted:
                 continue
             if lane and str(e.get("lane") or "").strip().lower() != lane.strip().lower():
+                continue
+            if norm_s and normalize_slot(str(e.get("slot") or "/u/0/")) != norm_s:
                 continue
             out.append(e)
         return out
 
     def is_slot_available(self, slot: str, max_tasks: int = MAX_TASKS_PER_SLOT) -> tuple[bool, str]:
-        """Return (available, reason) based on the registry count for `slot` (D4.3, D4.4)."""
+        """Return (available, reason) based on non-stale registry count for `slot` (D4.3, D4.4, W6 R6.1)."""
         norm_s = normalize_slot(slot)
         active = self.active_tasks_for_slot(norm_s)
         count = len(active)
@@ -4947,20 +5033,53 @@ class TaskRegistry:
         return (True, f"registry load {count}/{max_tasks}")
 
     def stale_tasks(self, max_age_seconds: float = 3600.0) -> List[Dict[str, Any]]:
-        """Return running tasks older than `max_age_seconds` (or whose PID is no longer alive) (D4.5)."""
-        now_ep = time.time()
+        """Return running tasks that are stale (dead PID, finished lane in TaskState, or older than `max_age_seconds`) (D4.5, W6 R6.1)."""
         stale: List[Dict[str, Any]] = []
-        for e in self.active_entries():
-            started_ep = float(e.get("started_epoch") or 0.0)
-            age = max(0.0, now_ep - started_ep) if started_ep > 0 else 0.0
-            pid = int(e.get("pid") or 0)
-            pid_dead = bool(pid > 0 and not _pid_alive(pid) and age > 120.0)
-            if age >= max_age_seconds or pid_dead:
+        ts_store: Optional[TaskState] = None
+        try:
+            ts_store = TaskState()
+        except Exception:
+            ts_store = None
+        for e in self.active_entries(include_stale=True):
+            is_st, age, st_reason = self._is_entry_stale(
+                e, max_age_seconds=max_age_seconds, task_state_store=ts_store
+            )
+            if is_st:
                 copy_e = dict(e)
                 copy_e["age_seconds"] = int(round(age))
                 copy_e["age_human"] = _format_elapsed(age)
+                copy_e["stale_reason"] = st_reason
                 stale.append(copy_e)
         return stale
+
+    def prune_stale_tasks(self, max_age_seconds: float = 3600.0) -> List[Dict[str, Any]]:
+        """Mark all stale `running` entries in `~/.gemini/argon_tasks.json` as `stale_reaped` and persist (W6 R6.2)."""
+        self.load()
+        ts_store: Optional[TaskState] = None
+        try:
+            ts_store = TaskState()
+        except Exception:
+            ts_store = None
+        now_str = time.strftime("%Y-%m-%d %H:%M:%S")
+        reaped: List[Dict[str, Any]] = []
+        for e in (self.data.get("entries") or []):
+            if not isinstance(e, dict) or str(e.get("status") or "").strip().lower() != "running":
+                continue
+            is_st, age, st_reason = self._is_entry_stale(
+                e, max_age_seconds=max_age_seconds, task_state_store=ts_store
+            )
+            if is_st:
+                e["status"] = "stale_reaped"
+                e["end_reason"] = f"reaped stale registry entry ({st_reason})"
+                e["completed_at"] = now_str
+                e["updated_at"] = now_str
+                copy_e = dict(e)
+                copy_e["age_seconds"] = int(round(age))
+                copy_e["stale_reason"] = st_reason
+                reaped.append(copy_e)
+        if reaped:
+            self.save()
+        return reaped
 
     def register_start(
         self,
@@ -4974,24 +5093,26 @@ class TaskRegistry:
         screenshot_path: str = "",
         prompt_hash: str = "",
     ) -> Dict[str, Any]:
-        """Mark a task as started in ~/.gemini/argon_tasks.json (D4.1, D4.2)."""
+        """Mark a task as started in ~/.gemini/argon_tasks.json using the full normalized project path (D4.1, D4.2, W2 R2.2)."""
         self.load()
         proj_str = self._canonical_proj(project_path)
+        norm_proj_key = _normalize_project_key(proj_str)
         norm_s = normalize_slot(slot) if slot else "/u/0/"
         lane_str = (lane or "single").strip().lower()
         entries: List[Dict[str, Any]] = self.data.setdefault("entries", [])
 
         now_str = time.strftime("%Y-%m-%d %H:%M:%S")
         now_ep = time.time()
-        task_id = f"{Path(proj_str).name}:{lane_str}:{norm_s.strip('/')}:{int(now_ep)}"
+        task_id = f"{norm_proj_key}:{lane_str}:{norm_s.strip('/')}:{int(now_ep)}"
 
-        # Update existing running entry for the same (project, lane) if already registered by agent
+        # Update existing running entry ONLY when (project, lane, slot) all match (W2 R2.1-R2.3)
         for existing in entries:
             if (
                 isinstance(existing, dict)
                 and str(existing.get("status") or "") == "running"
-                and _normalize_project_key(existing.get("project", "")) == _normalize_project_key(proj_str)
+                and _normalize_project_key(existing.get("project", "")) == norm_proj_key
                 and str(existing.get("lane") or "single").strip().lower() == lane_str
+                and normalize_slot(str(existing.get("slot") or "/u/0/")) == norm_s
             ):
                 existing["slot"] = norm_s
                 if account:
@@ -5262,21 +5383,104 @@ class SessionStore:
                 return key
         return None
 
-    def lookup(self, project_path: Any, mode: Optional[str] = None) -> Optional[Dict[str, Any]]:
-        """Return the stored session for a project, or None when there is none."""
+    def lookup(
+        self,
+        project_path: Any,
+        mode: Optional[str] = None,
+        lane: Optional[str] = None,
+        slot: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Return the stored session for a project (and optional lane/slot), or None when there is none (W1 R1.1, R1.3)."""
         self.load()
         key = self._find_key(project_path)
-        if key is None:
-            return None
-        entry = (self.data.get("sessions") or {}).get(key)
+        entry = (self.data.get("sessions") or {}).get(key) if key is not None else None
         if not isinstance(entry, dict):
-            return None
-        if mode is not None:
+            entry = None
+        if entry is not None and mode is not None:
             stored_mode = (entry.get("mode") or "gemini").strip().lower()
             wanted_mode = (mode or "gemini").strip().lower()
             if stored_mode != wanted_mode:
-                return None
-        return entry
+                entry = None
+
+        norm_slot = normalize_slot(slot) if slot else None
+        req_lane = (lane or "").strip().lower()
+
+        if not req_lane:
+            if entry is not None and norm_slot and entry.get("slot"):
+                if normalize_slot(str(entry["slot"])) != norm_slot:
+                    s_lanes = entry.get("lanes") if isinstance(entry.get("lanes"), dict) else {}
+                    for l_cand in s_lanes.values():
+                        if isinstance(l_cand, dict) and l_cand.get("chat_url") and normalize_slot(str(l_cand.get("slot") or "")) == norm_slot:
+                            merged = dict(entry)
+                            merged.update({k: v for k, v in l_cand.items() if v})
+                            return merged
+            return entry
+
+        if req_lane == "new":
+            s_lanes = (entry.get("lanes") if (entry and isinstance(entry.get("lanes"), dict)) else {}) or {}
+            new_rec = s_lanes.get("new") if isinstance(s_lanes.get("new"), dict) else None
+            if new_rec and new_rec.get("chat_url"):
+                if not norm_slot or normalize_slot(str(new_rec.get("slot") or "")) == norm_slot:
+                    merged = dict(entry or {})
+                    merged.update({k: v for k, v in new_rec.items() if v})
+                    return merged
+            return None
+
+        # Per-lane lookup for 'followup' / 'single': check SessionStore.lanes[lane] and TaskState(lane)
+        candidates: List[Dict[str, Any]] = []
+        s_lanes = (entry.get("lanes") if (entry and isinstance(entry.get("lanes"), dict)) else {}) or {}
+        norm_lane = self.normalize_winner_lane(req_lane) or req_lane
+        if isinstance(s_lanes.get(norm_lane), dict) and s_lanes[norm_lane].get("chat_url"):
+            c_rec = dict(entry or {})
+            c_rec.update({k: v for k, v in s_lanes[norm_lane].items() if v})
+            candidates.append(c_rec)
+
+        try:
+            ts_store = TaskState()
+            ts_lane = ts_store.get(project_path, lane=norm_lane)
+            if isinstance(ts_lane, dict) and (ts_lane.get("chat_url") or ts_lane.get("chat_id")):
+                candidates.append(dict(ts_lane))
+            if norm_lane == "followup":
+                winner_lane = self.normalize_winner_lane(str((entry or {}).get("winner") or ""))
+                if winner_lane and isinstance(s_lanes.get(winner_lane), dict) and s_lanes[winner_lane].get("chat_url"):
+                    w_rec = dict(entry or {})
+                    w_rec.update({k: v for k, v in s_lanes[winner_lane].items() if v})
+                    candidates.append(w_rec)
+                if entry is not None and entry.get("chat_url"):
+                    candidates.append(dict(entry))
+                if isinstance(s_lanes.get("new"), dict) and s_lanes["new"].get("chat_url"):
+                    n_rec = dict(entry or {})
+                    n_rec.update({k: v for k, v in s_lanes["new"].items() if v})
+                    candidates.append(n_rec)
+                ts_new = ts_store.get(project_path, lane="new")
+                if isinstance(ts_new, dict) and (ts_new.get("chat_url") or ts_new.get("chat_id")):
+                    candidates.append(dict(ts_new))
+                ts_top = ts_store.get(project_path)
+                if isinstance(ts_top, dict) and (ts_top.get("chat_url") or ts_top.get("chat_id")):
+                    candidates.append(dict(ts_top))
+        except Exception:
+            pass
+
+        for cand in candidates:
+            c_url = str(cand.get("chat_url") or "").strip()
+            c_id = str(cand.get("chat_id") or _extract_chat_id(c_url) or "").strip()
+            c_slot = normalize_slot(str(cand.get("slot") or (entry or {}).get("slot") or "/u/0/"))
+            if not c_url and c_id:
+                c_url = f"https://gemini.google.com{c_slot}app/{c_id}"
+            if not c_url:
+                continue
+            if norm_slot and c_slot != norm_slot:
+                continue
+            merged_out = dict(entry or {})
+            merged_out.update({k: v for k, v in cand.items() if v})
+            merged_out["chat_url"] = c_url
+            if c_id:
+                merged_out["chat_id"] = c_id
+            merged_out["slot"] = c_slot
+            merged_out.setdefault("mode", (mode or "gemini").strip().lower())
+            return merged_out
+
+        return None
 
     @staticmethod
     def normalize_winner_lane(winner: Optional[str]) -> Optional[str]:
@@ -5349,12 +5553,16 @@ class SessionStore:
         if clean_ws_mode not in ("task", "chat"):
             clean_ws_mode = ""
         slot_part = normalize_slot(slot) if slot else "/u/0/"
-        url_slot = _url_slot_for_account(
-            slot_part,
-            isolated_profile=_profile_is_isolated_slot(profile_dir),
-            strict=False,
-        )
+        try:
+            url_slot = _url_slot_for_account(
+                slot_part,
+                isolated_profile=_profile_is_isolated_slot(profile_dir),
+                strict=False,
+            )
+        except Exception:
+            url_slot = slot_part
         chat_url = f"https://gemini.google.com{url_slot}app/{chat_id}"
+
         now_str = time.strftime("%Y-%m-%d %H:%M:%S")
 
         sessions = self.data.setdefault("sessions", {})
@@ -5660,7 +5868,7 @@ RE_CHAT = re.compile(r"^\s*(chat|চ্যাট|চাট)\s*$", re.IGNORECASE)
 # The word must stand on its own, otherwise a chat title such as
 # "Argon Parallel Isolation" or "Argonaut" would count as the model.
 RE_ARGON = re.compile(
-    r"(4\s*argon|gemini[\s\-_]*4[\s\-_]*argon|(?<![\w\-])argon(?![\w\-])|আর\u09cd?গন)",
+    r"(code\s*&\s*analysis\s*4\s*argon|কোড\s*ও\s*বিশ্লেষণ\s*4\s*argon|4\s*argon|gemini[\s\-_]*4[\s\-_]*argon|(?<![\w\-])argon(?![\w\-])|আর\u09cd?গন)",
     re.IGNORECASE,
 )
 RE_UPLOAD = re.compile(
@@ -6454,8 +6662,17 @@ def ensure_argon_model(
     if require_chip is None:
         require_chip = True
 
-    chip_wait = float(wait_for_chip_seconds) if not is_cont else min(12.0, float(wait_for_chip_seconds))
+    chip_wait = max(45.0, float(wait_for_chip_seconds)) if is_cont else float(wait_for_chip_seconds)
+    if is_cont:
+        print(f"[+] waiting for the model chip on a continuation page (timeout={chip_wait:.0f}s)...")
     initial_chip = _wait_for_model_chip(page, timeout=chip_wait)
+    if initial_chip is None and is_cont:
+        hydrating_msg = (
+            f"model chip (not visible) after {int(round(chip_wait))} s on a continuation page - "
+            "the conversation is still hydrating"
+        )
+        setattr(page, "_argon_continuation_chip_hydrating_reason", hydrating_msg)
+        print(f"[!] {hydrating_msg}", file=sys.stderr)
     if initial_chip is None and not require_chip and not is_cont:
         return True
 
@@ -6525,7 +6742,14 @@ def ensure_argon_model(
             file=sys.stderr,
         )
         return False
-    if last_picker_state == "missing":
+    if is_cont and not last_seen:
+        hydrating_msg = (
+            f"model chip (not visible) after {int(round(chip_wait))} s on a continuation page - "
+            "the conversation is still hydrating"
+        )
+        setattr(page, "_argon_chip_hydration_reason", hydrating_msg)
+        print(f"[!] {hydrating_msg}", file=sys.stderr)
+    elif last_picker_state == "missing":
         print(
             f"[!] The '4 Argon' option was not found in the model picker "
             f"and the model chip reads {last_seen or '(not visible)'!r} - refusing to send.",
@@ -6593,7 +6817,8 @@ def _inspect_zip_archive(zip_path: Path) -> tuple[bool, int, int, str]:
         return False, 0, 0, f"could not stat archive {zp}: {exc}"
     if sz <= 0:
         return False, 0, 0, f"archive {zp.name} is 0 bytes (empty)"
-    max_allowed_bytes = int(_MAX_ARCH_MB) * 1024 * 1024
+    # Contract 2 (R2.1) & W3.1: Single 100 MB hard archive limit in round23_reliability.MAX_ARCHIVE_BYTES.
+    max_allowed_bytes = int(globals().get("MAX_ARCHIVE_BYTES", int(_MAX_ARCH_MB) * 1024 * 1024))
     if sz > max_allowed_bytes:
         return (
             False,
@@ -6694,6 +6919,41 @@ def _attachment_present(page, zip_path: Path) -> bool:
                 break
     except Exception:
         pass
+
+    if not chip_visible:
+        try:
+            chip_visible = bool(
+                page.evaluate(
+                    """([fullName, stemName]) => {
+                        const needles = [String(fullName || '').toLowerCase(), String(stemName || '').toLowerCase()].filter(Boolean);
+                        if (!needles.length) return false;
+                        const sels = [
+                            "[data-test-id*='attachment' i]",
+                            "[data-test-id*='file' i]",
+                            "[class*='attachment' i]",
+                            "[class*='file-chip' i]",
+                            "[class*='upload-chip' i]",
+                            "[class*='input-area'] [role='button']",
+                            "[class*='input-area'] span",
+                            "[class*='input-area'] div"
+                        ];
+                        for (const sel of sels) {
+                            for (const el of Array.from(document.querySelectorAll(sel))) {
+                                const txt = String(el.innerText || el.textContent || el.getAttribute('aria-label') || '').trim().toLowerCase();
+                                if (!txt) continue;
+                                if (needles.some(n => txt.includes(n))) {
+                                    const r = el.getBoundingClientRect ? el.getBoundingClientRect() : { width: 1, height: 1 };
+                                    if (r.width > 0 && r.height > 0) return true;
+                                }
+                            }
+                        }
+                        return false;
+                    }""",
+                    [Path(zip_path).name, Path(zip_path).stem],
+                )
+            )
+        except Exception:
+            pass
 
     return bool(input_matched or chip_visible)
 
@@ -6912,7 +7172,7 @@ def _wait_for_upload_complete(page, zip_path: Path, timeout: float = 600.0) -> b
 
 
 def _extension_is_available(page) -> bool:
-    """Return True when the MV3 companion extension content script is active on `page`."""
+    """Return True when the MV3 companion extension content script is active on `page` (verifying version per Contract 5)."""
     if str(os.environ.get("ARGON_DISABLE_COMPANION_EXTENSION") or "").strip().lower() in (
         "1",
         "true",
@@ -6920,10 +7180,19 @@ def _extension_is_available(page) -> bool:
     ):
         return False
     try:
+        eff_cap_sync = get_effective_base64_attach_cap()
         ver = page.evaluate(
-            "() => (document && document.documentElement && document.documentElement.getAttribute('data-argon-companion-extension')) || ''"
+            """([capBytes]) => {
+                if (!document || !document.documentElement) return '';
+                document.documentElement.setAttribute('data-argon-max-base64-bytes', String(capBytes));
+                return document.documentElement.getAttribute('data-argon-companion-extension') || '';
+            }""",
+            [int(eff_cap_sync)],
         )
-        return bool(isinstance(ver, str) and ver.strip())
+        if isinstance(ver, str) and ver.strip():
+            check_companion_extension_version(page=page, loaded_version=ver.strip())
+            return True
+        return False
     except Exception:
         return False
 
@@ -6937,6 +7206,17 @@ def _invoke_companion_extension(
     """Send a command to the MV3 companion extension via the DOM custom event bridge and return its response."""
     if not _extension_is_available(page):
         return None
+    eff_payload: Dict[str, Any] = dict(payload or {})
+    # Contract 2 (R2.3): Keep Core and Extension on the exact same effective base64 cap.
+    try:
+        eff_cap_now = int(get_effective_base64_attach_cap(MAX_BASE64_ATTACH_BYTES))
+        eff_payload.setdefault("maxBase64Bytes", eff_cap_now)
+        page.evaluate(
+            "(capStr) => { if (document && document.documentElement) document.documentElement.setAttribute('data-argon-max-base64-attach-bytes', capStr); }",
+            str(eff_cap_now),
+        )
+    except Exception:
+        pass
     req_id = f"req_{os.getpid()}_{int(time.time() * 1000)}_{ abs(hash(action)) % 10000 }"
     try:
         res = page.evaluate(
@@ -6987,11 +7267,26 @@ def _invoke_companion_extension(
                     finish({ ok: false, operation: act, path: "extension", reason: "companion extension request timed out" });
                 }, Math.max(500, Number(timeoutMs || 15000)));
             })""",
-            [req_id, action, payload or {}, int(timeout_ms)],
+            [req_id, action, eff_payload, int(timeout_ms)],
         )
         return res if isinstance(res, dict) else None
     except Exception:
         return None
+
+
+def _disarm_extension_prompt_guard(page, reason: str = "verified_send") -> Optional[Dict[str, Any]]:
+    """Contract 1 (R1.1, R1.2) & W5.1: Disarm the companion extension's MutationObserver prompt guard after EVERY verified send."""
+    if not _extension_is_available(page):
+        return None
+    res = _invoke_companion_extension(
+        page,
+        "disarm_prompt_guard",
+        {"reason": str(reason or "verified_send")},
+        timeout_ms=5000,
+    )
+    if isinstance(res, dict):
+        setattr(page, "_argon_last_disarm_response", res)
+    return res
 
 
 def _attach_zip_via_datatransfer(
@@ -7017,7 +7312,7 @@ def _attach_zip_via_datatransfer(
     except OSError as exc:
         return False, "python_fallback", f"could not stat archive {zp.name}: {exc}"
 
-    hard_cap_bytes = 100 * 1024 * 1024
+    hard_cap_bytes = int(MAX_ARCHIVE_BYTES)
     if sz > hard_cap_bytes:
         return (
             False,
@@ -7026,8 +7321,13 @@ def _attach_zip_via_datatransfer(
             f"exceeds the 100 MB hard limit ({hard_cap_bytes} bytes)",
         )
 
-    eff_b64_cap = get_effective_base64_attach_cap(MAX_BASE64_ATTACH_BYTES)
+    eff_b64_cap = get_effective_base64_attach_cap()
     if sz > eff_b64_cap and not allow_over_cap:
+        print(
+            f"[i] Archive {zp.name} ({sz / (1024 * 1024):.2f} MB): "
+            f"the base64 route can carry at most {eff_b64_cap / (1024 * 1024):.2f} MB; "
+            "above that the zero-copy route is used."
+        )
         return False, "size_cap_exceeded", "size_cap_exceeded"
 
     try:
@@ -7045,6 +7345,8 @@ def _attach_zip_via_datatransfer(
                 "fileName": zp.name,
                 "expectedSize": len(raw_bytes),
                 "base64Data": b64_str,
+                "maxBase64Bytes": eff_b64_cap,
+                "allowOverCap": bool(allow_over_cap),
             },
             timeout_ms=20000,
         )
@@ -7059,6 +7361,8 @@ def _attach_zip_via_datatransfer(
                     up_err or f"upload of {zp.name} did not finish within the upload window after extension DataTransfer attach",
                 )
             ext_reason = str(ext_res.get("reason") or "extension attach failed")
+            if ext_reason == "size_cap_exceeded":
+                return False, "size_cap_exceeded", "size_cap_exceeded"
             if "rendered no file input" in ext_reason:
                 return False, "extension", ext_reason
 
@@ -7155,25 +7459,36 @@ def attach_zip(page, zip_path: Path) -> bool:
         setattr(page, "_argon_last_operation_error", err)
         return False
 
-    eff_b64_cap = get_effective_base64_attach_cap(MAX_BASE64_ATTACH_BYTES)
+    eff_b64_cap = get_effective_base64_attach_cap()
+    has_existing_att, existing_att_detail = _conversation_holds_existing_attachment(page)
 
-    # R3.2: An archive above MAX_BASE64_ATTACH_BYTES must be attached to a FRESH conversation.
-    if sz > eff_b64_cap:
-        has_existing_att, existing_att_detail = _conversation_holds_existing_attachment(page)
-        if has_existing_att:
-            fresh_reason = (
-                f"fresh_conversation_required_for_large_archive: archive {zp.name} ({sz} bytes) "
-                f"exceeds MAX_BASE64_ATTACH_BYTES ({eff_b64_cap} bytes) and the target conversation "
-                f"already holds an attachment ({existing_att_detail}); large archives require a fresh chat (--new-session)."
-            )
-            err = AttachOperationError(
-                fresh_reason,
-                path_used="fresh_conversation_guard",
-                elapsed_seconds=time.monotonic() - t0,
-            )
-            setattr(page, "_argon_last_operation_error", err)
-            print(f"[ERROR] {fresh_reason}", file=sys.stderr)
-            return False
+    # Round 27 W1 R1.4 & W3 R3.3: In a continuation that already holds an attachment, skip attaching a second archive.
+    if bool(getattr(page, "_argon_is_continuation", False)) and has_existing_att:
+        skip_msg = (
+            f"conversation already holds an attachment ({existing_att_detail}) - "
+            "skipping second archive attach in continuation"
+        )
+        print(f"[+] {skip_msg}")
+        setattr(page, "_argon_last_attach_path", "skipped_existing_in_continuation")
+        setattr(page, "_argon_skipped_second_archive", skip_msg)
+        setattr(page, "_argon_last_operation_error", None)
+        return True
+
+    # R3.2: An archive above MAX_BASE64_ATTACH_BYTES on a non-continuation page with an existing attachment is refused.
+    if sz > eff_b64_cap and has_existing_att:
+        fresh_reason = (
+            f"fresh_conversation_required_for_large_archive: archive {zp.name} ({sz} bytes) "
+            f"exceeds MAX_BASE64_ATTACH_BYTES ({eff_b64_cap} bytes) and the target conversation "
+            f"already holds an attachment ({existing_att_detail}); large archives require a fresh chat (--new-session)."
+        )
+        err = AttachOperationError(
+            fresh_reason,
+            path_used="fresh_conversation_guard",
+            elapsed_seconds=time.monotonic() - t0,
+        )
+        setattr(page, "_argon_last_operation_error", err)
+        print(f"[ERROR] {fresh_reason}", file=sys.stderr)
+        return False
 
     eff_win = _upload_timeout_for_archive(zp, floor_seconds=600.0)
     ext_active = _extension_is_available(page)
@@ -7196,8 +7511,17 @@ def attach_zip(page, zip_path: Path) -> bool:
         initial_route,
         use_base64=use_base64_primary,
     )
+    canonical_size_line = format_archive_canonical_size_line(
+        zp.name,
+        sz,
+        initial_route,
+        use_base64=use_base64_primary,
+        hard_limit_bytes=MAX_ARCHIVE_BYTES,
+    )
     setattr(page, "_argon_last_route_decision_line", route_line)
+    setattr(page, "_argon_last_canonical_size_line", canonical_size_line)
     print(route_line)
+    print(canonical_size_line)
 
     # Probe _attach_zip_via_datatransfer:
     # - When sz <= eff_b64_cap, this runs today's companion-extension / DataTransfer route (preserving F4).
@@ -7782,6 +8106,8 @@ def _click_send_immediately(page, composer, expected_min_len: int = 1, probe_sni
                 except Exception:
                     pass
             print("[+] Send triggered and verified via companion extension semantic matcher.")
+            # Contract 1 (R1.1) & W5.1: Explicitly disarm the extension's prompt guard on EVERY verified send.
+            _disarm_extension_prompt_guard(page, reason="extension_click_send")
             # Round 24: Gemini's Task mode keeps the submitted prompt in the composer, so
             # the send arrow stays armed and the leftover can be fired again as a queued
             # steering turn. The extension's matcher already proved the send went out.
@@ -7789,6 +8115,7 @@ def _click_send_immediately(page, composer, expected_min_len: int = 1, probe_sni
             return True
 
     button = _composer_send_button(page, composer)
+    turns_before = _count_user_turns_in_dom(page)
     if button is not None:
         try:
             button.click(timeout=6000)
@@ -7797,7 +8124,13 @@ def _click_send_immediately(page, composer, expected_min_len: int = 1, probe_sni
             pass
 
     remaining_text = _composer_text(composer)
-    if len(remaining_text) >= expected_min_len:
+    # Round 27 (W5 / Contract 6 R6.1): Gemini's Task mode KEEPS the submitted prompt in
+    # the composer, so a full composer does NOT mean the click failed. Falling back to
+    # the keyboard anyway submits the SAME prompt again - one prompt could go out up to
+    # THREE times (click + Control+Enter + Enter). Only fall back when the conversation
+    # did NOT gain a turn.
+    turn_grew = _count_user_turns_in_dom(page) > turns_before
+    if len(remaining_text) >= expected_min_len and not turn_grew:
         _focus_composer_dom(composer)
         try:
             page.keyboard.press("Control+Enter")
@@ -7805,13 +8138,20 @@ def _click_send_immediately(page, composer, expected_min_len: int = 1, probe_sni
         except Exception:
             pass
         remaining_text = _composer_text(composer)
+        turn_grew = _count_user_turns_in_dom(page) > turns_before
 
-    if len(remaining_text) >= expected_min_len:
+    if len(remaining_text) >= expected_min_len and not turn_grew:
         try:
             page.keyboard.press("Enter")
             page.wait_for_timeout(800)
         except Exception:
             pass
+        remaining_text = _composer_text(composer)
+    elif turn_grew:
+        print(
+            "[i] The conversation gained a turn - the prompt was submitted, so the "
+            "keyboard fallback is skipped (it would send it a second time)."
+        )
 
     verify_deadline = time.monotonic() + 15.0
     while time.monotonic() < verify_deadline:
@@ -7824,6 +8164,9 @@ def _click_send_immediately(page, composer, expected_min_len: int = 1, probe_sni
             or (bool(probe_snippet) and snippet_count_after > snippet_count_before)
         )
         if composer_emptied or conversation_grew:
+            # Contract 1 (R1.1) & W5.1: Disarm the companion extension's MutationObserver BEFORE
+            # clearing the composer on the pure-Python fallback path so the observer never re-pastes.
+            _disarm_extension_prompt_guard(page, reason="python_fallback_send")
             # Round 24: the composer keeps the submitted prompt in Gemini's Task mode, so
             # the send arrow stays armed and the leftover can be fired again as a queued
             # steering turn. Clear it - but ONLY when the snippet count proves the prompt
@@ -7849,6 +8192,8 @@ def _click_send_immediately(page, composer, expected_min_len: int = 1, probe_sni
             time.sleep(0.4)
 
     ok_final = len(_composer_text(composer)) < expected_min_len
+    if ok_final:
+        _disarm_extension_prompt_guard(page, reason="python_fallback_final_empty")
     if not ok_final:
         btn_state = "found and clicked" if button is not None else "not found in composer container"
         err = SendOperationError(
@@ -7859,6 +8204,49 @@ def _click_send_immediately(page, composer, expected_min_len: int = 1, probe_sni
         setattr(page, "_argon_last_operation_error", err)
         print(f"[ERROR] {err}", file=sys.stderr)
     return ok_final
+
+
+def _count_user_turns_in_dom(page) -> int:
+    """Count user message turns (including `.queued-steering-turn`) in the conversation DOM (Contract 6 R6.1, W5.3)."""
+    try:
+        cnt = page.evaluate(
+            """() => {
+                const sels = [
+                    "user-query",
+                    "[data-test-id='user-query']",
+                    "message-turn.user-query",
+                    "div.user-query",
+                    ".user-query-container",
+                    ".queued-steering-turn"
+                ];
+                const seen = new Set();
+                for (const sel of sels) {
+                    for (const el of Array.from(document.querySelectorAll(sel))) {
+                        let dup = false;
+                        for (const existing of seen) {
+                            if (existing.contains(el) || el.contains(existing)) {
+                                dup = true;
+                                break;
+                            }
+                        }
+                        if (!dup) seen.add(el);
+                    }
+                }
+                return seen.size;
+            }"""
+        )
+        if isinstance(cnt, int) and cnt >= 0:
+            return cnt
+    except Exception:
+        pass
+    for sel in ("user-query", "[data-test-id='user-query']", "div.user-query", ".queued-steering-turn"):
+        try:
+            n = page.locator(sel).count()
+            if n:
+                return int(n)
+        except Exception:
+            continue
+    return 0
 
 
 def _execute_composer_send_sequence(
@@ -8072,8 +8460,24 @@ def _execute_composer_send_sequence(
         except Exception:
             pass
 
+    # W1.4 & W3.3 (and TASK_BRIEF diagnostic fix): In a continuation conversation that ALREADY holds
+    # an attachment, do NOT attach a second full archive — state so by name and continue with existing context.
+    skip_continuation_attach = False
+    if zip_path is not None and (is_continuation or bool(getattr(page, "_argon_is_continuation", False))):
+        if not bool(getattr(page, "_argon_force_reattach_on_continuation", False)):
+            has_existing_att, existing_att_detail = _conversation_holds_existing_attachment(page)
+            if has_existing_att:
+                skip_continuation_attach = True
+                skip_msg = (
+                    f"continuation conversation already holds attachment ({existing_att_detail}); "
+                    f"skipping second full archive {Path(zip_path).name} and continuing with existing context"
+                )
+                print(f"[+] {skip_msg}")
+                p_log.append(f"attachment {Path(zip_path).name} : OK (SKIPPED - {skip_msg})")
+                setattr(page, "_argon_last_attach_path", "continuation_existing_attachment")
+
     # Step 3: Attach the archive and wait until THIS upload finishes.
-    if zip_path is not None:
+    if zip_path is not None and not skip_continuation_attach:
         def _attempt_attach_once_or_retry(p) -> bool:
             if attach_zip(p, zip_path):
                 return True
@@ -8160,7 +8564,7 @@ def _execute_composer_send_sequence(
         return mode_ok, model_ok, False
 
     # R3.4: Never send the prompt before the upload has finished and been confirmed.
-    if zip_path is not None:
+    if zip_path is not None and not skip_continuation_attach:
         if _composer_upload_in_progress(page) or not _attachment_present(page, zip_path):
             still_up = _composer_upload_in_progress(page)
             eff_win_now = _upload_timeout_for_archive(Path(zip_path), floor_seconds=600.0)
@@ -8180,6 +8584,8 @@ def _execute_composer_send_sequence(
             setattr(page, "_argon_last_operation_error", AttachOperationError(unconfirmed_reason, path_used=pipeline_path))
             print(f"[ERROR] Operation 'attach' failed ({pipeline_path}): {unconfirmed_reason}", file=sys.stderr)
             return mode_ok, model_ok, False
+
+    user_turns_before_send = _count_user_turns_in_dom(page)
 
     # Step 4: The moment the upload has finished, verify the Flash guard and click send immediately.
     sent_ok = _click_send_immediately(
@@ -8205,6 +8611,24 @@ def _execute_composer_send_sequence(
         print(f"[ERROR] Operation 'send' failed ({send_path_used}): {send_reason}", file=sys.stderr)
     else:
         p_log.append(f"send ({send_path_used}) : OK")
+        # Contract 1 (R1.1) & W5.1: Ensure extension prompt guard is disarmed after every verified send.
+        _disarm_extension_prompt_guard(page, reason=f"verified_{send_path_used}")
+
+        # W5.4: Re-check the composer 2 seconds after the clear and clear again if the observer or editor re-populated it.
+        recheck_secs = float(getattr(page, "_argon_post_clear_recheck_seconds", 2.0))
+        if recheck_secs > 0:
+            try:
+                page.wait_for_timeout(int(recheck_secs * 1000))
+            except Exception:
+                time.sleep(recheck_secs)
+            try:
+                recheck_text = _composer_text(composer)
+            except Exception:
+                recheck_text = ""
+            if len(recheck_text) >= expected_min_len:
+                _disarm_extension_prompt_guard(page, reason="post_2s_composer_recheck")
+                _clear_leftover_prompt_after_send(page, composer, probe_snippet, expected_min_len)
+
         # Round 26 (R1.5): report the composer state after the send. A leftover prompt
         # in an armed composer can be fired again, so it must be visible in the log.
         try:
@@ -8217,6 +8641,19 @@ def _execute_composer_send_sequence(
                 f"[!] composer after send : NOT EMPTY ({len(leftover_text)} chars) - "
                 "the leftover can still be fired."
             )
+        else:
+            p_log.append("composer after send : EMPTY (0 chars)")
+
+        # Contract 6 (R6.1) & W5.3: Count user turns after the send and print DUPLICATE SEND DETECTED
+        # when the count grew by more than one.
+        user_turns_after_send = _count_user_turns_in_dom(page)
+        user_turn_delta = user_turns_after_send - user_turns_before_send
+        if user_turn_delta > 1:
+            cid_dup = _extract_chat_id(str(getattr(page, "url", "") or "")) or "(unknown)"
+            dup_banner = f"DUPLICATE SEND DETECTED ({user_turn_delta} user messages for one prompt) [chat_id={cid_dup}]"
+            setattr(page, "_argon_duplicate_send_detected", dup_banner)
+            p_log.append(dup_banner)
+            print(f"[ERROR] {dup_banner}", file=sys.stderr)
     return mode_ok, model_ok, sent_ok
 
 
@@ -8238,6 +8675,19 @@ def _type_and_send(page, composer, prompt_text: str, on_progress: Optional[Any] 
 
     for attempt in range(2):
         if attempt > 0:
+            # W5.2: Re-run _check_duplicate_prompt before every retry attempt so a prompt that
+            # already landed on attempt 1 is never sent a second time on attempt 2.
+            dup_retry = _check_duplicate_prompt(
+                page,
+                prompt_text=prompt_text,
+                task_text=prompt_text,
+                prev_state=None,
+                new_session=False,
+            )
+            if dup_retry is not None:
+                print(f"[i] _type_and_send attempt {attempt + 1}: prompt is already in the conversation ({dup_retry}) - not sending again.")
+                _disarm_extension_prompt_guard(page, reason="type_and_send_duplicate_guard")
+                return
             fresh = _find_composer(page)
             if fresh is not None:
                 composer = fresh
@@ -9032,7 +9482,6 @@ try:
     from round23_reliability import (
         DEFAULT_WAIT_DEADLINE_SECONDS,
         MAX_ARCHIVE_BYTES,
-        MAX_BASE64_ATTACH_BYTES,
         _attach_zip_via_cdp_dom_file_input,
         _check_page_responsive,
         _conversation_holds_existing_attachment,
@@ -9043,6 +9492,7 @@ try:
         _verify_tab_on_own_conversation,
         attach_images_to_composer,
         format_account_slot_resolution_line,
+        format_archive_canonical_size_line,
         format_archive_route_decision_line,
         get_effective_base64_attach_cap,
         install_round23_bridge_hooks,
@@ -9104,10 +9554,38 @@ def run_preflight_selftest_cli(headless: bool = True, require_extension: bool = 
     if not r24_wu.get("ok"):
         print(f"[ERROR] Round 24 work-units self-test failed: {r24_wu}", file=sys.stderr)
         return EXIT_PREFLIGHT_FAILED
+    try:
+        from test_round27_two_lane import run_round27_two_lane_suite
+
+        r27_rep = run_round27_two_lane_suite()
+    except Exception as r27_exc:
+        print(f"[ERROR] Round 27 two-lane & contract self-test could not run: {r27_exc}", file=sys.stderr)
+        return EXIT_PREFLIGHT_FAILED
+    if not r27_rep.get("ok"):
+        print(f"[ERROR] Round 27 two-lane & contract self-test failed: {r27_rep}", file=sys.stderr)
+        return EXIT_PREFLIGHT_FAILED
+    print(
+        f"  Round 27 two-lane+ext : OK ({r27_rep.get('passed')}/{r27_rep.get('total')} cases in "
+        f"{r27_rep.get('elapsed_ms')} ms: W1-W7 + Contracts 1-6 verified)"
+    )
     print(
         f"  Round 24 work units   : OK ({r24_wu.get('passed')}/{r24_wu.get('total')} cases in "
         f"{r24_wu.get('elapsed_ms')} ms: W1 base64 cap={r24_wu.get('base64_cap_bytes')}B + CDP zero-copy, "
         f"W2 --account-index + resolved URLs, W3 100MB cap + fresh-chat guard + upload state)"
+    )
+    try:
+        from test_round27_two_lane import run_round27_suite
+
+        r27_rep = run_round27_suite()
+    except Exception as r27_exc:
+        print(f"[ERROR] Round 27 two-lane & contracts self-test could not run: {r27_exc}", file=sys.stderr)
+        return EXIT_PREFLIGHT_FAILED
+    if not r27_rep.get("ok"):
+        print(f"[ERROR] Round 27 two-lane & contracts self-test failed: {r27_rep}", file=sys.stderr)
+        return EXIT_PREFLIGHT_FAILED
+    print(
+        f"  Round 27 contracts    : OK ({r27_rep.get('passed')}/{r27_rep.get('total')} cases in "
+        f"{r27_rep.get('elapsed_ms')} ms: Contracts 1-6 + W1-W7 verified across Core and Extension)"
     )
     return EXIT_SUCCESS
 
@@ -10219,9 +10697,14 @@ def _print_duplicate_prompt_notice(sent_hms: str) -> None:
         )
 
 
+if "_r27_rebind_late_hooks" in globals() and callable(globals()["_r27_rebind_late_hooks"]):
+    globals()["_r27_rebind_late_hooks"](globals())
+
+
 def _print_prompt_sent_banner(sent_hms: str, conv_title: str, conv_link: str) -> None:
     title_display = (conv_title or "").strip() or "(new conversation)"
     link_display = (conv_link or "").strip() or "https://gemini.google.com/u/0/app"
+
     print(
         f"[+] PROMPT SENT at {sent_hms}\n"
         f"    conversation : {title_display}\n"
@@ -11266,6 +11749,289 @@ def _expand_attach_images(spec) -> List[Path]:
     return uniq
 
 
+def check_concurrent_lane_guard(
+    proj_root: Path,
+    requested_lane: Optional[str],
+    requested_slot: Optional[str],
+    task_state_store: Optional[TaskState] = None,
+    task_registry: Optional[TaskRegistry] = None,
+    force: bool = False,
+) -> Dict[str, Any]:
+    """Round 27 (W2.1-W2.4 & Contract 6 R6.2): Evaluate the ALREADY RUNNING guard per (project, lane, slot).
+
+    A `followup` lane on slot B and a `new` lane on slot A may run simultaneously for the same project.
+    Only refuses with `EXIT_ALREADY_RUNNING` (9) when the running task is in the SAME lane AND on the SAME slot
+    (or when no slot/lane distinction separates them), and names both `running_lane` and `requested_lane`.
+    """
+    ts = task_state_store or TaskState()
+    reg = task_registry or TaskRegistry()
+    proj_root = Path(proj_root).resolve()
+    req_lane = str(requested_lane or "single").strip().lower()
+    req_slot = normalize_slot(requested_slot) if requested_slot else ""
+
+    reg.reclaim_dead_tasks(proj_root)
+    reg.prune_stale_tasks(proj_root)
+
+    existing_lane_state = ts.get(proj_root, lane=requested_lane) if requested_lane else None
+    if isinstance(existing_lane_state, dict):
+        el_pid = int(existing_lane_state.get("pid") or 0)
+        el_state = str(existing_lane_state.get("state") or "").strip().lower()
+        el_prog = str(existing_lane_state.get("send_progress") or "none").strip().lower()
+        if el_pid and el_pid != os.getpid() and not _pid_alive(el_pid):
+            if el_state == "running" or el_prog not in ("prompt_sent", "verified"):
+                ts.set(
+                    proj_root,
+                    lane=requested_lane,
+                    state="failed",
+                    end_reason=f"reclaimed leftover state={el_state!r} from dead pid {el_pid}",
+                )
+                existing_lane_state = ts.get(proj_root, lane=requested_lane)
+
+    running_lanes = ts.get_running_lanes(proj_root)
+    for rl_name, rl_data in list(running_lanes.items()):
+        rl_pid = int((rl_data or {}).get("pid") or 0)
+        rl_prog = str((rl_data or {}).get("send_progress") or "none").strip().lower()
+        if rl_pid and rl_pid != os.getpid() and not _pid_alive(rl_pid) and rl_prog not in ("prompt_sent", "verified"):
+            ts.set(
+                proj_root,
+                lane=rl_name,
+                state="failed",
+                end_reason=f"reclaimed leftover running lane {rl_name!r} from dead pid {rl_pid}",
+            )
+            running_lanes.pop(rl_name, None)
+
+    def _conflicts_with_request(cand: Dict[str, Any], cand_lane_fallback: str = "single") -> bool:
+        c_lane = str(cand.get("lane") or cand_lane_fallback or "single").strip().lower()
+        c_slot = normalize_slot(str(cand.get("slot") or "/u/0/"))
+        # Different lanes (e.g. 'followup' vs 'new') never block each other when on different slots,
+        # and even when requested_slot is not yet chosen, 'new' vs 'followup' is allowed to run in parallel.
+        if requested_lane and c_lane != req_lane:
+            if not req_slot or c_slot != req_slot:
+                return False
+            # Even if requested_slot was passed, W2.1 says: the guard must only refuse when the
+            # running task is in the SAME lane AND the SAME slot.
+            return False
+        # Same lane: if an explicit different slot was requested, allow it; otherwise same lane conflicts.
+        if req_slot and c_slot != req_slot:
+            return False
+        return True
+
+    blocking_entry: Optional[Dict[str, Any]] = None
+    blocking_lane_name = req_lane
+    if requested_lane:
+        if existing_lane_state and str(existing_lane_state.get("state") or "").strip().lower() in ("sent", "waiting"):
+            b_pid_cand = int(existing_lane_state.get("pid") or 0)
+            if (not b_pid_cand or b_pid_cand == os.getpid() or _pid_alive(b_pid_cand)) and _conflicts_with_request(
+                existing_lane_state, req_lane
+            ):
+                blocking_entry = existing_lane_state
+                blocking_lane_name = str(existing_lane_state.get("lane") or req_lane)
+    elif running_lanes:
+        for rl_key, rl_cand in running_lanes.items():
+            b_pid_cand = int((rl_cand or {}).get("pid") or 0)
+            if (not b_pid_cand or b_pid_cand == os.getpid() or _pid_alive(b_pid_cand)) and _conflicts_with_request(
+                rl_cand, rl_key
+            ):
+                blocking_entry = rl_cand
+                blocking_lane_name = str(rl_cand.get("lane") or rl_key)
+                break
+
+    if blocking_entry is None:
+        reg_active = reg.active_tasks_for_project(proj_root, lane=requested_lane, include_stale=False)
+        for ra_item in reg_active:
+            ra_pid = int(ra_item.get("pid") or 0)
+            if ra_pid and ra_pid != os.getpid() and not _pid_alive(ra_pid):
+                continue
+            if (ra_item.get("chat_id") or ra_item.get("chat_url")) and _conflicts_with_request(ra_item, req_lane):
+                blocking_entry = ra_item
+                blocking_lane_name = str(ra_item.get("lane") or req_lane)
+                break
+
+    if blocking_entry is None:
+        return {
+            "blocked": False,
+            "exit_code": EXIT_SUCCESS,
+            "running_lane": None,
+            "requested_lane": req_lane,
+            "requested_slot": req_slot,
+            "message": "",
+        }
+
+    b_slot = normalize_slot(str(blocking_entry.get("slot") or "/u/0/"))
+    b_cid = str(blocking_entry.get("chat_id") or "") or (
+        _extract_chat_id(str(blocking_entry.get("chat_url") or "")) or "(pending)"
+    )
+    b_url = str(blocking_entry.get("chat_url") or "https://gemini.google.com/u/0/app")
+    b_state = str(blocking_entry.get("state") or blocking_entry.get("status") or "running")
+    b_shot = str(blocking_entry.get("last_screenshot") or blocking_entry.get("screenshot_path") or "(none)")
+    b_sent = str(blocking_entry.get("sent_at") or blocking_entry.get("started_at") or "?")
+
+    if not force:
+        refusal_msg = (
+            f"[ERROR] A task is ALREADY RUNNING for project {proj_root} "
+            f"(running_lane={blocking_lane_name!r}, requested_lane={req_lane!r}, slot={b_slot}, state={b_state!r}, sent_at={b_sent})!"
+        )
+        print("\n" + "!" * 78, file=sys.stderr)
+        print(refusal_msg, file=sys.stderr)
+        print(
+            "  Sending another prompt on the same lane and slot now would SUPERSEDE the unfinished task.",
+            file=sys.stderr,
+        )
+        print(f"  - running_lane   : {blocking_lane_name}", file=sys.stderr)
+        print(f"  - requested_lane : {req_lane}", file=sys.stderr)
+        print(
+            f"  - slot           : {b_slot} ({blocking_entry.get('email') or blocking_entry.get('account') or 'pool account'})",
+            file=sys.stderr,
+        )
+        print(f"  - chat_id        : {b_cid}", file=sys.stderr)
+        print(f"  - link           : {b_url}", file=sys.stderr)
+        print(f"  - state          : {b_state}", file=sys.stderr)
+        print(f"  - screenshot     : {b_shot}", file=sys.stderr)
+        print("\n  Choose one of the two explicit actions:", file=sys.stderr)
+        print(
+            f'    1. Resume waiting for the running task:\n'
+            f'       python "{SCRIPTS_DIR / "dispatch_argon.py"}" --project-path "{proj_root}" --resume',
+            file=sys.stderr,
+        )
+        print(
+            f'    2. Force a new dispatch (explicitly abandoning/superseding the previous task):\n'
+            f'       python "{SCRIPTS_DIR / "dispatch_argon.py"}" --project-path "{proj_root}" --task "..." --force',
+            file=sys.stderr,
+        )
+        print("!" * 78 + "\n", file=sys.stderr)
+        return {
+            "blocked": True,
+            "exit_code": EXIT_ALREADY_RUNNING,
+            "running_lane": blocking_lane_name,
+            "requested_lane": req_lane,
+            "slot": b_slot,
+            "chat_id": b_cid,
+            "message": refusal_msg,
+        }
+
+    print(
+        f"[!] --force specified: marking previous running task (lane={blocking_lane_name}, chat={b_cid}, slot={b_slot}) "
+        "as 'superseded' before starting new run."
+    )
+    ts.set(
+        proj_root,
+        lane=requested_lane,
+        state="superseded",
+        superseded_at=time.strftime("%Y-%m-%d %H:%M:%S"),
+    )
+    reg.register_done(proj_root, lane=requested_lane, status="superseded")
+    return {
+        "blocked": False,
+        "exit_code": EXIT_SUCCESS,
+        "running_lane": blocking_lane_name,
+        "requested_lane": req_lane,
+        "superseded": True,
+        "message": "",
+    }
+
+
+def resolve_lane_conversation(
+    proj_root: Path,
+    lane: Optional[str],
+    mode: str = "gemini",
+    active_slot: str = "/u/0/",
+    explicit_slot: Optional[str] = None,
+    new_session: bool = False,
+    resume_chat: bool = False,
+    session_store: Optional[SessionStore] = None,
+    task_state_store: Optional[TaskState] = None,
+) -> Dict[str, Any]:
+    """Round 27 (W1.1-W1.3 & Contract 6 R6.2): Resolve the conversation for `--lane followup` vs `--lane new`.
+
+    - When `lane == 'followup'` and a recorded conversation exists, returns `is_continuation=True`,
+      the recorded `session`, its `slot`, and prints `lane: followup -> continuing chat <id> (<url>)`.
+    - When `lane == 'followup'` and NO recorded conversation exists, prints
+      `no recorded conversation for lane 'followup'` and `lane: followup -> NEW chat (no recorded conversation)`,
+      and returns `is_continuation=False`.
+    - When `lane == 'new'` or `new_session=True`, returns `is_continuation=False`.
+    """
+    ss = session_store or SessionStore()
+    ts = task_state_store or TaskState()
+    clean_lane = str(lane or "").strip().lower()
+
+    if resume_chat or new_session or clean_lane == "new":
+        if clean_lane == "new":
+            line = f"lane: new -> NEW chat on {active_slot}"
+            print(f"[+] {line}")
+            return {
+                "session": None,
+                "is_continuation": False,
+                "slot": active_slot,
+                "chat_id": "",
+                "chat_url": "",
+                "log_line": line,
+                "no_recorded_followup": False,
+            }
+        return {
+            "session": None,
+            "is_continuation": False,
+            "slot": active_slot,
+            "chat_id": "",
+            "chat_url": "",
+            "log_line": "",
+            "no_recorded_followup": False,
+        }
+
+    session = ss.lookup_for_lane(proj_root, lane=clean_lane or None, mode=mode, task_state_store=ts)
+    if session and (session.get("mode") or "gemini") != (mode or "gemini").strip().lower():
+        session = None
+
+    # Only drop the recorded session on a slot mismatch when the caller EXPLICITLY passed a different
+    # slot for a non-followup run. For `--lane followup`, the follow-up conversation lives on its
+    # recorded slot unless an explicit conflicting slot was forced.
+    if session and explicit_slot is not None and session.get("slot"):
+        if normalize_slot(session["slot"]) != normalize_slot(explicit_slot):
+            if clean_lane != "followup":
+                session = None
+
+    if session and (session.get("chat_url") or session.get("chat_id")):
+        cid = str(session.get("chat_id") or _extract_chat_id(str(session.get("chat_url") or "")) or "")
+        s_slot = normalize_slot(str(session.get("slot") or active_slot))
+        c_url = str(session.get("chat_url") or f"https://gemini.google.com{s_slot}app/{cid}")
+        eff_lane_label = clean_lane or "followup"
+        line = f"lane: {eff_lane_label} -> continuing chat {cid} ({c_url})"
+        print(f"[+] {line}")
+        return {
+            "session": session,
+            "is_continuation": True,
+            "slot": s_slot if explicit_slot is None else normalize_slot(explicit_slot),
+            "chat_id": cid,
+            "chat_url": c_url,
+            "log_line": line,
+            "no_recorded_followup": False,
+        }
+
+    if clean_lane == "followup":
+        msg1 = "no recorded conversation for lane 'followup'"
+        msg2 = "lane: followup -> NEW chat (no recorded conversation)"
+        print(f"[!] {msg1}")
+        print(f"[+] {msg2}")
+        return {
+            "session": None,
+            "is_continuation": False,
+            "slot": active_slot,
+            "chat_id": "",
+            "chat_url": "",
+            "log_line": f"{msg1} | {msg2}",
+            "no_recorded_followup": True,
+        }
+
+    return {
+        "session": None,
+        "is_continuation": False,
+        "slot": active_slot,
+        "chat_id": "",
+        "chat_url": "",
+        "log_line": "",
+        "no_recorded_followup": False,
+    }
+
+
 def dispatch_to_argon(
     task: str,
     project_path: str = ".",
@@ -11468,20 +12234,13 @@ def dispatch_to_argon(
         except Exception as _handoff_err:
             print(f"[!] Warning: Could not write manual hand-off pack: {_handoff_err}", file=sys.stderr)
 
-    # D4.5: Surface any STALE tasks in the registry (with their age and screenshot)
+    # D4.5 & W6 R6.1-R6.2: Reap stale tasks automatically so dead/finished entries never block slots
     stale_list = task_registry.stale_tasks()
     if stale_list:
-        print("[!] STALE tasks detected in ~/.gemini/argon_tasks.json (started but never marked completed):", file=sys.stderr)
-        for st_item in stale_list:
-            print(
-                f"    - project={st_item.get('project')} lane={st_item.get('lane')} "
-                f"slot={st_item.get('slot')} chat_id={st_item.get('chat_id') or '(none)'} "
-                f"age={st_item.get('age_human')} screenshot={st_item.get('screenshot_path') or '(none)'}",
-                file=sys.stderr,
-            )
+        reaped_now = task_registry.prune_stale_tasks()
         print(
-            f'    Close stale tasks explicitly with: python "{SCRIPTS_DIR / "dispatch_argon.py"}" '
-            f'--project-path "{proj_root}" --register-task-done',
+            f"[+] Reaped {len(reaped_now)} stale task(s) from ~/.gemini/argon_tasks.json "
+            "(finished lanes or expired entries do not count against slot caps).",
             file=sys.stderr,
         )
 
@@ -11490,7 +12249,9 @@ def dispatch_to_argon(
     task_registry.reclaim_dead_tasks(proj_root, lane=lane)
 
     if not resume:
-        existing_lane_state = task_state_store.get(proj_root, lane=lane) if lane else None
+        req_lane_norm = (lane or ("new" if new_session else "single")).strip().lower()
+        req_slot_norm = normalize_slot(slot) if slot else None
+        existing_lane_state = task_state_store.get(proj_root, lane=req_lane_norm)
         if isinstance(existing_lane_state, dict):
             el_pid = int(existing_lane_state.get("pid") or 0)
             el_state = str(existing_lane_state.get("state") or "").strip().lower()
@@ -11499,11 +12260,11 @@ def dispatch_to_argon(
                 if el_state == "running" or el_prog not in ("prompt_sent", "verified"):
                     task_state_store.set(
                         proj_root,
-                        lane=lane,
+                        lane=req_lane_norm,
                         state="failed",
                         end_reason=f"reclaimed leftover state={el_state!r} from dead pid {el_pid}",
                     )
-                    existing_lane_state = task_state_store.get(proj_root, lane=lane)
+                    existing_lane_state = task_state_store.get(proj_root, lane=req_lane_norm)
 
         running_lanes = task_state_store.get_running_lanes(proj_root)
         for rl_name, rl_data in list(running_lanes.items()):
@@ -11518,31 +12279,40 @@ def dispatch_to_argon(
                 )
                 running_lanes.pop(rl_name, None)
 
+        # Round 27 W2 R2.1-R2.4: EXIT_ALREADY_RUNNING (9) refuses ONLY when the running task
+        # is in the SAME lane AND on the SAME slot. A followup lane on slot B and a new lane
+        # on slot A (or different lanes/slots) are allowed to run concurrently.
         blocking_entry: Optional[Dict[str, Any]] = None
-        if lane:
-            if existing_lane_state and str(existing_lane_state.get("state") or "").strip().lower() in ("sent", "waiting"):
-                b_pid_cand = int(existing_lane_state.get("pid") or 0)
-                if not b_pid_cand or b_pid_cand == os.getpid() or _pid_alive(b_pid_cand):
-                    blocking_entry = existing_lane_state
-        elif running_lanes:
-            for _, rl_cand in running_lanes.items():
-                b_pid_cand = int((rl_cand or {}).get("pid") or 0)
-                if not b_pid_cand or b_pid_cand == os.getpid() or _pid_alive(b_pid_cand):
-                    blocking_entry = rl_cand
-                    break
+        if existing_lane_state and str(existing_lane_state.get("state") or "").strip().lower() in ("sent", "waiting"):
+            b_pid_cand = int(existing_lane_state.get("pid") or 0)
+            b_slot_cand = normalize_slot(str(existing_lane_state.get("slot") or "/u/0/"))
+            b_lane_cand = str(existing_lane_state.get("lane") or req_lane_norm).strip().lower()
+            same_lane = b_lane_cand == req_lane_norm
+            same_slot = (req_slot_norm is None) or (b_slot_cand == req_slot_norm)
+            if same_lane and same_slot and (not b_pid_cand or b_pid_cand == os.getpid() or _pid_alive(b_pid_cand)):
+                blocking_entry = existing_lane_state
 
         if blocking_entry is None:
-            reg_active = task_registry.active_tasks_for_project(proj_root, lane=lane)
+            reg_active = task_registry.active_tasks_for_project(
+                proj_root, lane=req_lane_norm, slot=req_slot_norm
+            )
             for ra_item in reg_active:
                 ra_pid = int(ra_item.get("pid") or 0)
                 if ra_pid and ra_pid != os.getpid() and not _pid_alive(ra_pid):
+                    continue
+                ra_lane = str(ra_item.get("lane") or "single").strip().lower()
+                ra_slot = normalize_slot(str(ra_item.get("slot") or "/u/0/"))
+                if ra_lane != req_lane_norm:
+                    continue
+                if req_slot_norm is not None and ra_slot != req_slot_norm:
                     continue
                 if ra_item.get("chat_id") or ra_item.get("chat_url"):
                     blocking_entry = ra_item
                     break
 
         if blocking_entry is not None:
-            b_slot = str(blocking_entry.get("slot") or "/u/0/")
+            b_slot = normalize_slot(str(blocking_entry.get("slot") or "/u/0/"))
+            b_lane = str(blocking_entry.get("lane") or req_lane_norm).strip().lower()
             b_cid = str(blocking_entry.get("chat_id") or "") or (_extract_chat_id(str(blocking_entry.get("chat_url") or "")) or "(pending)")
             b_url = str(blocking_entry.get("chat_url") or "https://gemini.google.com/u/0/app")
             b_state = str(blocking_entry.get("state") or blocking_entry.get("status") or "running")
@@ -11551,13 +12321,16 @@ def dispatch_to_argon(
             if not force:
                 print("\n" + "!" * 78, file=sys.stderr)
                 print(
-                    f"[ERROR] A task is ALREADY RUNNING for project {proj_root} (state={b_state!r}, sent_at={b_sent})!",
+                    f"[ERROR] A task is ALREADY RUNNING for project {proj_root} "
+                    f"(running_lane={b_lane!r}, requested_lane={req_lane_norm!r}, slot={b_slot}, state={b_state!r}, sent_at={b_sent})!",
                     file=sys.stderr,
                 )
                 print(
-                    "  Sending another prompt now would SUPERSEDE the unfinished task or block the account.",
+                    "  Sending another prompt now in the same lane and slot would SUPERSEDE the unfinished task.",
                     file=sys.stderr,
                 )
+                print(f"  - running_lane  : {b_lane}", file=sys.stderr)
+                print(f"  - requested_lane: {req_lane_norm}", file=sys.stderr)
                 print(f"  - slot        : {b_slot} ({blocking_entry.get('email') or blocking_entry.get('account') or 'pool account'})", file=sys.stderr)
                 print(f"  - chat_id     : {b_cid}", file=sys.stderr)
                 print(f"  - link        : {b_url}", file=sys.stderr)
@@ -11715,15 +12488,19 @@ def dispatch_to_argon(
     slot_profile = _profile_dir_for_slot(base_profile, active_slot)
     print(f"[+] Slot browser profile: {slot_profile}")
 
-    session = None if (new_session or lane == "new" or resume_chat) else session_store.lookup(proj_root, mode=mode)
+    eff_lane_label = (lane or ("new" if new_session else "single")).strip().lower()
+    session = (
+        None
+        if (new_session or eff_lane_label == "new" or resume_chat)
+        else session_store.lookup(
+            proj_root,
+            mode=mode,
+            lane=eff_lane_label,
+            slot=active_slot if slot is not None else None,
+        )
+    )
     if session and (session.get("mode") or "gemini") != (mode or "gemini").strip().lower():
         session = None
-    if session and lane == "followup":
-        s_lanes = session.get("lanes") if isinstance(session.get("lanes"), dict) else {}
-        f_lane_entry = s_lanes.get("followup") if isinstance(s_lanes.get("followup"), dict) else {}
-        if f_lane_entry.get("chat_url") and (not slot or normalize_slot(str(f_lane_entry.get("slot") or active_slot)) == active_slot):
-            session = dict(session)
-            session.update({k: v for k, v in f_lane_entry.items() if v})
     # A Gemini conversation URL belongs to the Google account slot it was created in.
     # If an explicit slot was requested (e.g. during pool rotation) that differs from
     # the stored session's slot, start a fresh chat on the requested slot.
@@ -11731,7 +12508,9 @@ def dispatch_to_argon(
         if normalize_slot(session["slot"]) != active_slot:
             session = None
 
-    is_continuation = bool(session and session.get("chat_url") and not resume_chat and not new_session and lane != "new")
+    is_continuation = bool(
+        session and session.get("chat_url") and not resume_chat and not new_session and eff_lane_label != "new"
+    )
     if resume_chat and resume_entry is not None:
         if slot is None and resume_entry.get("slot"):
             active_slot = normalize_slot(resume_entry["slot"])
@@ -11753,6 +12532,8 @@ def dispatch_to_argon(
             isolated_profile=isolated_slot,
             lane=lane,
         )
+        res_cid = str(resume_entry.get("chat_id") or _extract_chat_id(target_url) or "(pending)")
+        print(f"[+] lane: {eff_lane_label} -> continuing chat {res_cid} ({target_url})")
     elif is_continuation and session is not None:
         if slot is None and session.get("slot"):
             active_slot = normalize_slot(session["slot"])
@@ -11762,7 +12543,11 @@ def dispatch_to_argon(
         target_email = active_account.get("email") if active_account else None
         isolated_slot = _profile_is_isolated_slot(slot_profile)
         target_url = _normalize_gemini_chat_url(str(session["chat_url"]), isolated_profile=isolated_slot, slot=active_slot)
+        cont_cid = str(session.get("chat_id") or _extract_chat_id(target_url) or "(stored)")
+        print(f"[+] lane: {eff_lane_label} -> continuing chat {cont_cid} ({target_url})")
     else:
+        if eff_lane_label == "followup":
+            print("[!] no recorded conversation for lane 'followup'")
         pool_cfg.set_active_slot(active_slot)
         active_account = pool_cfg.get_by_slot(active_slot)
         target_email = active_account.get("email") if active_account else None
@@ -11780,6 +12565,7 @@ def dispatch_to_argon(
                 file=sys.stderr,
             )
             return EXIT_NOT_SIGNED_IN
+        print(f"[+] lane: {eff_lane_label} -> NEW chat (pending) (no recorded conversation)")
 
     prior_task_entry = task_state_store.get(proj_root) or {}
     prior_diag_evidence: Optional[Dict[str, Any]] = None
@@ -12539,6 +13325,18 @@ def dispatch_to_argon(
                         )
                         _emit_send_failure("send_sequence_failed", shot_retry, page_obj=page)
                         if current_attempt >= MAX_LADDER_ATTEMPTS or manual_self_send_mode:
+                            dup_before_retry = _check_duplicate_prompt(
+                                page,
+                                prompt_text=prompt_text,
+                                task_text=task,
+                                prev_state=prev_state,
+                                new_session=False,
+                            )
+                            if dup_before_retry is not None:
+                                _print_duplicate_prompt_notice(dup_before_retry)
+                                resume_chat = True
+                                just_sent_prompt = True
+                        if not just_sent_prompt and not resume_chat and (current_attempt >= MAX_LADDER_ATTEMPTS or manual_self_send_mode):
                             print(
                                 "[+] Automatic attempts exhausted - executing bridge self-manual send fallback "
                                 "using the same composer, upload wait, and hard Flash guard (Rule 8)..."
@@ -12677,6 +13475,8 @@ def dispatch_to_argon(
 
             # ------------------------------------------------- remember session --
             chat_id = _wait_for_chat_id(page)
+            if not is_continuation and not resume_chat and chat_id:
+                print(f"[+] lane: {eff_lane_label} -> NEW chat {chat_id} (no recorded conversation)")
             if not is_continuation and not resume_chat and chat_id and chat_id in forbidden_new_chat_ids:
                 shot_foreign = _take_step_screenshot(
                     page,
@@ -12738,6 +13538,10 @@ def dispatch_to_argon(
                         page_url=effective_chat_url,
                         account=target_email or "",
                     )
+                if no_recorded_followup:
+                    print(f"[+] lane: followup -> NEW chat {chat_id} (no recorded conversation)")
+                elif (lane or "").strip().lower() == "new" or new_session:
+                    print(f"[+] lane: new -> NEW chat {chat_id} ({effective_chat_url})")
                 print(f"[+] Remembered the session for this project: {effective_chat_url}")
                 if chat_title:
                     print(f"    conversation name : {chat_title}")
@@ -13849,6 +14653,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="List all currently running and stale tasks in ~/.gemini/argon_tasks.json with per-slot load counts.",
     )
     parser.add_argument(
+        "--prune-stale-tasks",
+        action="store_true",
+        help="Reap stale running entries in ~/.gemini/argon_tasks.json (finished lanes, dead PIDs, or expired entries) so healthy slots are not marked busy.",
+    )
+    parser.add_argument(
         "--close-browser",
         action="store_true",
         help="Safely close the browser of --slot (all its tabs) with session/cookies intact.",
@@ -14180,7 +14989,7 @@ def append_followup_to_running_task(
     eff_slot = normalize_slot(slot or ts_entry.get("slot") or reg_entry.get("slot") or pool_cfg.active_slot())
     acct_obj = pool_cfg.get_by_slot(eff_slot) or {}
     eff_email = str(ts_entry.get("email") or reg_entry.get("account") or acct_obj.get("email") or "")
-    running_task_id = str(reg_entry.get("task_id") or f"{proj_root.name}:{eff_lane}:{eff_slot.strip('/')}")
+    running_task_id = str(reg_entry.get("task_id") or f"{_normalize_project_key(proj_root)}:{eff_lane}:{eff_slot.strip('/')}")
     running_label = str(reg_entry.get("label") or ts_entry.get("task") or "running-task").splitlines()[0][:120]
     running_pid = int(reg_entry.get("pid") or ts_entry.get("pid") or 0)
 
@@ -14315,7 +15124,11 @@ def select_account_slot(
             return c_slot, f"CARRY-OVER policy: staying on {c_slot} where the previous context lives"
 
     # Follow-up always uses its own account even when that account already runs multiple tasks.
-    existing_session = None if (new_session or lane == "new") else sess_store.lookup(project_path, mode=mode)
+    existing_session = (
+        None
+        if (new_session or lane == "new")
+        else sess_store.lookup(project_path, mode=mode, lane=lane or "followup")
+    )
     if existing_session and existing_session.get("chat_url") and existing_session.get("slot"):
         f_slot = normalize_slot(str(existing_session["slot"]))
         f_cid = str(existing_session.get("chat_id") or "")
@@ -14418,12 +15231,15 @@ def _pool_slots_in_order(
     pool_cfg,
     start_slot: Optional[str],
     skip_start_slot: bool = False,
+    preserve_start_slot_first: bool = False,
 ) -> list:
-    """Pool slots to try in wrap-around order (Rule 2).
+    """Pool slots to try in wrap-around order (Rule 2, W6 R6.1).
 
     Every configured pool account is included regardless of its status field.
     Slots that are currently below `MAX_TASKS_PER_SLOT` in `TaskRegistry` are
-    ordered ahead of slots that are already running `MAX_TASKS_PER_SLOT` tasks.
+    ordered ahead of slots that are already running `MAX_TASKS_PER_SLOT` tasks,
+    except when `preserve_start_slot_first=True` (an explicitly requested slot
+    is never pushed behind another slot).
     """
     if pool_cfg is None:
         return []
@@ -14458,7 +15274,10 @@ def _pool_slots_in_order(
             under_cap.append(s_norm)
         else:
             at_cap.append(s_norm)
-    return under_cap + at_cap
+    combined = under_cap + at_cap
+    if preserve_start_slot_first and not skip_start_slot and target_start in combined:
+        combined = [target_start] + [s for s in combined if s != target_start]
+    return combined
 
 
 def list_registered_tasks_cli() -> int:
@@ -14712,6 +15531,25 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
         return EXIT_SUCCESS
 
+    if getattr(args, "prune_stale_tasks", False):
+        reg = TaskRegistry()
+        reaped = reg.prune_stale_tasks()
+        print(f"[+] Reaped {len(reaped)} stale task(s) from {reg.path}.")
+        for r_item in reaped:
+            print(
+                f"    - {r_item.get('task_id')} (slot={r_item.get('slot')}, "
+                f"lane={r_item.get('lane')}, reason={r_item.get('stale_reason')})"
+            )
+        return EXIT_SUCCESS
+
+    if getattr(args, "prune_stale_tasks", False):
+        reg = TaskRegistry()
+        pruned = reg.prune_stale_tasks(
+            args.project_path if getattr(args, "project_path", None) not in (None, ".") else None
+        )
+        print(f"[+] Pruned {len(pruned)} stale task(s) in {reg.path}.")
+        return EXIT_SUCCESS
+
     if getattr(args, "register_task_done", False):
         reg = TaskRegistry()
         closed = reg.register_done(
@@ -14721,8 +15559,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             status="completed",
             label=args.task_label,
         )
+        reaped = reg.prune_stale_tasks()
         print(
-            f"[+] Marked {closed} running task(s) as completed in {reg.path} "
+            f"[+] Marked {closed} running task(s) as completed (and reaped {len(reaped)} stale task(s)) in {reg.path} "
             f"for project {Path(args.project_path).resolve()}"
             + (f" (label={args.task_label!r})." if args.task_label else ".")
         )
@@ -14828,7 +15667,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     # Rule 2: --lane new is always a NEW task and must rotate across pool slots when needed,
     # whereas a FOLLOW-UP always stays on its own conversation slot even if busy.
     is_new_lane_or_session = bool(args.new_session or args.lane == "new")
-    existing_session = None if is_new_lane_or_session else SessionStore().lookup(args.project_path, mode=args.mode)
+    existing_session = (
+        None
+        if is_new_lane_or_session
+        else SessionStore().lookup(args.project_path, mode=args.mode, lane=args.lane or "followup")
+    )
     is_followup_bound = bool(
         existing_session
         and existing_session.get("chat_url")
@@ -14845,10 +15688,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     print(f"[+] Account policy selected start slot {chosen_slot}: {slot_reason}")
 
-    if is_followup_bound:
+    if is_followup_bound or args.slot:
         slots = [chosen_slot]
     else:
-        slots = _pool_slots_in_order(pool_cfg, chosen_slot, skip_start_slot=False)
+        slots = _pool_slots_in_order(
+            pool_cfg,
+            chosen_slot,
+            skip_start_slot=False,
+            preserve_start_slot_first=True,
+        )
         if chosen_slot not in slots:
             slots.insert(0, chosen_slot)
         if args.max_accounts and args.max_accounts > 0 and slots:

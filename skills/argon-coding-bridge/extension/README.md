@@ -20,11 +20,12 @@ and `--remote-debugging-pipe` transport in place of a local TCP debugging port.
 
 | Operation | Action Name | How It Works |
 |---|---|---|
-| **Attach archive** | `attach_archive` | Service worker fetches the archive bytes (or receives base64 chunks) and injects a `File` into `input[type=file]` via `DataTransfer` — never opening the native Windows file dialog. |
+| **Attach archive** | `attach_archive` | Enforces the shared base64 transport cap (`maxBase64Bytes` / `data-argon-max-base64-bytes`, default 8 MB) and returns `reason: "size_cap_exceeded"` when exceeded so Core falls through to zero-copy CDP `DOM.setFileInputFiles` (hard archive limit is 100 MB in `round23_reliability.MAX_ARCHIVE_BYTES`). For `<=` cap, injects a `File` into `input[type=file]` via `DataTransfer` without opening the OS file dialog. |
 | **Paste prompt** | `paste_prompt` | Selects the lowest visible composer (skipping the floating quick-action bar editor) and dispatches a synthetic `ClipboardEvent('paste')` carrying `text/plain` in a `DataTransfer` — no clipboard permission or `Control+V`. |
-| **Mode + Model + Send** | `ensure_mode_and_model`, `click_send` | Installs a `MutationObserver` guarding against model-chip reversion to `Flash` and upload composer clearing, verifies `Task` (`টাস্ক`) and `4 Argon` semantically, and clicks the semantic send control inside the composer's own container. |
-| **Delivery capture** | `capture_delivery` | Calls Drive's `viewer/text?id=<FILE_ID>&authuser=0&page=<N>` endpoint with session cookies and walks `page=0, 1, 2...` until empty, stitching all pages into the full `apply_changes.ps1`. |
-| **State persistence** | `get_state`, `set_state` | Stores run metadata and captured Drive file IDs in `chrome.storage.local`. |
+| **Disarm prompt guard** | `disarm_prompt_guard` | Accepts `{ reason }` and sets `keepPromptAlive = false` and `cachedPromptText = ""`, returning `{ ok: true, operation: "disarm_prompt_guard", path: "extension", keepPromptAlive: false, cachedPromptText: "", reason }`. Invoked by Core after every verified send (both `click_send` and pure-Python fallback) and automatically when `.queued-steering-turn` appears in the DOM. |
+| **Mode + Model + Send** | `ensure_mode_and_model`, `click_send` | Uses the shared localized model label list (`Code & analysis 4 Argon` / `কোড ও বিশ্লেষণ 4 Argon`), waits up to 45 s on slow-hydrating continuation pages (`waitForChipMs`), disarms the prompt guard immediately upon send, and clicks the semantic send control inside the composer container. |
+| **Delivery capture** | `capture_delivery` | Calls Drive's `viewer/text?id=<FILE_ID>&authuser=0&page=<N>` endpoint for the newest turn's `apply_changes.ps1` chip (`fileName: "apply_changes.ps1"`) with session cookies and walks `page=0, 1, 2...` until empty. |
+| **State & version** | `get_state`, `set_state`, `get_runtime_state`, `ping` | Stores run metadata and captured Drive file IDs in `chrome.storage.local` and exposes `version: "1.17.0"` (`data-argon-companion-extension="1.17.0"`) so Core detects any loaded-vs-repo extension version drift. |
 
 ## Automatic Pure-Python Fallback
 

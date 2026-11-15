@@ -42,6 +42,38 @@ COOKIE_SNAPSHOT_DIRNAME = ".argon_cookie_snapshot"
 QUARANTINE_DIRNAME = ".argon_quarantine"
 COMPANION_EXTENSION_DIR = Path(__file__).resolve().parent.parent / "extension"
 COMPANION_EXTENSION_ID = "fpkgidjninpmnngjibimgfbadegpimbg"
+COMPANION_EXTENSION_VERSION = "1.17.0"
+
+
+def get_repo_companion_extension_version(ext_dir: Optional[Path] = None) -> str:
+    """Return the companion extension version declared in `extension/manifest.json` (Contract 5)."""
+    cand = Path(ext_dir).expanduser().resolve() if ext_dir else COMPANION_EXTENSION_DIR.resolve()
+    manifest = cand / "manifest.json"
+    try:
+        if manifest.is_file():
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+            ver = str(data.get("version") or "").strip()
+            if ver:
+                return ver
+    except Exception:
+        pass
+    return COMPANION_EXTENSION_VERSION
+
+def check_companion_extension_version(
+    loaded_version: str = "",
+    repo_version: str = "",
+    emit_warning: bool = True,
+) -> Dict[str, Any]:
+    """Compare the loaded companion extension version with the repo's (Contract 5 R5.1).
+
+    The implementation lives in `round23_reliability.py`; it is imported lazily so that
+    `safe_browser` stays importable on its own (it used to be MISSING here, which made
+    every extension install/verify fail with a NameError).
+    """
+    from round23_reliability import check_companion_extension_version as _check
+
+    return _check(None, loaded_version, repo_version, None, emit_warning=emit_warning)
+
 
 DEFAULT_HOST_ARGS = [
     "--no-default-browser-check",
@@ -264,7 +296,7 @@ def ensure_companion_extension_installed(
         }
 
     expected_id = compute_extension_id_from_manifest(resolved)
-    manifest_version = "1.16.0"
+    manifest_version = get_repo_companion_extension_version(resolved)
     manifest_name = "Argon Coding Bridge Companion"
     try:
         m_data = json.loads((resolved / "manifest.json").read_text(encoding="utf-8"))
@@ -346,6 +378,22 @@ def ensure_companion_extension_installed(
                             "reason": f"Extension {loaded_id} not enabled in Extensions.getExtensions after loadUnpacked",
                         }
 
+                loaded_ver_initial = str(matched.get("version") or "").strip()
+                version_mismatch_msg = ""
+                if loaded_ver_initial and loaded_ver_initial != manifest_version:
+                    try:
+                        ws.call("Extensions.loadUnpacked", {"path": str(resolved)})
+                        after_reload = ws.call("Extensions.getExtensions")
+                        matched = _match_ext_entry(list(after_reload.get("extensions") or [])) or matched
+                    except Exception:
+                        pass
+                    loaded_ver_after = str(matched.get("version") or loaded_ver_initial).strip()
+                    if loaded_ver_after and loaded_ver_after != manifest_version:
+                        version_mismatch_msg = (
+                            f"the browser is running extension {loaded_ver_after} but the repo has {manifest_version} "
+                            "- restart the Argon browser before dispatching"
+                        )
+                        print(f"[WARNING] {version_mismatch_msg}", file=sys.stderr)
                 verified_id = str(matched.get("id") or expected_id)
                 sw_target: Optional[Dict[str, Any]] = None
                 sw_deadline = time.monotonic() + min(timeout, 2.5)
@@ -392,6 +440,8 @@ def ensure_companion_extension_installed(
                 m_sw = re.search(r"chrome-extension://([a-p]{32})/", sw_url)
                 if m_sw:
                     runtime_id = m_sw.group(1)
+                loaded_ver = str(matched.get("version") or manifest_version)
+                ver_chk = check_companion_extension_version(loaded_ver, manifest_version, emit_warning=True)
                 return {
                     "ok": True,
                     "installed": True,
@@ -400,7 +450,10 @@ def ensure_companion_extension_installed(
                     "id": runtime_id,
                     "declared_id": expected_id,
                     "name": str(matched.get("name") or manifest_name),
-                    "version": str(matched.get("version") or manifest_version),
+                    "version": loaded_ver,
+                    "expected_version": manifest_version,
+                    "version_match": bool(ver_chk.get("version_match", True)),
+                    "version_warning": "" if ver_chk.get("version_match", True) else str(ver_chk.get("message") or ""),
                     "path": str(matched.get("path") or resolved),
                     "enabled": True,
                     "service_worker_url": sw_url,
@@ -455,6 +508,8 @@ def ensure_companion_extension_installed(
                     m_sw = re.search(r"chrome-extension://([a-p]{32})/", sw_url)
                     if m_sw:
                         runtime_id = m_sw.group(1)
+                    loaded_ver = str(matched.get("version") or manifest_version)
+                    ver_chk = check_companion_extension_version(loaded_ver, manifest_version, emit_warning=True)
                     return {
                         "ok": True,
                         "installed": True,
@@ -463,7 +518,10 @@ def ensure_companion_extension_installed(
                         "id": runtime_id,
                         "declared_id": expected_id,
                         "name": str(matched.get("name") or manifest_name),
-                        "version": str(matched.get("version") or manifest_version),
+                        "version": loaded_ver,
+                        "expected_version": manifest_version,
+                        "version_match": bool(ver_chk.get("version_match", True)),
+                        "version_warning": "" if ver_chk.get("version_match", True) else str(ver_chk.get("message") or ""),
                         "path": str(matched.get("path") or resolved),
                         "enabled": True,
                         "service_worker_url": sw_url,

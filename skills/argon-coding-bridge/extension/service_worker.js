@@ -3,7 +3,7 @@
 // and persists run state in chrome.storage.local so Gemini DOM changes and OS file
 // dialogs cannot break the send or capture pipeline.
 
-const EXTENSION_VERSION = "1.16.0";
+const EXTENSION_VERSION = "1.17.0";
 const STORAGE_STATE_KEY = "argon_companion_state_v1";
 
 async function readCompanionState() {
@@ -88,6 +88,8 @@ async function captureDriveDeliveryWalk(payload) {
   const opts = payload || {};
   const curState = await readCompanionState();
   const fileId = String(opts.fileId || curState.lastDriveFileId || "").trim();
+  const fileName = String(opts.fileName || "apply_changes.ps1").trim() || "apply_changes.ps1";
+  const turnIndex = opts.turnIndex !== undefined ? Number(opts.turnIndex) : -1;
   const maxPages = Math.max(1, Number(opts.maxPages || 12));
   const authUser = String(opts.authUser !== undefined ? opts.authUser : "0").trim();
   const baseOrigin = String(opts.baseOrigin || "https://drive.google.com").replace(/\/+$/, "");
@@ -97,6 +99,8 @@ async function captureDriveDeliveryWalk(payload) {
       ok: false,
       operation: "delivery",
       path: "extension",
+      fileName: fileName,
+      turnIndex: turnIndex,
       reason: "the Drive preview did not expose a file id"
     };
   }
@@ -116,6 +120,8 @@ async function captureDriveDeliveryWalk(payload) {
           ok: false,
           operation: "delivery",
           path: "extension",
+          fileName: fileName,
+          turnIndex: turnIndex,
           reason: `the Drive text endpoint returned HTTP ${resp.status} on page 0`
         };
       }
@@ -125,6 +131,8 @@ async function captureDriveDeliveryWalk(payload) {
         ok: false,
         operation: "delivery",
         path: "extension",
+        fileName: fileName,
+        turnIndex: turnIndex,
         reason: `the Drive text endpoint failed on page ${pageNo} (${String(err)})`
       };
     }
@@ -136,6 +144,8 @@ async function captureDriveDeliveryWalk(payload) {
           ok: false,
           operation: "delivery",
           path: "extension",
+          fileName: fileName,
+          turnIndex: turnIndex,
           reason: "the Drive text endpoint did not return a file body"
         };
       }
@@ -156,6 +166,8 @@ async function captureDriveDeliveryWalk(payload) {
       ok: false,
       operation: "delivery",
       path: "extension",
+      fileName: fileName,
+      turnIndex: turnIndex,
       reason: "the Drive text endpoint returned no content"
     };
   }
@@ -166,6 +178,8 @@ async function captureDriveDeliveryWalk(payload) {
       operation: "delivery",
       ok: true,
       fileId: fileId,
+      fileName: fileName,
+      turnIndex: turnIndex,
       pages: chunks.length,
       length: fullText.length,
       at: new Date().toISOString()
@@ -176,6 +190,8 @@ async function captureDriveDeliveryWalk(payload) {
     operation: "delivery",
     path: "extension",
     fileId: fileId,
+    fileName: fileName,
+    turnIndex: turnIndex,
     pages: chunks.length,
     text: fullText
   };

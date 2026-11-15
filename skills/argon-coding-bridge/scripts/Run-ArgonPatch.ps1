@@ -435,9 +435,20 @@ try {
 
     if (Test-Path -LiteralPath $targetPatch -PathType Leaf) {
         $stamp = (Get-Date).ToString("yyyyMMdd_HHmmss")
-        $backupCopy = "$targetPatch.bak-$stamp"
+        $backupRoot = Join-Path $projectRoot ".argon_backup"
+        if (-not (Test-Path -LiteralPath $backupRoot)) {
+            New-Item -ItemType Directory -Path $backupRoot -Force | Out-Null
+        }
+        $backupCopy = Join-Path $backupRoot "apply_changes.ps1.bak-$stamp"
         [System.IO.File]::Copy($targetPatch, $backupCopy, $true)
         Write-ArgonWarn "Existing apply_changes.ps1 backed up to: $backupCopy"
+    }
+    Get-ChildItem -LiteralPath $projectRoot -Filter "apply_changes.ps1.bak-*" -File -ErrorAction SilentlyContinue | ForEach-Object {
+        $backupRoot = Join-Path $projectRoot ".argon_backup"
+        if (-not (Test-Path -LiteralPath $backupRoot)) {
+            New-Item -ItemType Directory -Path $backupRoot -Force | Out-Null
+        }
+        Move-Item -LiteralPath $_.FullName -Destination (Join-Path $backupRoot $_.Name) -Force -ErrorAction SilentlyContinue
     }
     if (-not [string]::Equals($foundPatch, $targetPatch, [System.StringComparison]::OrdinalIgnoreCase)) {
         # The browser may still hold a handle on a freshly downloaded file, so

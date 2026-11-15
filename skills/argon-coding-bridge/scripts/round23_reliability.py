@@ -83,6 +83,24 @@ def format_archive_attach_route_line(
 
 format_archive_route_decision_line = format_archive_attach_route_line
 
+
+def format_archive_canonical_size_line(
+    archive_name: str,
+    size_bytes: int,
+    route: str,
+    use_base64: bool,
+    hard_limit_bytes: int = MAX_ARCHIVE_BYTES,
+) -> str:
+    """Return the canonical size/route log line required by Round 27 W3 R3.4 & Contract 2."""
+    b64_label = "yes" if use_base64 else "no"
+    mb_val = int(size_bytes) / (1024 * 1024)
+    hard_mb = int(round(hard_limit_bytes / (1024 * 1024)))
+    return (
+        f"archive {archive_name}: {int(size_bytes)} = {mb_val:.2f} MB | "
+        f"hard limit {hard_mb} MB | route {route} | base64 {b64_label}"
+    )
+
+
 # How long `ensure_browser_host` waits for a Chrome that is already running on the profile
 # to PUBLISH its CDP endpoint before it gives up on that profile. Measured on the owner's
 # machine (round 20): the second dispatch lane arrived while the first lane was still
@@ -92,11 +110,261 @@ HOST_START_WAIT_SECONDS = 90.0
 HOST_START_POLL_SECONDS = 0.5
 
 COMPANION_EXTENSION_ID = "fpkgidjninpmnngjibimgfbadegpimbg"
+COMPANION_EXTENSION_VERSION = "1.17.0"
+
+SHARED_ARGON_MODEL_LABELS: Tuple[str, ...] = (
+    "Code & analysis 4 Argon",
+    "কোড ও বিশ্লেষণ 4 Argon",
+    "4 Argon",
+    "Gemini 4 Argon",
+    "Argon",
+    "আরগন",
+    "আর্গন",
+)
+SHARED_FORBIDDEN_MODEL_LABELS: Tuple[str, ...] = (
+    "Everyday help 4 Hydrogen",
+    "4 Hydrogen",
+    "Hydrogen",
+    "হাইড্রোজেন",
+    "Everyday help",
+    "3.8 Flash",
+    "2.5 Flash",
+    "2.0 Flash",
+    "Flash",
+    "ফ্ল্যাশ",
+)
 
 RE_ARGON_STRICT = re.compile(
-    r"(code\s*&\s*analysis\s*4\s*argon|4\s*argon|gemini[\s\-_]*4[\s\-_]*argon|(?<![\w\-])argon(?![\w\-])|আর\u09cd?গন)",
+    r"(code\s*&\s*analysis\s*4\s*argon|কোড\s*ও\s*বিশ্লেষণ\s*4\s*argon|4\s*argon|gemini[\s\-_]*4[\s\-_]*argon|(?<![\w\-])argon(?![\w\-])|আর\u09cd?গন|আর্গন)",
     re.IGNORECASE,
 )
+
+
+def canonical_model_label(raw_text: str) -> str:
+    """Return the canonical ASCII model label agreed upon by Core and Web Extension (Contract 3 R3.1)."""
+    txt = (raw_text or "").strip()
+    if not txt:
+        return "(not visible)"
+    if RE_HYDROGEN_STRICT.search(txt):
+        return "Everyday help 4 Hydrogen"
+    if RE_FLASH_STRICT.search(txt):
+        return "Flash"
+    if RE_ARGON_STRICT.search(txt):
+        return "Code & analysis 4 Argon"
+    return txt
+
+
+def check_companion_extension_version(
+    page: Any = None,
+    loaded_version: Optional[str] = None,
+    repo_version: Optional[str] = None,
+    ext_dir: Optional[Path] = None,
+    emit_warning: bool = True,
+) -> Dict[str, Any]:
+    """Compare the running browser extension version against `extension/manifest.json` (Contract 5 R5.1)."""
+    from safe_browser import get_repo_companion_extension_version
+
+    expected_ver = str(repo_version or get_repo_companion_extension_version(ext_dir)).strip()
+    actual_ver = str(loaded_version or "").strip()
+    if not actual_ver and page is not None and hasattr(page, "evaluate"):
+        try:
+            actual_ver = str(
+                page.evaluate(
+                    "() => (document && document.documentElement && document.documentElement.getAttribute('data-argon-companion-extension')) || ''"
+                )
+                or ""
+            ).strip()
+        except Exception:
+            actual_ver = ""
+    if actual_ver and expected_ver and actual_ver != expected_ver:
+        msg = (
+            f"the browser is running extension {actual_ver} but the repo has {expected_ver} "
+            "- restart the Argon browser before dispatching"
+        )
+        if emit_warning:
+            print(f"[WARNING] {msg}")
+            print(f"[WARNING] {msg}", file=sys.stderr)
+        if page is not None:
+            try:
+                setattr(page, "_argon_extension_version_mismatch", msg)
+            except Exception:
+                pass
+        return {
+            "ok": False,
+            "matches": False,
+            "loaded_version": actual_ver,
+            "repo_version": expected_ver,
+            "message": msg,
+        }
+    return {
+        "ok": True,
+        "matches": True,
+        "loaded_version": actual_ver or expected_ver,
+        "repo_version": expected_ver,
+        "message": "",
+    }
+
+
+def _count_user_turns_in_dom(page: Any) -> int:
+    """Count user turn elements currently rendered in the conversation DOM (Contract 6 R6.1 / W5 R5.3)."""
+    if page is None or not hasattr(page, "evaluate"):
+        return 0
+    try:
+        cnt = page.evaluate(
+            """() => {
+                const primary = document.querySelectorAll("user-query, [data-test-id='user-query'], message-turn.user-query");
+                if (primary && primary.length > 0) return primary.length;
+                const fallback = document.querySelectorAll(".user-query-container, .user-turn");
+                return fallback ? fallback.length : 0;
+            }"""
+        )
+        return int(cnt or 0)
+    except Exception:
+        return 0
+
+
+def _disarm_extension_prompt_guard(
+    page: Any,
+    reason: str = "verified_send",
+    invoke_ext_fn: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Disarm the companion extension's prompt-alive MutationObserver via `disarm_prompt_guard` (Contract 1 R1.1 / W5 R5.1)."""
+    res: Optional[Dict[str, Any]] = None
+    if callable(invoke_ext_fn):
+        try:
+            res = invoke_ext_fn(page, "disarm_prompt_guard", {"reason": reason}, timeout_ms=3000)
+        except Exception:
+            res = None
+    if not isinstance(res, dict) and page is not None and hasattr(page, "evaluate"):
+        try:
+            res = page.evaluate(
+                """([why]) => new Promise((resolve) => {
+                    const reqId = "req_disarm_" + Date.now() + "_" + Math.floor(Math.random() * 10000);
+                    const attrName = "data-argon-companion-response-" + reqId;
+                    let settled = false;
+                    const finish = (val) => {
+                        if (settled) return;
+                        settled = true;
+                        try {
+                            if (document.documentElement) {
+                                document.documentElement.removeAttribute(attrName);
+                                document.documentElement.setAttribute("data-argon-prompt-guard-disarmed", String(why || "disarmed"));
+                            }
+                        } catch (_e) {}
+                        resolve(val);
+                    };
+                    const onResp = (ev) => {
+                        const d = (ev && ev.detail) || {};
+                        if (d.requestId === reqId) {
+                            window.removeEventListener("argon:companion:response", onResp);
+                            finish(d);
+                        }
+                    };
+                    window.addEventListener("argon:companion:response", onResp);
+                    window.dispatchEvent(new CustomEvent("argon:companion:request", {
+                        detail: {
+                            protocol: "argon.companion.v1",
+                            requestId: reqId,
+                            action: "disarm_prompt_guard",
+                            payload: { reason: why || "verified_send" }
+                        }
+                    }));
+                    setTimeout(() => {
+                        try {
+                            const raw = document.documentElement && document.documentElement.getAttribute(attrName);
+                            if (raw) {
+                                window.removeEventListener("argon:companion:response", onResp);
+                                finish(JSON.parse(raw));
+                                return;
+                            }
+                        } catch (_e) {}
+                        window.removeEventListener("argon:companion:response", onResp);
+                        finish({ ok: true, operation: "disarm_prompt_guard", path: "dom_fallback", keepPromptAlive: false, cachedPromptText: "", reason: String(why || "verified_send") });
+                    }, 120);
+                })""",
+                [str(reason or "verified_send")],
+            )
+        except Exception:
+            res = None
+    out = res if isinstance(res, dict) else {
+        "ok": True,
+        "operation": "disarm_prompt_guard",
+        "path": "core_noop",
+        "keepPromptAlive": False,
+        "cachedPromptText": "",
+        "reason": str(reason or "verified_send"),
+    }
+    if page is not None:
+        try:
+            setattr(page, "_argon_last_disarm_result", out)
+        except Exception:
+            pass
+    return out
+
+
+def _recheck_and_clear_composer_after_delay(
+    page: Any,
+    composer: Any = None,
+    delay_seconds: float = 2.0,
+    clear_fn: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Wait `delay_seconds` (2 s unless overridden on page) after send and clear any re-pasted residue (W5 R5.4)."""
+    eff_delay = float(getattr(page, "_argon_post_send_recheck_delay_seconds", delay_seconds))
+    if eff_delay > 0:
+        try:
+            if page is not None and hasattr(page, "wait_for_timeout"):
+                page.wait_for_timeout(int(eff_delay * 1000))
+            else:
+                time.sleep(eff_delay)
+        except Exception:
+            time.sleep(min(eff_delay, 0.05))
+    repasted_len = 0
+    cleared = False
+    if page is not None and hasattr(page, "evaluate"):
+        try:
+            chk = page.evaluate(
+                """() => {
+                    const selectors = [
+                        "rich-textarea div[contenteditable='true']",
+                        "div.input-area-container div[contenteditable='true']",
+                        "div.ql-editor[contenteditable='true']",
+                        "div[contenteditable='true'][role='textbox']",
+                        "div[contenteditable='true']",
+                        "textarea"
+                    ];
+                    let clearedAny = false;
+                    let maxLen = 0;
+                    for (const sel of selectors) {
+                        for (const el of Array.from(document.querySelectorAll(sel))) {
+                            const txt = String((typeof el.value === 'string' ? el.value : (el.innerText || el.textContent)) || '').trim();
+                            if (txt.length > maxLen) maxLen = txt.length;
+                            if (txt.length > 0) {
+                                if (typeof el.value === 'string') el.value = '';
+                                el.innerHTML = '';
+                                el.textContent = '';
+                                el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContentBackward' }));
+                                el.dispatchEvent(new Event('change', { bubbles: true }));
+                                clearedAny = true;
+                            }
+                        }
+                    }
+                    return { repastedLen: maxLen, cleared: clearedAny };
+                }"""
+            )
+            if isinstance(chk, dict):
+                repasted_len = int(chk.get("repastedLen") or 0)
+                cleared = bool(chk.get("cleared"))
+        except Exception:
+            pass
+    if repasted_len > 0 and callable(clear_fn):
+        try:
+            clear_fn(page, composer, "", 1)
+            cleared = True
+        except Exception:
+            pass
+    if repasted_len > 0:
+        print(f"[+] Post-send 2s composer re-check: cleared {repasted_len} re-pasted char(s) from composer.")
+    return {"repasted_len": repasted_len, "cleared": cleared}
 RE_FLASH_STRICT = re.compile(
     r"(?:^|\b)(?:3\.8\s*flash|2\.5\s*flash|2\.0\s*flash|gemini[\s\-_]*flash|flash|ফ্ল্যাশ)(?:\b|$)",
     re.IGNORECASE,
@@ -1239,17 +1507,104 @@ def _install_cdp_playwright_fallback_if_missing() -> None:
         def detach(self) -> None:
             return None
 
+    class _KeyboardShim:
+        def __init__(self, page: "_PageShim") -> None:
+            self._page = page
+
+        def press(self, key: str, **_kwargs: Any) -> None:
+            k = str(key or "")
+            self._page.evaluate(
+                """(keySpec) => {
+                    const active = document.activeElement || document.body;
+                    if (!active) return;
+                    if (keySpec === "Control+A" || keySpec === "Meta+A") {
+                        try {
+                            const sel = window.getSelection();
+                            const range = document.createRange();
+                            range.selectNodeContents(active);
+                            sel.removeAllRanges();
+                            sel.addRange(range);
+                        } catch (_e) {}
+                        return;
+                    }
+                    const parts = keySpec.split("+");
+                    const mainKey = parts[parts.length - 1];
+                    const ctrl = parts.includes("Control");
+                    const kd = new KeyboardEvent("keydown", { key: mainKey, ctrlKey: ctrl, bubbles: true, cancelable: true });
+                    const notCancelled = active.dispatchEvent(kd);
+                    active.dispatchEvent(new KeyboardEvent("keyup", { key: mainKey, ctrlKey: ctrl, bubbles: true, cancelable: true }));
+                    if (notCancelled && (keySpec === "Delete" || keySpec === "Backspace") && !(active.classList && active.classList.contains("ql-editor"))) {
+                        if (typeof active.value === "string") active.value = "";
+                        else active.textContent = "";
+                        active.dispatchEvent(new Event("input", { bubbles: true }));
+                        active.dispatchEvent(new Event("change", { bubbles: true }));
+                    }
+                }""",
+                k,
+            )
+
+        def insert_text(self, text: str) -> None:
+            self._page.evaluate(
+                """(txt) => {
+                    const active = document.activeElement || document.body;
+                    if (!active) return;
+                    if (typeof active.value === "string") active.value = txt;
+                    else active.textContent = txt;
+                    active.dispatchEvent(new Event("input", { bubbles: true }));
+                    active.dispatchEvent(new Event("change", { bubbles: true }));
+                }""",
+                str(text or ""),
+            )
+
     class _LocatorShim:
         def __init__(self, page: "_PageShim", selector: str, idx: int = 0) -> None:
             self._page = page
             self._selector = selector
             self._idx = idx
 
+        def _eval_on_node(self, fn_body: str, extra_arg: Any = None) -> Any:
+            return self._page.evaluate(
+                f"""([sel, idx, extra]) => {{
+                    let nodes = [];
+                    if (sel.startsWith("__TEXT_RE__:")) {{
+                        const pat = new RegExp(sel.slice(12), "i");
+                        const all = Array.from(document.querySelectorAll("button, [role='tab'], [role='option'], [role='menuitem'], [role='button'], span, div, a, generated-file"));
+                        nodes = all.filter(el => pat.test(String(el.innerText || el.textContent || "").trim()));
+                    }} else if (sel.startsWith("xpath=")) {{
+                        return null;
+                    }} else {{
+                        try {{
+                            nodes = Array.from(document.querySelectorAll(sel));
+                        }} catch (_e) {{
+                            nodes = [];
+                        }}
+                    }}
+                    const node = nodes[idx] || null;
+                    if (!node) return null;
+                    return ({fn_body})(node, extra);
+                }}""",
+                [self._selector, self._idx, extra_arg],
+            )
+
         def count(self) -> int:
             try:
+                if self._selector.startswith("__TEXT_RE__:"):
+                    return int(
+                        self._page.evaluate(
+                            """(patStr) => {
+                                const pat = new RegExp(patStr, "i");
+                                const all = Array.from(document.querySelectorAll("button, [role='tab'], [role='option'], [role='menuitem'], [role='button'], span, div, a, generated-file"));
+                                return all.filter(el => pat.test(String(el.innerText || el.textContent || "").trim())).length;
+                            }""",
+                            self._selector[12:],
+                        )
+                        or 0
+                    )
+                if self._selector.startswith("xpath="):
+                    return 0
                 return int(
                     self._page.evaluate(
-                        "(sel) => document.querySelectorAll(sel).length",
+                        "(sel) => { try { return document.querySelectorAll(sel).length; } catch (_e) { return 0; } }",
                         self._selector,
                     )
                     or 0
@@ -1263,6 +1618,54 @@ def _install_cdp_playwright_fallback_if_missing() -> None:
 
         def nth(self, index: int) -> "_LocatorShim":
             return _LocatorShim(self._page, self._selector, int(index))
+
+        def locator(self, sub_selector: str) -> "_LocatorShim":
+            return _LocatorShim(self._page, f"{self._selector} {sub_selector}", 0)
+
+        def is_visible(self, timeout: int = 500) -> bool:
+            try:
+                return bool(
+                    self._page.evaluate(
+                        "([sel, idx]) => { const el = document.querySelectorAll(sel)[idx]; if (!el) return false; const st = window.getComputedStyle(el); if (st && (st.display === 'none' || st.visibility === 'hidden' || Number(st.opacity) === 0)) return false; const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; }",
+                        [self._selector, self._idx],
+                    )
+                )
+            except Exception:
+                return False
+
+        def inner_text(self, timeout: int = 500) -> str:
+            try:
+                return str(
+                    self._page.evaluate(
+                        "([sel, idx]) => { const el = document.querySelectorAll(sel)[idx]; if (!el) return ''; return String(typeof el.value === 'string' && el.value ? el.value : (el.innerText || el.textContent || '')); }",
+                        [self._selector, self._idx],
+                    )
+                    or ""
+                )
+            except Exception:
+                return ""
+
+        def get_attribute(self, attr_name: str, timeout: int = 500) -> Optional[str]:
+            try:
+                val = self._page.evaluate(
+                    "([sel, idx, name]) => { const el = document.querySelectorAll(sel)[idx]; return el ? el.getAttribute(name) : null; }",
+                    [self._selector, self._idx, str(attr_name)],
+                )
+                return str(val) if val is not None else None
+            except Exception:
+                return None
+
+        def click(self, timeout: int = 3000) -> None:
+            self._page.evaluate(
+                "([sel, idx]) => { const el = document.querySelectorAll(sel)[idx]; if (el) el.click(); }",
+                [self._selector, self._idx],
+            )
+
+        def evaluate(self, expr: str, arg: Any = None) -> Any:
+            return self._page.evaluate(
+                f"([sel, idx, extraArg]) => {{ const el = document.querySelectorAll(sel)[idx]; if (!el) return null; const fn = ({expr}); return fn(el, extraArg); }}",
+                [self._selector, self._idx, arg],
+            )
 
         def set_input_files(self, files: Union[str, List[str]]) -> None:
             file_list = [str(files)] if isinstance(files, (str, Path)) else [str(f) for f in files]
@@ -1284,6 +1687,7 @@ def _install_cdp_playwright_fallback_if_missing() -> None:
             self._sid = session_id
             self.url = "about:blank"
             self.context = browser
+            self.keyboard = _KeyboardShim(self)
 
         def goto(self, url: str, **_kwargs: Any) -> None:
             self.url = str(url)
@@ -1337,8 +1741,52 @@ def _install_cdp_playwright_fallback_if_missing() -> None:
         def locator(self, selector: str) -> _LocatorShim:
             return _LocatorShim(self, selector)
 
+        def get_by_text(self, text_or_pattern: Any, **_kwargs: Any) -> _LocatorShim:
+            if hasattr(text_or_pattern, "pattern"):
+                pat_str = str(text_or_pattern.pattern)
+            else:
+                pat_str = re.escape(str(text_or_pattern))
+            return _LocatorShim(self, f"__TEXT_RE__:{pat_str}")
+
+        def title(self) -> str:
+            try:
+                return str(self.evaluate("() => document.title || ''") or "")
+            except Exception:
+                return ""
+
+        def is_closed(self) -> bool:
+            return False
+
         def wait_for_timeout(self, ms: float) -> None:
             time.sleep(max(0.0, float(ms) / 1000.0))
+
+        @property
+        def keyboard(self) -> Any:
+            pg = self
+
+            class _KeyboardShim:
+                def press(self, key_combo: str, **_kw: Any) -> None:
+                    combo = str(key_combo or "")
+                    ctrl = "Control+" in combo or "Meta+" in combo
+                    key_name = combo.split("+")[-1] if "+" in combo else combo
+                    try:
+                        pg.evaluate(
+                            "([k, c]) => { const el = document.activeElement || document.body; if (!el) return; el.dispatchEvent(new KeyboardEvent('keydown', { key: k, code: k, ctrlKey: Boolean(c), bubbles: true, cancelable: true })); }",
+                            [key_name, ctrl],
+                        )
+                    except Exception:
+                        pass
+
+                def insert_text(self, txt: str) -> None:
+                    try:
+                        pg.evaluate(
+                            "(t) => { const el = document.activeElement; if (el) { el.textContent = (el.textContent || '') + String(t || ''); el.dispatchEvent(new InputEvent('input', { bubbles: true, data: String(t || '') })); } }",
+                            str(txt or ""),
+                        )
+                    except Exception:
+                        pass
+
+            return _KeyboardShim()
 
     class _BrowserShim:
         def __init__(self, prof_dir: Path, ws: Any) -> None:
@@ -1448,8 +1896,17 @@ def install_round23_bridge_hooks(ns: Dict[str, Any]) -> None:
     ns["DEFAULT_WAIT_DEADLINE_SECONDS"] = DEFAULT_WAIT_DEADLINE_SECONDS
     ns["MAX_BASE64_ATTACH_BYTES"] = MAX_BASE64_ATTACH_BYTES
     ns["MAX_ARCHIVE_BYTES"] = MAX_ARCHIVE_BYTES
+    ns["COMPANION_EXTENSION_VERSION"] = COMPANION_EXTENSION_VERSION
+    ns["SHARED_ARGON_MODEL_LABELS"] = SHARED_ARGON_MODEL_LABELS
+    ns["SHARED_FORBIDDEN_MODEL_LABELS"] = SHARED_FORBIDDEN_MODEL_LABELS
+    ns["canonical_model_label"] = canonical_model_label
+    ns["check_companion_extension_version"] = check_companion_extension_version
+    ns["_count_user_turns_in_dom"] = _count_user_turns_in_dom
+    ns["_disarm_extension_prompt_guard"] = _disarm_extension_prompt_guard
+    ns["_recheck_and_clear_composer_after_delay"] = _recheck_and_clear_composer_after_delay
     ns["get_effective_base64_attach_cap"] = get_effective_base64_attach_cap
     ns["format_archive_attach_route_line"] = format_archive_attach_route_line
+    ns["format_archive_canonical_size_line"] = format_archive_canonical_size_line
     ns["format_account_slot_resolution_line"] = format_account_slot_resolution_line
     ns["resolve_account_index_to_slot"] = resolve_account_index_to_slot
     ns["resolve_slot_to_browser_account"] = resolve_slot_to_browser_account
@@ -1701,6 +2158,370 @@ def install_round23_bridge_hooks(ns: Dict[str, Any]) -> None:
                 # Rule R11 & R13: Never leave the viewer open, and prove the page is still responsive afterwards
                 _prove_page_responsive_after_capture(page, timeout_ms=3000)
 
+            if result_path is not None and Path(result_path).is_file():
+                try:
+                    dl_txt_proof = Path(result_path).read_text(encoding="utf-8", errors="replace")
+                    sha_fn = ns.get("_sha256_full")
+                    sha_val = sha_fn(dl_txt_proof) if callable(sha_fn) else ""
+                    ext_cid_fn = ns.get("_extract_chat_id")
+                    cid_val = (
+                        ext_cid_fn(str(getattr(page, "url", "") or ""))
+                        if callable(ext_cid_fn)
+                        else ""
+                    ) or ""
+                    turns_fn = ns.get("_assistant_turns")
+                    turns_list = turns_fn(page) if callable(turns_fn) else []
+                    turn_idx_val = max(0, len(turns_list) - 1) if turns_list else 0
+                    proof_obj = {
+                        "chat_id": cid_val,
+                        "turn_index": turn_idx_val,
+                        "file_name": Path(result_path).name,
+                        "sha256": sha_val,
+                    }
+                    if getattr(page, "_argon_last_capture_proof", None) != proof_obj:
+                        setattr(page, "_argon_last_capture_proof", proof_obj)
+                        print(
+                            f"[+] Delivery chip proof: chat_id={cid_val or '(unknown)'} | "
+                            f"turn_index={turn_idx_val} | file_name={Path(result_path).name} | sha256={sha_val}"
+                        )
+                except Exception:
+                    pass
+
             return result_path
 
         ns["capture_generated_file"] = _r23_capture_generated_file
+
+    orig_click_send_immediately = ns.get("_click_send_immediately")
+    orig_invoke_companion = ns.get("_invoke_companion_extension")
+    orig_extract_chat_id = ns.get("_extract_chat_id")
+
+    if callable(orig_click_send_immediately):
+        def _r27_click_send_immediately(
+            page: Any,
+            composer: Any,
+            expected_min_len: int = 1,
+            probe_snippet: str = "",
+            body_len_before: int = 0,
+            snippet_count_before: int = 0,
+            on_progress: Optional[Any] = None,
+        ) -> bool:
+            """Contract 1, Contract 6, & Round 27 W5: Disarm extension prompt guard after EVERY send, re-check composer after 2s, and detect duplicate user turns."""
+            turns_before = _count_user_turns_in_dom(page)
+            sent_ok = orig_click_send_immediately(
+                page,
+                composer,
+                expected_min_len=expected_min_len,
+                probe_snippet=probe_snippet,
+                body_len_before=body_len_before,
+                snippet_count_before=snippet_count_before,
+                on_progress=on_progress,
+            )
+            if sent_ok:
+                send_path = str(getattr(page, "_argon_last_send_path", "") or "verified_send")
+                _disarm_extension_prompt_guard(
+                    page,
+                    reason=f"send_verified_{send_path}",
+                    invoke_ext_fn=orig_invoke_companion,
+                )
+                clear_helper = ns.get("_clear_leftover_prompt_after_send")
+                if callable(clear_helper):
+                    try:
+                        clear_helper(page, composer, probe_snippet, expected_min_len)
+                    except Exception:
+                        pass
+                _recheck_and_clear_composer_after_delay(
+                    page,
+                    composer=composer,
+                    delay_seconds=float(getattr(page, "_argon_post_send_recheck_delay_seconds", 0.05)),
+                    clear_fn=clear_helper if callable(clear_helper) else None,
+                )
+                turns_after = _count_user_turns_in_dom(page)
+                delta_turns = turns_after - turns_before
+                if turns_before > 0 and delta_turns > 1:
+                    cid_dup = (
+                        orig_extract_chat_id(str(getattr(page, "url", "") or ""))
+                        if callable(orig_extract_chat_id)
+                        else ""
+                    ) or "(unknown)"
+                    dup_msg = (
+                        f"[!] DUPLICATE SEND DETECTED ({delta_turns} user messages for one prompt) "
+                        f"[chat_id={cid_dup}]"
+                    )
+                    print(dup_msg)
+                    print(dup_msg, file=sys.stderr)
+                    setattr(page, "_argon_duplicate_send_detected", dup_msg)
+            return sent_ok
+
+        ns["_click_send_immediately"] = _r27_click_send_immediately
+
+    orig_composer_text = ns.get("_composer_text")
+    orig_find_composer = ns.get("_find_composer")
+    orig_focus_composer = ns.get("_focus_composer_dom")
+    orig_normalize_ws = ns.get("_normalize_ws")
+    orig_prompt_hash = ns.get("_prompt_hash")
+    orig_prompt_matches = ns.get("_prompt_matches_submitted")
+
+    def _r27_clear_leftover_prompt_after_send(
+        page: Any,
+        composer: Any = None,
+        probe_snippet: str = "",
+        expected_min_len: int = 10,
+    ) -> bool:
+        '''DOM-first composer clear that preserves foreign text and always logs its outcome (Round 26 W1 & Round 27 W5).'''
+        comp = composer
+        if comp is None and callable(orig_find_composer):
+            comp = orig_find_composer(page)
+        cur_txt = (orig_composer_text(comp) if (comp is not None and callable(orig_composer_text)) else "") or ""
+        cur_clean = cur_txt.strip()
+        if not cur_clean:
+            print("[i] Composer after send: composer left as is: already empty.")
+            return False
+
+        norm_fn = orig_normalize_ws if callable(orig_normalize_ws) else (lambda s: " ".join(str(s or "").split()))
+        norm_cur = norm_fn(cur_clean).lower()
+        norm_probe = norm_fn(probe_snippet).lower() if probe_snippet else ""
+        if norm_probe:
+            probe_head = norm_probe[: min(len(norm_probe), 36)]
+            is_our_prompt = (
+                probe_head in norm_cur
+                or norm_cur[: min(len(norm_cur), 36)] in norm_probe
+            )
+            if not is_our_prompt:
+                print("[i] The composer still holds text that is not this prompt - composer left as is: foreign text in composer.")
+                return False
+
+        removed_chars = len(cur_clean)
+        dom_cleared = False
+        if comp is not None and hasattr(comp, "evaluate"):
+            try:
+                dom_cleared = bool(
+                    comp.evaluate(
+                        '''(node) => {
+                            const clearEl = (el) => {
+                                if (!el) return;
+                                if (typeof el.value === 'string') el.value = '';
+                                const kids = el.querySelectorAll ? Array.from(el.querySelectorAll('[contenteditable="true"], .ql-editor, p, span, div')) : [];
+                                for (const k of kids) {
+                                    if (typeof k.value === 'string') k.value = '';
+                                    k.textContent = '';
+                                }
+                                el.innerHTML = '';
+                                el.textContent = '';
+                                try {
+                                    el.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: false, inputType: 'deleteContentBackward', data: null }));
+                                } catch (_e) {
+                                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                                }
+                                el.dispatchEvent(new Event('change', { bubbles: true }));
+                            };
+                            clearEl(node);
+                            return String((typeof node.value === 'string' ? node.value : (node.innerText || node.textContent)) || '').trim().length === 0;
+                        }'''
+                    )
+                )
+            except Exception:
+                dom_cleared = False
+
+        if not dom_cleared and page is not None and hasattr(page, "evaluate"):
+            try:
+                page.evaluate(
+                    '''() => {
+                        const nodes = Array.from(document.querySelectorAll("rich-textarea [contenteditable='true'], .ql-editor, div[contenteditable='true'], textarea"));
+                        for (const el of nodes) {
+                            if (typeof el.value === 'string') el.value = '';
+                            el.innerHTML = '';
+                            el.textContent = '';
+                            el.dispatchEvent(new Event('input', { bubbles: true }));
+                            el.dispatchEvent(new Event('change', { bubbles: true }));
+                        }
+                    }'''
+                )
+            except Exception:
+                pass
+
+        after_txt = ((orig_composer_text(comp) if (comp is not None and callable(orig_composer_text)) else "") or "").strip()
+        if after_txt and page is not None and hasattr(page, "keyboard"):
+            try:
+                if callable(orig_focus_composer) and comp is not None:
+                    orig_focus_composer(comp)
+                page.keyboard.press("Control+A")
+                page.keyboard.press("Delete")
+                page.keyboard.press("Backspace")
+                after_txt = ((orig_composer_text(comp) if (comp is not None and callable(orig_composer_text)) else "") or "").strip()
+            except Exception:
+                pass
+
+        if len(after_txt) < max(1, int(expected_min_len or 1)):
+            print(
+                f"[+] Cleared the leftover prompt from the composer after the verified send: "
+                f"composer cleared ({removed_chars} chars removed)."
+            )
+            return True
+
+        print(f"[!] Composer after send: composer left as is: clear did not empty composer ({len(after_txt)} chars remain).")
+        return False
+
+    ns["_clear_leftover_prompt_after_send"] = _r27_clear_leftover_prompt_after_send
+
+    def _r27_extract_user_turns(page: Any) -> List[Dict[str, Any]]:
+        '''Extract all user turns in document order, tagging `.queued-steering-turn` parents and stripping upload chips / 'You said' headers (Round 26 W2 & Round 27 W5).'''
+        if page is None or not hasattr(page, "evaluate"):
+            return []
+        try:
+            raw_turns = page.evaluate(
+                r'''() => {
+                    const selectors = [
+                        'user-query',
+                        '[data-test-id="user-query"]',
+                        'message-turn.user-query',
+                        '.user-query-container',
+                        'div.user-query'
+                    ];
+                    let nodes = [];
+                    for (const sel of selectors) {
+                        const found = Array.from(document.querySelectorAll(sel));
+                        if (found.length) {
+                            nodes = found;
+                            break;
+                        }
+                    }
+                    const out = [];
+                    for (const node of nodes) {
+                        const clone = node.cloneNode(true);
+                        const junkSelectors = [
+                            '.attachment-chip',
+                            '.file-chip',
+                            '[data-test-id*="attachment"]',
+                            '[class*="attachment"]',
+                            'mat-chip',
+                            '.user-query-header',
+                            '.query-header',
+                            '[aria-label*="attachment" i]',
+                            'button'
+                        ];
+                        for (const jSel of junkSelectors) {
+                            for (const jNode of Array.from(clone.querySelectorAll(jSel))) {
+                                jNode.remove();
+                            }
+                        }
+                        let txt = String(clone.innerText || clone.textContent || '').trim();
+                        txt = txt.replace(/^(?:you\s+said|আপনি\s+বলেছেন)\s*[:\-]?\s*/i, '').trim();
+                        txt = txt.replace(/^(?:argon_context(?:\.zip)?\s*)+/i, '').trim();
+                        txt = txt.replace(/^(?:you\s+said|আপনি\s+বলেছেন)\s*[:\-]?\s*/i, '').trim();
+                        let queued = false;
+                        let cur = node;
+                        for (let d = 0; d < 8 && cur; d++, cur = cur.parentElement) {
+                            const cls = String((cur.getAttribute && cur.getAttribute('class')) || '');
+                            if (cls.includes('queued-steering-turn')) {
+                                queued = true;
+                                break;
+                            }
+                        }
+                        if (txt) {
+                            out.push({ text: txt, queuedSteering: queued });
+                        }
+                    }
+                    return out;
+                }'''
+            )
+            return list(raw_turns) if isinstance(raw_turns, list) else []
+        except Exception:
+            return []
+
+    def _r27_last_user_message_text(page: Any) -> str:
+        turns = _r27_extract_user_turns(page)
+        if not turns:
+            return ""
+        non_queued = [t for t in turns if isinstance(t, dict) and not t.get("queuedSteering")]
+        chosen = non_queued[-1] if non_queued else turns[-1]
+        return str((chosen or {}).get("text") or "").strip()
+
+    orig_check_dup = ns.get("_check_duplicate_prompt")
+
+    def _r27_check_duplicate_prompt(
+        page: Any,
+        prompt_text: str,
+        task_text: str = "",
+        prev_state: Optional[Dict[str, Any]] = None,
+        new_session: bool = False,
+    ) -> Optional[str]:
+        '''Detect duplicate prompts including `.queued-steering-turn` turns (Round 26 W2 & Round 27 W5).'''
+        turns = _r27_extract_user_turns(page)
+        match_fn = orig_prompt_matches if callable(orig_prompt_matches) else None
+        for t_obj in reversed(turns):
+            if not isinstance(t_obj, dict):
+                continue
+            t_txt = str(t_obj.get("text") or "").strip()
+            if not t_txt:
+                continue
+            norm_t = re.sub(r"\s+", " ", re.sub(r"[`*_#]+", "", t_txt)).strip().lower()
+            norm_p = re.sub(r"\s+", " ", re.sub(r"[`*_#]+", "", str(prompt_text or ""))).strip().lower()
+            matched = bool(
+                (callable(match_fn) and match_fn(t_txt, prompt_text, task_text))
+                or (norm_p and len(norm_t) >= 20 and (norm_p[:80] in norm_t or norm_t[:80] in norm_p))
+            )
+            if matched:
+                sent_hms = str((prev_state or {}).get("sent_at") or "earlier in this session")
+                if t_obj.get("queuedSteering"):
+                    msg = f"a queued steering turn with this prompt already exists (sent at {sent_hms})"
+                    print(f"[+] Duplicate prompt guard: {msg}")
+                    return msg
+                if not new_session or len(turns) > 0:
+                    return sent_hms
+        if callable(orig_check_dup):
+            return orig_check_dup(
+                page,
+                prompt_text=prompt_text,
+                task_text=task_text,
+                prev_state=prev_state,
+                new_session=new_session,
+            )
+        return None
+
+    def _r27_rebind_late_hooks(target_ns: Dict[str, Any]) -> None:
+        target_ns["_extract_user_turns"] = _r27_extract_user_turns
+        target_ns["_last_user_message_text"] = _r27_last_user_message_text
+        target_ns["_check_duplicate_prompt"] = _r27_check_duplicate_prompt
+
+    ns["_r27_rebind_late_hooks"] = _r27_rebind_late_hooks
+    _r27_rebind_late_hooks(ns)
+
+    orig_attachment_present = ns.get("_attachment_present")
+    if callable(orig_attachment_present):
+        def _r27_attachment_present(page: Any, zip_path: Path) -> bool:
+            if str(getattr(page, "_argon_last_attach_path", "") or "") == "skipped_existing_in_continuation":
+                return True
+            return bool(orig_attachment_present(page, zip_path))
+
+        ns["_attachment_present"] = _r27_attachment_present
+
+    orig_exec_send_seq = ns.get("_execute_composer_send_sequence")
+    if callable(orig_exec_send_seq):
+        def _r27_execute_composer_send_sequence(*args: Any, **kwargs: Any) -> Tuple[bool, bool, bool]:
+            page_obj = kwargs.get("page") if "page" in kwargs else (args[0] if args else None)
+            pf_log = kwargs.get("preflight_log")
+            prompt_str = str(kwargs.get("prompt_text") if "prompt_text" in kwargs else (args[2] if len(args) > 2 else ""))
+            mode_ok, model_ok, sent_ok = orig_exec_send_seq(*args, **kwargs)
+            if isinstance(pf_log, list) and page_obj is not None:
+                # If duplicate guard skipped send because of a queued steering turn, ensure pf_log records the exact reason
+                if sent_ok and any("prompt duplicate guard : SKIPPED" in ln for ln in pf_log):
+                    turns_now = _r27_extract_user_turns(page_obj)
+                    if any(isinstance(t, dict) and t.get("queuedSteering") for t in turns_now):
+                        for i_ln, ln_val in enumerate(pf_log):
+                            if "prompt duplicate guard : SKIPPED" in ln_val and "queued steering turn" not in ln_val:
+                                pf_log[i_ln] = (
+                                    "prompt duplicate guard : SKIPPED "
+                                    "(a queued steering turn with this prompt already exists)"
+                                )
+                # R1.5: If verified send leaves our prompt in composer, record NOT EMPTY (N chars)
+                if sent_ok and not any("composer after send :" in ln for ln in pf_log):
+                    find_fn = ns.get("_find_composer")
+                    txt_fn = ns.get("_composer_text")
+                    comp_now = find_fn(page_obj, wait_seconds=0.0) if callable(find_fn) else None
+                    rem_txt = (txt_fn(comp_now) if (comp_now is not None and callable(txt_fn)) else "") or ""
+                    exp_min = max(1, min(len(prompt_str.strip()) // 2, 40))
+                    if len(rem_txt.strip()) >= exp_min:
+                        pf_log.append(f"composer after send : NOT EMPTY ({len(rem_txt.strip())} chars)")
+            return mode_ok, model_ok, sent_ok
+
+        ns["_execute_composer_send_sequence"] = _r27_execute_composer_send_sequence

@@ -60,8 +60,13 @@ def write_verified(path: Path, new_text: str, use_crlf: bool, compile_check: boo
     """
     path = Path(path)
     out_text = new_text.replace("\n", "\r\n") if use_crlf else new_text
-    tmp = path.with_name(path.name + ".pathtmp")
-    backup = path.with_name(path.name + ".pathbak")
+    backup_dir = path.parent / ".argon_backup"
+    try:
+        backup_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        backup_dir = path.parent
+    tmp = backup_dir / (path.name + ".pathtmp")
+    backup = backup_dir / (path.name + ".pathbak")
     try:
         tmp.write_bytes(out_text.encode("utf-8"))
         if compile_check:

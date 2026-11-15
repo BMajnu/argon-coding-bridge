@@ -332,7 +332,10 @@ def test_r2_r10_r11_r12_r13_hermetic_browser_and_single_session_send() -> Dict[s
             )
             wd_val = (wd_eval.get("result") or {}).get("value") or {}
             assert wd_val.get("webdriver") is False, f"Expected navigator.webdriver === false, got {wd_val}"
-            assert wd_val.get("marker") == "1.16.0", f"Expected content script marker '1.16.0', got {wd_val}"
+            expected_ext_ver = sb.get_repo_companion_extension_version()
+            assert wd_val.get("marker") == expected_ext_ver, (
+                f"Expected content script marker {expected_ext_ver!r}, got {wd_val}"
+            )
 
             # Exercise R10 + R11 + R12: Inject a realistic Gemini workspace DOM with:
             # - Task mode toggle + model picker containing '4 Hydrogen' (Everyday help) AND 'Code & analysis 4 Argon'

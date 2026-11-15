@@ -417,42 +417,81 @@ def run_dual_dispatch(
 
     followup_logs: List[str] = []
     new_logs: List[str] = []
-    # Rule R4: The two lanes must never run concurrently against the same Argon browser.
-    # Run FOLLOW-UP first, then NEW-SESSION sequentially on the shared browser host.
-    print("[+] Running FOLLOW-UP and NEW-SESSION lanes sequentially on the single Argon browser (Rule R4)...")
-    proc_followup = subprocess.Popen(
-        followup_cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
-    t_f = threading.Thread(
-        target=_stream_pipe,
-        args=(proc_followup.stdout, f"[FOLLOWUP {followup_slot}]", followup_logs),
-        daemon=True,
-    )
-    t_f.start()
-    rc_followup = proc_followup.wait()
-    t_f.join(timeout=5.0)
+    # Round 27 (Contract 6 R6.2 & W2.1): When followup and new run on DIFFERENT slots, both lanes
+    # may run at the same time in parallel tabs/slots; only fall back to sequential when on the same slot.
+    same_slot = normalize_slot(followup_slot) == normalize_slot(new_slot)
+    if not same_slot:
+        print(
+            f"[+] Launching FOLLOW-UP ({followup_slot}) and NEW-SESSION ({new_slot}) lanes CONCURRENTLY "
+            "(two-lane parallel execution on distinct slots)..."
+        )
+        proc_followup = subprocess.Popen(
+            followup_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        proc_new = subprocess.Popen(
+            new_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        t_f = threading.Thread(
+            target=_stream_pipe,
+            args=(proc_followup.stdout, f"[FOLLOWUP {followup_slot}]", followup_logs),
+            daemon=True,
+        )
+        t_n = threading.Thread(
+            target=_stream_pipe,
+            args=(proc_new.stdout, f"[NEW {new_slot}]", new_logs),
+            daemon=True,
+        )
+        t_f.start()
+        t_n.start()
+        rc_followup = proc_followup.wait()
+        rc_new = proc_new.wait()
+        t_f.join(timeout=5.0)
+        t_n.join(timeout=5.0)
+    else:
+        print("[+] Running FOLLOW-UP and NEW-SESSION lanes sequentially on the same slot...")
+        proc_followup = subprocess.Popen(
+            followup_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        t_f = threading.Thread(
+            target=_stream_pipe,
+            args=(proc_followup.stdout, f"[FOLLOWUP {followup_slot}]", followup_logs),
+            daemon=True,
+        )
+        t_f.start()
+        rc_followup = proc_followup.wait()
+        t_f.join(timeout=5.0)
 
-    proc_new = subprocess.Popen(
-        new_cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
-    t_n = threading.Thread(
-        target=_stream_pipe,
-        args=(proc_new.stdout, f"[NEW {new_slot}]", new_logs),
-        daemon=True,
-    )
-    t_n.start()
-    rc_new = proc_new.wait()
-    t_n.join(timeout=5.0)
+        proc_new = subprocess.Popen(
+            new_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        t_n = threading.Thread(
+            target=_stream_pipe,
+            args=(proc_new.stdout, f"[NEW {new_slot}]", new_logs),
+            daemon=True,
+        )
+        t_n.start()
+        rc_new = proc_new.wait()
+        t_n.join(timeout=5.0)
 
     followup_patch = _ensure_canonical_patch_path(followup_dir)
     new_patch = _ensure_canonical_patch_path(new_dir)

@@ -186,9 +186,13 @@ def package_files(repo: Path) -> List[str]:
             if any(part in {"__pycache__", ".git", ".argon_backup", "scratch", "downloads"}
                    for part in rel.parts):
                 continue
-            if rel.name in RUNTIME_FILES or rel.name.endswith(".pyc"):
+            if rel.name in RUNTIME_FILES or rel.name.endswith((".pyc", ".bak", ".pathbak")) or ".bak-" in rel.name:
                 continue
             tracked.append(str(rel).replace("\\", "/"))
+    tracked = [
+        f for f in tracked
+        if not f.endswith((".pyc", ".bak", ".pathbak")) and ".bak-" not in Path(f).name
+    ]
     for extra in EXTRA_PUBLISHED:
         if extra not in tracked and (repo / extra).is_file():
             tracked.append(extra)
